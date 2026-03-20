@@ -140,7 +140,7 @@ public sealed class FileTools
     }
 
     [Description("Searches for files matching a glob pattern.")]
-    public string search_files(
+    public string glob(
         [Description("The glob pattern (e.g. '**/*.cs' or 'src/**/*.ts')")] string pattern)
     {
         // Simple search implementation
@@ -169,6 +169,78 @@ public sealed class FileTools
         catch (Exception ex)
         {
             return $"Error searching files: {ex.Message}";
+        }
+    }
+
+    [Description("Searches file contents using regular expressions.")]
+    public async Task<string> grep(
+        [Description("The regex pattern to search for in file contents")] string pattern,
+        [Description("File pattern to include in the search (e.g. '*.cs', '*.{ts,tsx}')")] string? include = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            // Fallback simplistic grep for cross-platform (not as robust as ripgrep but works natively)
+            var searchPattern = string.IsNullOrEmpty(include) || include.Contains("{") ? "*.*" : include;
+            var files = Directory.GetFiles(_workingDirectory, searchPattern, SearchOption.AllDirectories);
+            
+            // Filter out common binaries/obj/bin
+            files = files.Where(f => !f.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar) &&
+                                     !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar) &&
+                                     !f.Contains(Path.DirectorySeparatorChar + ".git" + Path.DirectorySeparatorChar)).ToArray();
+
+            var regex = new System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.Compiled);
+            var sb = new StringBuilder();
+            int matchCount = 0;
+            
+            foreach (var file in files)
+            {
+                ct.ThrowIfCancellationRequested();
+                var relPath = Path.GetRelativePath(_workingDirectory, file);
+                
+                // Very rudimentary include pattern filtering for multiple extensions if passed like "*.{ts,tsx}"
+                if (!string.IsNullOrEmpty(include) && include.Contains("{"))
+                {
+                    var extensions = include.Replace("*.", "").Replace("{", "").Replace("}", "").Split(',');
+                    if (!extensions.Any(ext => file.EndsWith("." + ext.Trim()))) continue;
+                }
+
+                try
+                {
+                    var lines = await File.ReadAllLinesAsync(file, ct);
+                    bool fileHeaderAdded = false;
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (regex.IsMatch(lines[i]))
+                        {
+                            if (!fileHeaderAdded)
+                            {
+                                sb.AppendLine($"\n{relPath}:");
+                                fileHeaderAdded = true;
+                            }
+                            sb.AppendLine($"{i + 1}: {lines[i].Trim()}");
+                            matchCount++;
+                            
+                            if (matchCount > 100)
+                            {
+                                sb.AppendLine("... too many matches, truncating.");
+                                return sb.ToString();
+                            }
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Ignore binary files or unreadable files
+                }
+            }
+
+            if (matchCount == 0) return "No matches found.";
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error performing grep: {ex.Message}";
         }
     }
 }

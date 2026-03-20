@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -29,7 +30,7 @@ public sealed class CodingAgent
         
         var chatOptions = new ChatOptions
         {
-            Tools = new List<AITool>()
+            Tools = new List<AITool>(_options.CustomTools)
         };
 
         if (_options.EnableBash)
@@ -44,15 +45,20 @@ public sealed class CodingAgent
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.read_file));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.write_file));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.edit_file));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.search_files));
+            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.glob));
+            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.grep));
+        }
+
+        if (_options.EnableSkills)
+        {
+            var skillTools = new SkillTools(_options.WorkDirectory);
+            chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.load_skill));
+            chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.list_skills));
         }
 
         var messages = new List<ChatMessage>
         {
-            new ChatMessage(ChatRole.System, @"You are a helpful autonomous coding agent.
-You have access to tools to execute bash commands and manipulate the file system.
-Execute the user's task by running commands, reading files, and making changes.
-When you are completely finished, provide a final summary of what you did.")
+            new ChatMessage(ChatRole.System, BuildSystemPrompt())
         };
 
         messages.Add(new ChatMessage(ChatRole.User, taskDescription));
@@ -115,5 +121,78 @@ When you are completely finished, provide a final summary of what you did.")
 
         _logger.LogWarning("Agent reached maximum steps ({MaxSteps}) without finishing.", _options.MaxSteps);
         return new AgentResult { Status = "Timeout", Message = $"Agent exceeded max steps ({_options.MaxSteps})." };
+    }
+
+    private string BuildSystemPrompt()
+    {
+        var sb = new StringBuilder();
+        
+        if (!string.IsNullOrWhiteSpace(_options.SystemPrompt))
+        {
+            sb.AppendLine(_options.SystemPrompt);
+        }
+        else
+        {
+            sb.AppendLine("You are a helpful autonomous coding agent.");
+            sb.AppendLine("You have access to tools to execute bash commands and manipulate the file system.");
+            sb.AppendLine("Execute the user's task by running commands, reading files, and making changes.");
+            sb.AppendLine("When you are completely finished, provide a final summary of what you did.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.CustomInstructions))
+        {
+            sb.AppendLine("\n# Custom Instructions");
+            sb.AppendLine(_options.CustomInstructions);
+        }
+
+        if (_options.AutoLoadWorkspaceInstructions)
+        {
+            var workspaceInstructions = GetWorkspaceInstructions();
+            if (!string.IsNullOrWhiteSpace(workspaceInstructions))
+            {
+                sb.AppendLine("\n# Workspace Instructions");
+                sb.AppendLine(workspaceInstructions);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private string GetWorkspaceInstructions()
+    {
+        var sb = new StringBuilder();
+        var dir = _options.WorkDirectory;
+
+        // Load AGENTS.md if it exists
+        var agentsPath = Path.Combine(dir, "AGENTS.md");
+        if (File.Exists(agentsPath))
+        {
+            sb.AppendLine($"--- AGENTS.md ---");
+            sb.AppendLine(File.ReadAllText(agentsPath));
+        }
+
+        // Load .github/copilot-instructions.md
+        var githubDir = Path.Combine(dir, ".github");
+        var copilotInstructionsPath = Path.Combine(githubDir, "copilot-instructions.md");
+        if (File.Exists(copilotInstructionsPath))
+        {
+            sb.AppendLine($"--- .github/copilot-instructions.md ---");
+            sb.AppendLine(File.ReadAllText(copilotInstructionsPath));
+        }
+
+        // Load .github/instructions/**/*.instructions.md
+        var instructionsDir = Path.Combine(githubDir, "instructions");
+        if (Directory.Exists(instructionsDir))
+        {
+            var files = Directory.GetFiles(instructionsDir, "*.instructions.md", SearchOption.AllDirectories);
+            foreach (var file in files)
+            {
+                var relPath = Path.GetRelativePath(dir, file).Replace('\\', '/');
+                sb.AppendLine($"--- {relPath} ---");
+                sb.AppendLine(File.ReadAllText(file));
+            }
+        }
+
+        return sb.ToString();
     }
 }
