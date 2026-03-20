@@ -12,6 +12,7 @@ public sealed class AgentOptions
     public int MaxSteps { get; set; } = 25;
     public bool EnableBash { get; set; } = true;
     public bool EnableFileOps { get; set; } = true;
+    public bool EnableFileWrites { get; set; } = true;
     public bool EnableSkills { get; set; } = true;
     
     // System Prompt settings

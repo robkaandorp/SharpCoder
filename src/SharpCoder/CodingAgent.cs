@@ -43,10 +43,14 @@ public sealed class CodingAgent
         {
             var fileTools = new FileTools(_options.WorkDirectory);
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.read_file));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.write_file));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.edit_file));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.glob));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.grep));
+
+            if (_options.EnableFileWrites)
+            {
+                chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.write_file));
+                chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.edit_file));
+            }
         }
 
         if (_options.EnableSkills)
