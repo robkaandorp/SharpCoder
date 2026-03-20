@@ -69,7 +69,7 @@ public class FileToolsTests : IDisposable
     [Theory]
     [InlineData("../../etc/passwd")]
     [InlineData("/etc/passwd")]
-    [InlineData("..\\..\\Windows\\System32\\config")]
+    [InlineData("../../Windows/System32/config")]
     public async Task ReadFile_PathTraversal_ReturnsError(string maliciousPath)
     {
         var result = await _tools.read_file(maliciousPath, ct: TestContext.Current.CancellationToken);
