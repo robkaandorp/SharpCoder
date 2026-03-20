@@ -5,4 +5,7 @@
   <Folder Name="/src/">
     <Project Path="src/SharpCoder/SharpCoder.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SharpCoder.Tests/SharpCoder.Tests.csproj" />
+  </Folder>
 </Solution>
