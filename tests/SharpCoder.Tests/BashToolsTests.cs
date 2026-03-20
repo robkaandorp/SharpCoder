@@ -12,7 +12,7 @@ public class BashToolsTests
     public async Task ExecuteBashCommand_Echo_ReturnsOutput()
     {
         var tools = new BashTools(Environment.CurrentDirectory);
-        var result = await tools.execute_bash_command("echo Hello XUnit");
+        var result = await tools.execute_bash_command("echo Hello XUnit", TestContext.Current.CancellationToken);
 
         Assert.Contains("Hello XUnit", result);
         Assert.Contains("--- STDOUT ---", result);

@@ -19,8 +19,16 @@ public sealed class FileTools
 
     private string GetFullPath(string path)
     {
-        var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(_workingDirectory, path);
-        return Path.GetFullPath(fullPath);
+        var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(_workingDirectory, path));
+        var root = Path.GetFullPath(_workingDirectory) + Path.DirectorySeparatorChar;
+
+        if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(fullPath, Path.GetFullPath(_workingDirectory), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new UnauthorizedAccessException($"Path '{path}' escapes the work directory.");
+        }
+
+        return fullPath;
     }
 
     [Description("Read a file from the local filesystem. Returns contents with each line prefixed by its line number. Use offset to read specific sections.")]
@@ -94,7 +102,7 @@ public sealed class FileTools
         }
     }
 
-    [Description("Performs exact string replacements in files. The oldString must exactly match the file content, including whitespace and indentation.")]
+    [Description("Performs exact string replacements in files. The oldString must exactly match the file content, including whitespace and indentation. Only one occurrence is replaced per call.")]
     public async Task<string> edit_file(
         [Description("The relative or absolute path to the file")] string filePath,
         [Description("The exact text to replace. Must match the existing file exactly.")] string oldString,
@@ -110,25 +118,22 @@ public sealed class FileTools
             }
 
             var content = await File.ReadAllTextAsync(fullPath, ct);
-            
-            var matchCount = 0;
-            var index = 0;
-            while ((index = content.IndexOf(oldString, index, StringComparison.Ordinal)) != -1)
-            {
-                matchCount++;
-                index += oldString.Length;
-            }
 
-            if (matchCount == 0)
+            var firstIndex = content.IndexOf(oldString, StringComparison.Ordinal);
+            if (firstIndex == -1)
             {
                 return "Error: oldString not found in file. Ensure exact whitespace/indentation matching.";
             }
-            if (matchCount > 1)
+
+            var secondIndex = content.IndexOf(oldString, firstIndex + oldString.Length, StringComparison.Ordinal);
+            if (secondIndex != -1)
             {
-                return $"Error: Found {matchCount} matches for oldString. Provide more surrounding lines to make it unique.";
+                return "Error: Found multiple matches for oldString. Provide more surrounding lines to make it unique.";
             }
 
-            var updatedContent = content.Replace(oldString, newString);
+            var updatedContent = content.Substring(0, firstIndex)
+                + newString
+                + content.Substring(firstIndex + oldString.Length);
             await File.WriteAllTextAsync(fullPath, updatedContent, ct);
             
             return $"Successfully replaced 1 occurrence of oldString in '{filePath}'.";
@@ -143,27 +148,79 @@ public sealed class FileTools
     public string glob(
         [Description("The glob pattern (e.g. '**/*.cs' or 'src/**/*.ts')")] string pattern)
     {
-        // Simple search implementation
         try
         {
-            var isGlob = pattern.Contains("**");
-            var searchPattern = isGlob ? pattern.Replace("**\\", "").Replace("**/", "") : pattern;
-            var files = Directory.GetFiles(_workingDirectory, searchPattern, SearchOption.AllDirectories);
-            
+            var normalized = pattern.Replace('/', Path.DirectorySeparatorChar)
+                                    .Replace('\\', Path.DirectorySeparatorChar);
+
+            string searchRoot;
+            string filePattern;
+            SearchOption searchOption;
+
+            var globIndex = normalized.IndexOf("**", StringComparison.Ordinal);
+            if (globIndex >= 0)
+            {
+                // Has ** — extract prefix as search root, remainder as file pattern
+                var prefix = globIndex > 0
+                    ? normalized.Substring(0, globIndex).TrimEnd(Path.DirectorySeparatorChar)
+                    : "";
+                var remainder = normalized.Substring(globIndex + 2)
+                    .TrimStart(Path.DirectorySeparatorChar);
+
+                searchRoot = string.IsNullOrEmpty(prefix)
+                    ? _workingDirectory
+                    : Path.GetFullPath(Path.Combine(_workingDirectory, prefix));
+                filePattern = string.IsNullOrEmpty(remainder) ? "*" : remainder;
+                searchOption = SearchOption.AllDirectories;
+            }
+            else
+            {
+                // No ** — check for directory prefix
+                var lastSep = normalized.LastIndexOf(Path.DirectorySeparatorChar);
+                if (lastSep >= 0)
+                {
+                    var dirPart = normalized.Substring(0, lastSep);
+                    filePattern = normalized.Substring(lastSep + 1);
+                    searchRoot = Path.GetFullPath(Path.Combine(_workingDirectory, dirPart));
+                    searchOption = SearchOption.TopDirectoryOnly;
+                }
+                else
+                {
+                    searchRoot = _workingDirectory;
+                    filePattern = normalized;
+                    searchOption = SearchOption.TopDirectoryOnly;
+                }
+            }
+
+            // Security: ensure search root is within working directory
+            var rootFull = Path.GetFullPath(searchRoot);
+            var wdFull = Path.GetFullPath(_workingDirectory);
+            if (!rootFull.StartsWith(wdFull, StringComparison.OrdinalIgnoreCase))
+            {
+                return $"Error: Pattern '{pattern}' resolves outside the work directory.";
+            }
+
+            if (!Directory.Exists(searchRoot))
+            {
+                return "No files found matching the pattern.";
+            }
+
+            var files = Directory.GetFiles(searchRoot, filePattern, searchOption);
+
             if (files.Length == 0) return "No files found matching the pattern.";
-            
+
             var sb = new StringBuilder();
             var limit = Math.Min(files.Length, 100);
             for (var i = 0; i < limit; i++)
             {
                 sb.AppendLine(Path.GetRelativePath(_workingDirectory, files[i]));
             }
-            
+
             if (files.Length > limit)
             {
                 sb.AppendLine($"... and {files.Length - limit} more.");
             }
-            
+
             return sb.ToString();
         }
         catch (Exception ex)

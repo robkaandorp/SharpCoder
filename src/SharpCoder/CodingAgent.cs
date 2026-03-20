@@ -1,7 +1,5 @@
-using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -30,7 +28,8 @@ public sealed class CodingAgent
         
         var chatOptions = new ChatOptions
         {
-            Tools = new List<AITool>(_options.CustomTools)
+            Tools = new List<AITool>(_options.CustomTools),
+            ToolMode = ChatToolMode.Auto
         };
 
         if (_options.EnableBash)
@@ -60,71 +59,45 @@ public sealed class CodingAgent
             chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.list_skills));
         }
 
+        var wrappedClient = new ChatClientBuilder(_client)
+            .UseFunctionInvocation(configure: fic =>
+            {
+                fic.MaximumIterationsPerRequest = _options.MaxSteps;
+                fic.IncludeDetailedErrors = true;
+            })
+            .Build();
+
         var messages = new List<ChatMessage>
         {
-            new ChatMessage(ChatRole.System, BuildSystemPrompt())
+            new ChatMessage(ChatRole.System, BuildSystemPrompt()),
+            new ChatMessage(ChatRole.User, taskDescription)
         };
 
-        messages.Add(new ChatMessage(ChatRole.User, taskDescription));
-
-        int step = 0;
-        while (step < _options.MaxSteps)
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            step++;
-            _logger.LogInformation("Agent step {Step}/{MaxSteps}", step, _options.MaxSteps);
-
-            var response = await _client.GetResponseAsync(messages, chatOptions, ct);
-            var assistantMessage = response.Messages.FirstOrDefault();
-            if (assistantMessage == null)
+            var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
+            var finalText = response.Text ?? "No text response.";
+            _logger.LogInformation("Task complete. Final response received.");
+            return new AgentResult
             {
-                _logger.LogWarning("Received empty response from client.");
-                return new AgentResult { Status = "Error", Message = "Empty response." };
-            }
-
-            messages.Add(assistantMessage);
-
-            var toolCalls = assistantMessage.Contents.OfType<FunctionCallContent>().ToList();
-            if (toolCalls.Count == 0)
-            {
-                _logger.LogInformation("Task complete. Final response received.");
-                return new AgentResult { Status = "Success", Message = assistantMessage.Text ?? "No text response." };
-            }
-
-            foreach (var toolCall in toolCalls)
-            {
-                _logger.LogInformation("Executing tool {ToolName} with arguments {Args}", toolCall.Name, toolCall.Arguments);
-                
-                var tool = chatOptions.Tools.OfType<AIFunction>().FirstOrDefault(t => t.Name == toolCall.Name);
-                if (tool != null)
-                {
-                    try
-                    {
-                        var result = await tool.InvokeAsync(new AIFunctionArguments(toolCall.Arguments), ct);
-                        var msg = new ChatMessage(ChatRole.Tool, (string?)null);
-                        msg.Contents.Add(new FunctionResultContent(toolCall.CallId, result));
-                        messages.Add(msg);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error executing tool {ToolName}", toolCall.Name);
-                        var errorMsg = new ChatMessage(ChatRole.Tool, (string?)null);
-                        errorMsg.Contents.Add(new FunctionResultContent(toolCall.CallId, $"Error: {ex.Message}"));
-                        messages.Add(errorMsg);
-                    }
-                }
-                else
-                {
-                    _logger.LogWarning("Tool {ToolName} not found.", toolCall.Name);
-                    var notFoundMsg = new ChatMessage(ChatRole.Tool, (string?)null);
-                    notFoundMsg.Contents.Add(new FunctionResultContent(toolCall.CallId, $"Error: Tool '{toolCall.Name}' not found."));
-                    messages.Add(notFoundMsg);
-                }
-            }
+                Status = "Success",
+                Message = finalText,
+                Messages = response.Messages,
+                ModelId = response.ModelId,
+                FinishReason = response.FinishReason,
+                Usage = response.Usage,
+                ToolCallCount = AgentResult.CountToolCalls(response.Messages)
+            };
         }
-
-        _logger.LogWarning("Agent reached maximum steps ({MaxSteps}) without finishing.", _options.MaxSteps);
-        return new AgentResult { Status = "Timeout", Message = $"Agent exceeded max steps ({_options.MaxSteps})." };
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Agent execution failed.");
+            return new AgentResult { Status = "Error", Message = ex.Message };
+        }
     }
 
     private string BuildSystemPrompt()
