@@ -27,9 +27,9 @@ public class SkillToolsTests : IDisposable
     }
 
     [Fact]
-    public void ListSkills_NoDir_ReturnsNotFound()
+    public async Task ListSkills_NoDir_ReturnsNotFound()
     {
-        var result = _tools.list_skills();
+        var result = await _tools.list_skills();
         Assert.Contains("No skills directory found.", result);
     }
 
@@ -40,10 +40,29 @@ public class SkillToolsTests : IDisposable
         Directory.CreateDirectory(skillsDir);
         await File.WriteAllTextAsync(Path.Combine(skillsDir, "test-skill.md"), "Do this skill well.");
 
-        var listResult = _tools.list_skills();
+        var listResult = await _tools.list_skills();
         Assert.Contains("test-skill", listResult);
 
         var loadResult = await _tools.load_skill("test-skill");
         Assert.Contains("Do this skill well.", loadResult);
+    }
+
+    [Fact]
+    public async Task ListSkills_WithFrontmatter_ReturnsParsedInfo()
+    {
+        var skillsDir = Path.Combine(_testDir, ".github", "skills");
+        Directory.CreateDirectory(skillsDir);
+        
+        var content = @"---
+name: Awesome Skill
+description: This skill does awesome things.
+---
+
+Here is the content.";
+
+        await File.WriteAllTextAsync(Path.Combine(skillsDir, "awesome.md"), content);
+
+        var listResult = await _tools.list_skills();
+        Assert.Contains("- awesome: Awesome Skill - This skill does awesome things.", listResult);
     }
 }

@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -11,6 +12,9 @@ namespace SharpCoder.Tools;
 public sealed class SkillTools
 {
     private readonly string _workingDirectory;
+    private static readonly Regex FrontmatterRegex = new Regex(@"^---\s*[\r\n]+(.*?)\n---\s*[\r\n]+", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex NameRegex = new Regex(@"^name:\s*(.+)$", RegexOptions.Multiline | RegexOptions.Compiled);
+    private static readonly Regex DescriptionRegex = new Regex(@"^description:\s*(.+)$", RegexOptions.Multiline | RegexOptions.Compiled);
 
     public SkillTools(string workingDirectory)
     {
@@ -46,7 +50,7 @@ public sealed class SkillTools
     }
 
     [Description("Lists all available skills in the project.")]
-    public string list_skills()
+    public async Task<string> list_skills(CancellationToken ct = default)
     {
         var skillsDir = Path.Combine(_workingDirectory, ".github", "skills");
         if (!Directory.Exists(skillsDir))
@@ -66,7 +70,31 @@ public sealed class SkillTools
             sb.AppendLine("Available skills:");
             foreach (var file in files)
             {
-                sb.AppendLine($"- {Path.GetFileNameWithoutExtension(file)}");
+                var fileName = Path.GetFileNameWithoutExtension(file);
+                var content = await File.ReadAllTextAsync(file, ct);
+                
+                var name = fileName;
+                var description = "No description provided.";
+                
+                var fmMatch = FrontmatterRegex.Match(content);
+                if (fmMatch.Success)
+                {
+                    var frontmatter = fmMatch.Groups[1].Value;
+                    
+                    var nameMatch = NameRegex.Match(frontmatter);
+                    if (nameMatch.Success)
+                    {
+                        name = nameMatch.Groups[1].Value.Trim();
+                    }
+                    
+                    var descMatch = DescriptionRegex.Match(frontmatter);
+                    if (descMatch.Success)
+                    {
+                        description = descMatch.Groups[1].Value.Trim();
+                    }
+                }
+                
+                sb.AppendLine($"- {fileName}: {name} - {description}");
             }
             return sb.ToString();
         }
