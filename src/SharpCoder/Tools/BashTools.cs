@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SharpCoder.Tools;
 
@@ -11,11 +13,13 @@ public sealed class BashTools
 {
     private readonly string _workingDirectory;
     private readonly int _timeoutMs;
+    private readonly ILogger _logger;
 
-    public BashTools(string workingDirectory, int timeoutMs = 120000)
+    public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null)
     {
         _workingDirectory = workingDirectory;
         _timeoutMs = timeoutMs > 0 ? timeoutMs : 120000;
+        _logger = logger ?? NullLogger.Instance;
     }
 
     [Description("Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.")]
@@ -47,6 +51,7 @@ public sealed class BashTools
                 return "Failed to start process.";
             }
 
+            _logger.LogDebug("Executing: {Command} (pid={Pid})", command, process.Id);
             var outputTask = process.StandardOutput.ReadToEndAsync();
             var errorTask = process.StandardError.ReadToEndAsync();
 
@@ -66,6 +71,7 @@ public sealed class BashTools
 
             if (completedTask == timeoutTask)
             {
+                _logger.LogWarning("Command timed out after {TimeoutMs}ms: {Command}", _timeoutMs, command);
                 KillProcess(process);
                 return $"Command timed out after {_timeoutMs}ms.";
             }

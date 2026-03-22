@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -8,7 +9,27 @@ namespace SharpCoder;
 
 public sealed class AgentOptions
 {
-    public string WorkDirectory { get; set; } = Directory.GetCurrentDirectory();
+    private string _workDirectory = Directory.GetCurrentDirectory();
+
+    /// <summary>
+    /// The working directory for the agent. Must be a valid, existing directory.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the value is null or whitespace.</exception>
+    /// <exception cref="DirectoryNotFoundException">Thrown when the directory does not exist.</exception>
+    public string WorkDirectory
+    {
+        get => _workDirectory;
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("WorkDirectory cannot be null or empty.", nameof(WorkDirectory));
+            var fullPath = Path.GetFullPath(value);
+            if (!Directory.Exists(fullPath))
+                throw new DirectoryNotFoundException($"WorkDirectory does not exist: {fullPath}");
+            _workDirectory = fullPath;
+        }
+    }
+
     public int MaxSteps { get; set; } = 25;
 
     /// <summary>

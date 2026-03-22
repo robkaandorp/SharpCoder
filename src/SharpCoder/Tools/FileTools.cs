@@ -5,16 +5,20 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SharpCoder.Tools;
 
 public sealed class FileTools
 {
     private readonly string _workingDirectory;
+    private readonly ILogger _logger;
 
-    public FileTools(string workingDirectory)
+    public FileTools(string workingDirectory, ILogger? logger = null)
     {
         _workingDirectory = workingDirectory;
+        _logger = logger ?? NullLogger.Instance;
     }
 
     private string GetFullPath(string path)
@@ -47,7 +51,8 @@ public sealed class FileTools
             }
 
             var lines = await File.ReadAllLinesAsync(fullPath, ct);
-
+            if (lines.Length > 5000)
+                _logger.LogDebug("Reading large file {Path} ({Lines} lines)", filePath, lines.Length);
             if (offset < 1) offset = 1;
             if (limit < 1) limit = 1;
             var startIndex = offset - 1;
@@ -96,7 +101,7 @@ public sealed class FileTools
             }
 
             await File.WriteAllTextAsync(fullPath, content, ct);
-            return $"Successfully wrote {content.Length} characters to '{filePath}'.";
+            _logger.LogDebug("Wrote {Chars} chars to {Path}", content.Length, filePath);            return $"Successfully wrote {content.Length} characters to '{filePath}'.";
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -149,7 +154,8 @@ public sealed class FileTools
                 + newString
                 + content.Substring(endIndex);
             await File.WriteAllTextAsync(fullPath, updatedContent, ct);
-            
+            _logger.LogDebug("Edited {Path}: replaced {OldLen} chars with {NewLen} chars at position {Pos}",
+                filePath, oldString.Length, newString.Length, firstIndex);
             return $"Successfully replaced 1 occurrence of oldString in '{filePath}'.";
         }
         catch (OperationCanceledException) { throw; }

@@ -34,13 +34,13 @@ public sealed class CodingAgent
 
         if (_options.EnableBash)
         {
-            var bashTools = new BashTools(_options.WorkDirectory);
+            var bashTools = new BashTools(_options.WorkDirectory, logger: _logger);
             chatOptions.Tools.Add(AIFunctionFactory.Create(bashTools.execute_bash_command));
         }
 
         if (_options.EnableFileOps)
         {
-            var fileTools = new FileTools(_options.WorkDirectory);
+            var fileTools = new FileTools(_options.WorkDirectory, _logger);
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.read_file));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.glob));
             chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.grep));
@@ -76,8 +76,29 @@ public sealed class CodingAgent
         try
         {
             var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
+            var toolCalls = AgentResult.CountToolCalls(response.Messages);
             var finalText = response.Text ?? "No text response.";
-            _logger.LogInformation("Task complete. Final response received.");
+
+            // Detect MaxSteps exhaustion: the model wanted to make more tool calls
+            // but FunctionInvokingChatClient stopped it at the limit
+            if (response.FinishReason == ChatFinishReason.ToolCalls)
+            {
+                _logger.LogWarning(
+                    "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
+                    _options.MaxSteps, toolCalls);
+                return new AgentResult
+                {
+                    Status = "MaxStepsReached",
+                    Message = finalText,
+                    Messages = response.Messages,
+                    ModelId = response.ModelId,
+                    FinishReason = response.FinishReason,
+                    Usage = response.Usage,
+                    ToolCallCount = toolCalls
+                };
+            }
+
+            _logger.LogInformation("Task complete ({ToolCalls} tool calls).", toolCalls);
             return new AgentResult
             {
                 Status = "Success",
@@ -86,7 +107,7 @@ public sealed class CodingAgent
                 ModelId = response.ModelId,
                 FinishReason = response.FinishReason,
                 Usage = response.Usage,
-                ToolCallCount = AgentResult.CountToolCalls(response.Messages)
+                ToolCallCount = toolCalls
             };
         }
         catch (OperationCanceledException)
