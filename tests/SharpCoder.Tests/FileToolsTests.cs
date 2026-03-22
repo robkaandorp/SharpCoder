@@ -92,4 +92,74 @@ public class FileToolsTests : IDisposable
         var result = await _tools.edit_file(maliciousPath, "old", "new", TestContext.Current.CancellationToken);
         Assert.Contains("escapes the work directory", result);
     }
+
+    [Fact]
+    public async Task EditFile_EmptyOldString_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _tools.write_file("empty_old.txt", "content", ct);
+
+        var result = await _tools.edit_file("empty_old.txt", "", "new", ct);
+        Assert.Contains("Error", result);
+        Assert.Contains("cannot be empty", result);
+    }
+
+    [Fact]
+    public async Task EditFile_MultipleMatches_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _tools.write_file("multi.txt", "AAA\nBBB\nAAA", ct);
+
+        var result = await _tools.edit_file("multi.txt", "AAA", "CCC", ct);
+        Assert.Contains("Error", result);
+        Assert.Contains("multiple matches", result);
+    }
+
+    [Fact]
+    public async Task ReadFile_NegativeOffset_ClampsToOne()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _tools.write_file("clamp.txt", "Line1\nLine2\nLine3", ct);
+
+        var result = await _tools.read_file("clamp.txt", offset: -5, ct: ct);
+        Assert.Contains("1: Line1", result);
+    }
+
+    [Fact]
+    public async Task ReadFile_NegativeLimit_ClampsToOne()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _tools.write_file("neg_limit.txt", "Line1\nLine2\nLine3", ct);
+
+        var result = await _tools.read_file("neg_limit.txt", limit: -10, ct: ct);
+        Assert.Contains("1: Line1", result);
+        Assert.DoesNotContain("2: Line2", result);
+    }
+
+    [Fact]
+    public async Task ReadFile_OffsetBeyondEnd_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _tools.write_file("short.txt", "Line1\nLine2", ct);
+
+        var result = await _tools.read_file("short.txt", offset: 999, ct: ct);
+        Assert.Contains("Error", result);
+        Assert.Contains("beyond the end", result);
+    }
+
+    [Fact]
+    public async Task ReadFile_NonexistentFile_ReturnsError()
+    {
+        var result = await _tools.read_file("no_such_file.txt", ct: TestContext.Current.CancellationToken);
+        Assert.Contains("Error", result);
+        Assert.Contains("does not exist", result);
+    }
+
+    [Fact]
+    public async Task EditFile_NonexistentFile_ReturnsError()
+    {
+        var result = await _tools.edit_file("no_such.txt", "old", "new", TestContext.Current.CancellationToken);
+        Assert.Contains("Error", result);
+        Assert.Contains("does not exist", result);
+    }
 }

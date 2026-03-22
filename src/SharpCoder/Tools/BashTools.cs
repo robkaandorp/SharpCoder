@@ -15,7 +15,7 @@ public sealed class BashTools
     public BashTools(string workingDirectory, int timeoutMs = 120000)
     {
         _workingDirectory = workingDirectory;
-        _timeoutMs = timeoutMs;
+        _timeoutMs = timeoutMs > 0 ? timeoutMs : 120000;
     }
 
     [Description("Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.")]
@@ -23,6 +23,7 @@ public sealed class BashTools
         [Description("The command to execute")] string command,
         CancellationToken ct = default)
     {
+        Process? process = null;
         try
         {
             var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
@@ -40,7 +41,7 @@ public sealed class BashTools
                 CreateNoWindow = true
             };
 
-            using var process = Process.Start(processStartInfo);
+            process = Process.Start(processStartInfo);
             if (process == null)
             {
                 return "Failed to start process.";
@@ -55,7 +56,6 @@ public sealed class BashTools
             process.EnableRaisingEvents = true;
             process.Exited += (sender, args) => processCompletionSource.TrySetResult(true);
             
-            // If process already exited before we attached the handler
             if (process.HasExited)
             {
                 processCompletionSource.TrySetResult(true);
@@ -66,11 +66,11 @@ public sealed class BashTools
 
             if (completedTask == timeoutTask)
             {
-                process.Kill();
+                KillProcess(process);
                 return $"Command timed out after {_timeoutMs}ms.";
             }
 
-            cts.Cancel(); // Cancel the delay task
+            cts.Cancel();
 
             var output = await outputTask;
             var error = await errorTask;
@@ -93,9 +93,26 @@ public sealed class BashTools
 
             return sb.ToString();
         }
+        catch (OperationCanceledException)
+        {
+            KillProcess(process);
+            throw;
+        }
         catch (Exception ex)
         {
+            KillProcess(process);
             return $"Error executing command: {ex.Message}";
         }
+    }
+
+    private static void KillProcess(Process? process)
+    {
+        if (process == null) return;
+        try
+        {
+            if (!process.HasExited)
+                process.Kill();
+        }
+        catch { }
     }
 }

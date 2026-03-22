@@ -105,4 +105,23 @@ public class SearchToolsTests : IDisposable
         Assert.Contains("Error", result);
         Assert.Contains("outside the work directory", result);
     }
+
+    [Fact]
+    public async Task Grep_InvalidRegex_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_testDir, "dummy.txt"), "some content", ct);
+
+        var result = await _tools.grep("[invalid(regex", ct: ct);
+        Assert.Contains("Error", result);
+        Assert.Contains("Invalid regex", result);
+    }
+
+    [Fact]
+    public void Glob_NonexistentSubdirectory_ReturnsError()
+    {
+        var result = _tools.glob("nonexistent_dir/*.cs");
+        Assert.Contains("Error", result);
+        Assert.Contains("does not exist", result);
+    }
 }

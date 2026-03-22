@@ -47,8 +47,9 @@ public sealed class FileTools
             }
 
             var lines = await File.ReadAllLinesAsync(fullPath, ct);
-            
+
             if (offset < 1) offset = 1;
+            if (limit < 1) limit = 1;
             var startIndex = offset - 1;
             
             if (startIndex >= lines.Length)
@@ -56,10 +57,10 @@ public sealed class FileTools
                 return $"Error: Offset {offset} is beyond the end of the file (total lines: {lines.Length}).";
             }
 
-            var count = Math.Min(limit, lines.Length - startIndex);
+            var count = Math.Max(0, Math.Min(limit, lines.Length - startIndex));
             var result = new StringBuilder();
             
-            for (var i = 0; i < count; i++)
+            for (var i = 0; i < count && startIndex + i < lines.Length; i++)
             {
                 var lineIndex = startIndex + i;
                 result.AppendLine($"{lineIndex + 1}: {lines[lineIndex]}");
@@ -72,6 +73,7 @@ public sealed class FileTools
 
             return result.ToString();
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             return $"Error reading file: {ex.Message}";
@@ -96,6 +98,7 @@ public sealed class FileTools
             await File.WriteAllTextAsync(fullPath, content, ct);
             return $"Successfully wrote {content.Length} characters to '{filePath}'.";
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             return $"Error writing file: {ex.Message}";
@@ -111,6 +114,11 @@ public sealed class FileTools
     {
         try
         {
+            if (string.IsNullOrEmpty(oldString))
+            {
+                return "Error: oldString cannot be empty.";
+            }
+
             var fullPath = GetFullPath(filePath);
             if (!File.Exists(fullPath))
             {
@@ -125,7 +133,13 @@ public sealed class FileTools
                 return "Error: oldString not found in file. Ensure exact whitespace/indentation matching.";
             }
 
-            var secondIndex = content.IndexOf(oldString, firstIndex + oldString.Length, StringComparison.Ordinal);
+            var endIndex = firstIndex + oldString.Length;
+            if (endIndex > content.Length)
+            {
+                return "Error: Internal inconsistency — matched text extends beyond file content.";
+            }
+
+            var secondIndex = content.IndexOf(oldString, endIndex, StringComparison.Ordinal);
             if (secondIndex != -1)
             {
                 return "Error: Found multiple matches for oldString. Provide more surrounding lines to make it unique.";
@@ -133,11 +147,12 @@ public sealed class FileTools
 
             var updatedContent = content.Substring(0, firstIndex)
                 + newString
-                + content.Substring(firstIndex + oldString.Length);
+                + content.Substring(endIndex);
             await File.WriteAllTextAsync(fullPath, updatedContent, ct);
             
             return $"Successfully replaced 1 occurrence of oldString in '{filePath}'.";
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             return $"Error editing file: {ex.Message}";
@@ -202,7 +217,7 @@ public sealed class FileTools
 
             if (!Directory.Exists(searchRoot))
             {
-                return "No files found matching the pattern.";
+                return $"Error: Search directory does not exist: {Path.GetRelativePath(_workingDirectory, searchRoot)}";
             }
 
             var files = Directory.GetFiles(searchRoot, filePattern, searchOption);
@@ -237,6 +252,17 @@ public sealed class FileTools
     {
         try
         {
+            System.Text.RegularExpressions.Regex regex;
+            try
+            {
+                regex = new System.Text.RegularExpressions.Regex(
+                    pattern, System.Text.RegularExpressions.RegexOptions.Compiled);
+            }
+            catch (ArgumentException regexEx)
+            {
+                return $"Error: Invalid regex pattern: {regexEx.Message}";
+            }
+
             // Fallback simplistic grep for cross-platform (not as robust as ripgrep but works natively)
             var searchPattern = string.IsNullOrEmpty(include) || include.Contains("{") ? "*.*" : include;
             var files = Directory.GetFiles(_workingDirectory, searchPattern, SearchOption.AllDirectories);
@@ -246,7 +272,6 @@ public sealed class FileTools
                                      !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar) &&
                                      !f.Contains(Path.DirectorySeparatorChar + ".git" + Path.DirectorySeparatorChar)).ToArray();
 
-            var regex = new System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.Compiled);
             var sb = new StringBuilder();
             int matchCount = 0;
             
@@ -286,6 +311,7 @@ public sealed class FileTools
                         }
                     }
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception)
                 {
                     // Ignore binary files or unreadable files
@@ -295,6 +321,7 @@ public sealed class FileTools
             if (matchCount == 0) return "No matches found.";
             return sb.ToString();
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             return $"Error performing grep: {ex.Message}";

@@ -142,31 +142,59 @@ public sealed class CodingAgent
 
         // Load AGENTS.md if it exists
         var agentsPath = Path.Combine(dir, "AGENTS.md");
-        if (File.Exists(agentsPath))
+        try
         {
-            sb.AppendLine($"--- AGENTS.md ---");
-            sb.AppendLine(File.ReadAllText(agentsPath));
+            if (File.Exists(agentsPath))
+            {
+                sb.AppendLine($"--- AGENTS.md ---");
+                sb.AppendLine(File.ReadAllText(agentsPath));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read {File}", agentsPath);
         }
 
         // Load .github/copilot-instructions.md
         var githubDir = Path.Combine(dir, ".github");
         var copilotInstructionsPath = Path.Combine(githubDir, "copilot-instructions.md");
-        if (File.Exists(copilotInstructionsPath))
+        try
         {
-            sb.AppendLine($"--- .github/copilot-instructions.md ---");
-            sb.AppendLine(File.ReadAllText(copilotInstructionsPath));
+            if (File.Exists(copilotInstructionsPath))
+            {
+                sb.AppendLine($"--- .github/copilot-instructions.md ---");
+                sb.AppendLine(File.ReadAllText(copilotInstructionsPath));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read {File}", copilotInstructionsPath);
         }
 
         // Load .github/instructions/**/*.instructions.md
         var instructionsDir = Path.Combine(githubDir, "instructions");
         if (Directory.Exists(instructionsDir))
         {
-            var files = Directory.GetFiles(instructionsDir, "*.instructions.md", SearchOption.AllDirectories);
-            foreach (var file in files)
+            try
             {
-                var relPath = Path.GetRelativePath(dir, file).Replace('\\', '/');
-                sb.AppendLine($"--- {relPath} ---");
-                sb.AppendLine(File.ReadAllText(file));
+                var files = Directory.GetFiles(instructionsDir, "*.instructions.md", SearchOption.AllDirectories);
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var relPath = Path.GetRelativePath(dir, file).Replace('\\', '/');
+                        sb.AppendLine($"--- {relPath} ---");
+                        sb.AppendLine(File.ReadAllText(file));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to read instruction file {File}", file);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to enumerate instruction files in {Dir}", instructionsDir);
             }
         }
 
