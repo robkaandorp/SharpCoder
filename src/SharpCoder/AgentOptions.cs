@@ -55,5 +55,18 @@ public sealed class AgentOptions
     // Tools
     public IList<AITool> CustomTools { get; set; } = new List<AITool>();
 
+    // Context management
+    /// <summary>Maximum context window size in tokens for the model. Used for compaction decisions.</summary>
+    public int MaxContextTokens { get; set; } = 100_000;
+
+    /// <summary>Fraction of MaxContextTokens at which automatic compaction triggers (0.0–1.0).</summary>
+    public double CompactionThreshold { get; set; } = 0.8;
+
+    /// <summary>Number of recent messages to keep verbatim during compaction.</summary>
+    public int CompactionRetainRecent { get; set; } = 10;
+
+    /// <summary>Enable automatic context compaction when approaching token limits.</summary>
+    public bool EnableAutoCompaction { get; set; } = true;
+
     public ILogger Logger { get; set; } = NullLogger.Instance;
 }

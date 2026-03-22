@@ -1,5 +1,7 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,18 +16,80 @@ public sealed class CodingAgent
     private readonly IChatClient _client;
     private readonly AgentOptions _options;
     private readonly ILogger _logger;
+    private readonly ContextCompactor _compactor;
 
     public CodingAgent(IChatClient client, AgentOptions options)
     {
         _client = client;
         _options = options;
         _logger = options.Logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        _compactor = new ContextCompactor(client, _logger);
     }
 
-    public async Task<AgentResult> ExecuteAsync(string taskDescription, CancellationToken ct = default)
+    /// <summary>
+    /// Execute a task as a single-turn (stateless) conversation.
+    /// For multi-turn, use the overload that accepts an <see cref="AgentSession"/>.
+    /// </summary>
+    public Task<AgentResult> ExecuteAsync(string taskDescription, CancellationToken ct = default)
+    {
+        return ExecuteAsync(null, taskDescription, ct);
+    }
+
+    /// <summary>
+    /// Execute a task within a session, preserving conversation history across calls.
+    /// Pass null for a stateless single-turn execution.
+    /// </summary>
+    public async Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
     {
         _logger.LogInformation("Starting coding agent task in {Dir}", _options.WorkDirectory);
-        
+
+        // Auto-compact before building messages if session is large
+        if (session != null)
+        {
+            await _compactor.CompactIfNeededAsync(session, _options, ct);
+        }
+
+        var chatOptions = BuildChatOptions();
+        var wrappedClient = BuildWrappedClient();
+
+        var messages = BuildMessages(session, userMessage);
+
+        try
+        {
+            var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
+            var toolCalls = AgentResult.CountToolCalls(response.Messages);
+            var finalText = response.Text ?? "No text response.";
+
+            // Update session with new messages and usage
+            if (session != null)
+            {
+                UpdateSession(session, response);
+            }
+
+            if (response.FinishReason == ChatFinishReason.ToolCalls)
+            {
+                _logger.LogWarning(
+                    "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
+                    _options.MaxSteps, toolCalls);
+                return BuildResult("MaxStepsReached", finalText, response, toolCalls);
+            }
+
+            _logger.LogInformation("Task complete ({ToolCalls} tool calls).", toolCalls);
+            return BuildResult("Success", finalText, response, toolCalls);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Agent execution failed.");
+            return new AgentResult { Status = "Error", Message = ex.Message };
+        }
+    }
+
+    private ChatOptions BuildChatOptions()
+    {
         var chatOptions = new ChatOptions
         {
             Tools = new List<AITool>(_options.CustomTools),
@@ -59,66 +123,69 @@ public sealed class CodingAgent
             chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.list_skills));
         }
 
-        var wrappedClient = new ChatClientBuilder(_client)
+        return chatOptions;
+    }
+
+    private IChatClient BuildWrappedClient()
+    {
+        return new ChatClientBuilder(_client)
             .UseFunctionInvocation(configure: fic =>
             {
                 fic.MaximumIterationsPerRequest = _options.MaxSteps;
                 fic.IncludeDetailedErrors = true;
             })
             .Build();
+    }
 
+    private List<ChatMessage> BuildMessages(AgentSession? session, string userMessage)
+    {
         var messages = new List<ChatMessage>
         {
-            new ChatMessage(ChatRole.System, BuildSystemPrompt()),
-            new ChatMessage(ChatRole.User, taskDescription)
+            new ChatMessage(ChatRole.System, BuildSystemPrompt())
         };
 
-        try
+        // Replay session history if present
+        if (session?.MessageHistory.Count > 0)
         {
-            var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
-            var toolCalls = AgentResult.CountToolCalls(response.Messages);
-            var finalText = response.Text ?? "No text response.";
+            messages.AddRange(session.MessageHistory);
+        }
 
-            // Detect MaxSteps exhaustion: the model wanted to make more tool calls
-            // but FunctionInvokingChatClient stopped it at the limit
-            if (response.FinishReason == ChatFinishReason.ToolCalls)
-            {
-                _logger.LogWarning(
-                    "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
-                    _options.MaxSteps, toolCalls);
-                return new AgentResult
-                {
-                    Status = "MaxStepsReached",
-                    Message = finalText,
-                    Messages = response.Messages,
-                    ModelId = response.ModelId,
-                    FinishReason = response.FinishReason,
-                    Usage = response.Usage,
-                    ToolCallCount = toolCalls
-                };
-            }
+        messages.Add(new ChatMessage(ChatRole.User, userMessage));
+        return messages;
+    }
 
-            _logger.LogInformation("Task complete ({ToolCalls} tool calls).", toolCalls);
-            return new AgentResult
-            {
-                Status = "Success",
-                Message = finalText,
-                Messages = response.Messages,
-                ModelId = response.ModelId,
-                FinishReason = response.FinishReason,
-                Usage = response.Usage,
-                ToolCallCount = toolCalls
-            };
-        }
-        catch (OperationCanceledException)
+    private void UpdateSession(AgentSession session, ChatResponse response)
+    {
+        // Extract new messages (skip system prompt, keep everything else)
+        var newMessages = response.Messages.Where(m => m.Role != ChatRole.System).ToList();
+        session.MessageHistory = newMessages;
+        session.TotalToolCalls += AgentResult.CountToolCalls(response.Messages);
+        session.LastActivityAt = DateTimeOffset.UtcNow;
+
+        // Track token usage
+        if (response.Usage != null)
         {
-            throw;
+            session.InputTokensUsed += response.Usage.InputTokenCount ?? 0;
+            session.OutputTokensUsed += response.Usage.OutputTokenCount ?? 0;
         }
-        catch (Exception ex)
+
+        _logger.LogDebug(
+            "Session {SessionId}: {MessageCount} messages, ~{Tokens} context tokens, {TotalTools} total tool calls",
+            session.SessionId, session.MessageHistory.Count, session.EstimatedContextTokens, session.TotalToolCalls);
+    }
+
+    private static AgentResult BuildResult(string status, string message, ChatResponse response, int toolCalls)
+    {
+        return new AgentResult
         {
-            _logger.LogError(ex, "Agent execution failed.");
-            return new AgentResult { Status = "Error", Message = ex.Message };
-        }
+            Status = status,
+            Message = message,
+            Messages = response.Messages,
+            ModelId = response.ModelId,
+            FinishReason = response.FinishReason,
+            Usage = response.Usage,
+            ToolCallCount = toolCalls
+        };
     }
 
     private string BuildSystemPrompt()
@@ -161,7 +228,6 @@ public sealed class CodingAgent
         var sb = new StringBuilder();
         var dir = _options.WorkDirectory;
 
-        // Load AGENTS.md if it exists
         var agentsPath = Path.Combine(dir, "AGENTS.md");
         try
         {
@@ -176,7 +242,6 @@ public sealed class CodingAgent
             _logger.LogWarning(ex, "Failed to read {File}", agentsPath);
         }
 
-        // Load .github/copilot-instructions.md
         var githubDir = Path.Combine(dir, ".github");
         var copilotInstructionsPath = Path.Combine(githubDir, "copilot-instructions.md");
         try
@@ -192,7 +257,6 @@ public sealed class CodingAgent
             _logger.LogWarning(ex, "Failed to read {File}", copilotInstructionsPath);
         }
 
-        // Load .github/instructions/**/*.instructions.md
         var instructionsDir = Path.Combine(githubDir, "instructions");
         if (Directory.Exists(instructionsDir))
         {
