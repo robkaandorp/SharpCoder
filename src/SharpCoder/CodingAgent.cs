@@ -60,6 +60,14 @@ public sealed class CodingAgent
             var toolCalls = AgentResult.CountToolCalls(response.Messages);
             var finalText = response.Text ?? "No text response.";
 
+            // Log token usage (always, even without a session)
+            if (response.Usage != null)
+            {
+                _logger.LogInformation(
+                    "Usage: inputTokens={InputTokens}, outputTokens={OutputTokens}, totalTokens={TotalTokens}",
+                    response.Usage.InputTokenCount, response.Usage.OutputTokenCount, response.Usage.TotalTokenCount);
+            }
+
             // Update session with new messages and usage
             if (session != null)
             {
