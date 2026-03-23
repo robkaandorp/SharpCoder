@@ -26,17 +26,9 @@ public sealed class SkillTools
         [Description("The name of the skill to load (without the .md extension)")] string name,
         CancellationToken ct = default)
     {
-        var skillsDir = Path.Combine(_workingDirectory, ".github", "skills");
-        if (!Directory.Exists(skillsDir))
-        {
-            return "Error: Skills directory (.github/skills) does not exist.";
-        }
-
-        var skillFile = Path.Combine(skillsDir, $"{name}.md");
-        if (!File.Exists(skillFile))
-        {
+        var skillFile = ResolveSkillFile(name);
+        if (skillFile is null)
             return $"Error: Skill '{name}' not found. Use list_skills to see available skills.";
-        }
 
         try
         {
@@ -50,57 +42,113 @@ public sealed class SkillTools
     }
 
     [Description("Lists all available skills in the project.")]
-    public async Task<string> list_skills(CancellationToken ct = default)
+    public Task<string> list_skills(CancellationToken ct = default)
+    {
+        return Task.FromResult(ListSkillsSummary() ?? "No skills found.");
+    }
+
+    /// <summary>
+    /// Returns a short summary of available skills for injection into the system prompt,
+    /// or null if no skills directory exists.
+    /// </summary>
+    internal string? ListSkillsSummary()
     {
         var skillsDir = Path.Combine(_workingDirectory, ".github", "skills");
         if (!Directory.Exists(skillsDir))
-        {
-            return "No skills directory found.";
-        }
+            return null;
 
+        var entries = EnumerateSkillEntries(skillsDir);
+        if (entries.Count == 0)
+            return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("Available skills (use load_skill to read full instructions):");
+        foreach (var (name, description) in entries)
+            sb.AppendLine($"- {name}: {description}");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Resolves a skill name to a file path, supporting both flat files
+    /// (<c>.github/skills/{name}.md</c>) and subdirectory format
+    /// (<c>.github/skills/{name}/SKILL.md</c>).
+    /// </summary>
+    private string? ResolveSkillFile(string name)
+    {
+        var skillsDir = Path.Combine(_workingDirectory, ".github", "skills");
+        if (!Directory.Exists(skillsDir))
+            return null;
+
+        // Flat file: .github/skills/{name}.md
+        var flatFile = Path.Combine(skillsDir, $"{name}.md");
+        if (File.Exists(flatFile))
+            return flatFile;
+
+        // Subdirectory: .github/skills/{name}/SKILL.md
+        var subdirFile = Path.Combine(skillsDir, name, "SKILL.md");
+        if (File.Exists(subdirFile))
+            return subdirFile;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Enumerates all skill entries from the skills directory, supporting both flat
+    /// files and subdirectory format.
+    /// </summary>
+    private static List<(string Name, string Description)> EnumerateSkillEntries(string skillsDir)
+    {
+        var entries = new List<(string Name, string Description)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Flat files: .github/skills/*.md
         try
         {
-            var files = Directory.GetFiles(skillsDir, "*.md");
-            if (files.Length == 0)
+            foreach (var file in Directory.GetFiles(skillsDir, "*.md"))
             {
-                return "No skills found.";
+                var name = Path.GetFileNameWithoutExtension(file);
+                if (!seen.Add(name)) continue;
+                var description = ParseDescription(file);
+                entries.Add((name, description));
             }
+        }
+        catch { /* ignore enumeration errors */ }
 
-            var sb = new StringBuilder();
-            sb.AppendLine("Available skills:");
-            foreach (var file in files)
-            {
-                var fileName = Path.GetFileNameWithoutExtension(file);
-                var content = await File.ReadAllTextAsync(file, ct);
-                
-                var name = fileName;
-                var description = "No description provided.";
-                
-                var fmMatch = FrontmatterRegex.Match(content);
-                if (fmMatch.Success)
-                {
-                    var frontmatter = fmMatch.Groups[1].Value;
-                    
-                    var nameMatch = NameRegex.Match(frontmatter);
-                    if (nameMatch.Success)
-                    {
-                        name = nameMatch.Groups[1].Value.Trim();
-                    }
-                    
-                    var descMatch = DescriptionRegex.Match(frontmatter);
-                    if (descMatch.Success)
-                    {
-                        description = descMatch.Groups[1].Value.Trim();
-                    }
-                }
-                
-                sb.AppendLine($"- {fileName}: {name} - {description}");
-            }
-            return sb.ToString();
-        }
-        catch (Exception ex)
+        // Subdirectories: .github/skills/{name}/SKILL.md
+        try
         {
-            return $"Error listing skills: {ex.Message}";
+            foreach (var dir in Directory.GetDirectories(skillsDir))
+            {
+                var name = Path.GetFileName(dir);
+                if (!seen.Add(name)) continue;
+                var skillFile = Path.Combine(dir, "SKILL.md");
+                if (!File.Exists(skillFile)) continue;
+                var description = ParseDescription(skillFile);
+                entries.Add((name, description));
+            }
         }
+        catch { /* ignore enumeration errors */ }
+
+        entries.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        return entries;
+    }
+
+    private static string ParseDescription(string filePath)
+    {
+        try
+        {
+            var content = File.ReadAllText(filePath);
+            var fmMatch = FrontmatterRegex.Match(content);
+            if (fmMatch.Success)
+            {
+                var frontmatter = fmMatch.Groups[1].Value;
+                var descMatch = DescriptionRegex.Match(frontmatter);
+                if (descMatch.Success)
+                    return descMatch.Groups[1].Value.Trim();
+            }
+        }
+        catch { /* ignore parse errors */ }
+
+        return "No description provided.";
     }
 }

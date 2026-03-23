@@ -220,6 +220,18 @@ public sealed class CodingAgent
             }
         }
 
+        if (_options.EnableSkills)
+        {
+            var skillTools = new SkillTools(_options.WorkDirectory);
+            var skillSummary = skillTools.ListSkillsSummary();
+            if (!string.IsNullOrWhiteSpace(skillSummary))
+            {
+                sb.AppendLine("\n# Project Skills");
+                sb.AppendLine(skillSummary);
+                sb.AppendLine("IMPORTANT: Before building or testing, load the relevant skill first with load_skill.");
+            }
+        }
+
         return sb.ToString();
     }
 
