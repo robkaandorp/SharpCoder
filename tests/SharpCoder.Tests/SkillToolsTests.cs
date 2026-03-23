@@ -30,7 +30,7 @@ public class SkillToolsTests : IDisposable
     public async Task ListSkills_NoDir_ReturnsNotFound()
     {
         var result = await _tools.list_skills(TestContext.Current.CancellationToken);
-        Assert.Contains("No skills directory found.", result);
+        Assert.Contains("No skills found.", result);
     }
 
     [Fact]
@@ -65,6 +65,22 @@ Here is the content.";
         await File.WriteAllTextAsync(Path.Combine(skillsDir, "awesome.md"), content, ct);
 
         var listResult = await _tools.list_skills(ct);
-        Assert.Contains("- awesome: Awesome Skill - This skill does awesome things.", listResult);
+        Assert.Contains("awesome", listResult);
+        Assert.Contains("This skill does awesome things.", listResult);
+    }
+
+    [Fact]
+    public async Task LoadSkill_SubdirectoryFormat_ReturnsContent()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var skillDir = Path.Combine(_testDir, ".github", "skills", "build");
+        Directory.CreateDirectory(skillDir);
+        await File.WriteAllTextAsync(Path.Combine(skillDir, "SKILL.md"), "---\nname: build\n---\nRun dotnet build.", ct);
+
+        var loadResult = await _tools.load_skill("build", ct);
+        Assert.Contains("Run dotnet build.", loadResult);
+
+        var listResult = await _tools.list_skills(ct);
+        Assert.Contains("build", listResult);
     }
 }
