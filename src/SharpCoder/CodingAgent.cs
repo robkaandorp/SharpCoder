@@ -71,7 +71,7 @@ public sealed class CodingAgent
             // Update session with new messages and usage
             if (session != null)
             {
-                UpdateSession(session, response);
+                UpdateSession(session, userMessage, response);
             }
 
             if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -162,11 +162,18 @@ public sealed class CodingAgent
         return messages;
     }
 
-    private void UpdateSession(AgentSession session, ChatResponse response)
+    private void UpdateSession(AgentSession session, string userMessage, ChatResponse response)
     {
-        // Extract new messages (skip system prompt, keep everything else)
-        var newMessages = response.Messages.Where(m => m.Role != ChatRole.System).ToList();
-        session.MessageHistory = newMessages;
+        // Append the user message and all response messages to the existing history.
+        // response.Messages contains assistant responses (and tool call/result messages
+        // from the function invocation loop) but NOT the input messages we sent.
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, userMessage));
+        foreach (var msg in response.Messages)
+        {
+            if (msg.Role != ChatRole.System)
+                session.MessageHistory.Add(msg);
+        }
+
         session.TotalToolCalls += AgentResult.CountToolCalls(response.Messages);
         session.LastActivityAt = DateTimeOffset.UtcNow;
 
