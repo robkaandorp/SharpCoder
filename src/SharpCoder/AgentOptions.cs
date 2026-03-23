@@ -76,4 +76,11 @@ public sealed class AgentOptions
     public Action<CompactionResult>? OnCompacted { get; set; }
 
     public ILogger Logger { get; set; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Optional reasoning effort level for models that support extended thinking.
+    /// When set, the model will adjust its reasoning depth accordingly.
+    /// When <c>null</c>, no reasoning configuration is sent (provider default).
+    /// </summary>
+    public ReasoningEffort? ReasoningEffort { get; set; }
 }

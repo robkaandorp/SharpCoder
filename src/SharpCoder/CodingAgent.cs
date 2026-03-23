@@ -104,6 +104,11 @@ public sealed class CodingAgent
             ToolMode = ChatToolMode.Auto
         };
 
+        if (_options.ReasoningEffort.HasValue)
+        {
+            chatOptions.Reasoning = new ReasoningOptions { Effort = _options.ReasoningEffort.Value };
+        }
+
         if (_options.EnableBash)
         {
             var bashTools = new BashTools(_options.WorkDirectory, logger: _logger);

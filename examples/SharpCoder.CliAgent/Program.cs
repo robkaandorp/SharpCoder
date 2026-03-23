@@ -32,6 +32,7 @@ httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("
 
 var ollamaClient = new OllamaApiClient(httpClient);
 ollamaClient.SelectedModel = "gpt-oss:120b";
+
 IChatClient chatClient = ollamaClient;
 
 // Instantiate the agent
