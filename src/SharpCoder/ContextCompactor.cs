@@ -42,6 +42,9 @@ public sealed class ContextCompactor
         if (session.MessageHistory.Count <= options.CompactionRetainRecent + 1)
             return false; // Not enough messages to compact
 
+        var tokensBefore = estimated;
+        var messagesBefore = session.MessageHistory.Count;
+
         _logger.LogInformation(
             "Context compaction triggered: ~{Tokens} tokens (threshold: {Threshold}), {Messages} messages",
             estimated, threshold, session.MessageHistory.Count);
@@ -77,6 +80,10 @@ public sealed class ContextCompactor
             _logger.LogInformation(
                 "Compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
                 oldMessages.Count, session.MessageHistory.Count, session.EstimatedContextTokens);
+
+            options.OnCompacted?.Invoke(new CompactionResult(
+                tokensBefore, session.EstimatedContextTokens,
+                messagesBefore, session.MessageHistory.Count));
 
             return true;
         }

@@ -68,5 +68,12 @@ public sealed class AgentOptions
     /// <summary>Enable automatic context compaction when approaching token limits.</summary>
     public bool EnableAutoCompaction { get; set; } = true;
 
+    /// <summary>
+    /// Optional callback invoked after context compaction completes.
+    /// Receives the number of messages compacted, the message count remaining,
+    /// and the estimated token count after compaction.
+    /// </summary>
+    public Action<CompactionResult>? OnCompacted { get; set; }
+
     public ILogger Logger { get; set; } = NullLogger.Instance;
 }
