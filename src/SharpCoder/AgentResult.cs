@@ -35,6 +35,12 @@ public sealed class AgentResult
     public int ToolCallCount { get; set; }
 
     /// <summary>
+    /// Diagnostic snapshot of everything sent to the LLM.
+    /// Populated before the call, so available even on failure.
+    /// </summary>
+    public SessionDiagnostics? Diagnostics { get; set; }
+
+    /// <summary>
     /// Counts tool calls across all messages in the conversation.
     /// </summary>
     internal static int CountToolCalls(IEnumerable<ChatMessage> messages) =>

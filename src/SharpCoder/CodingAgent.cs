@@ -54,6 +54,27 @@ public sealed class CodingAgent
 
         var messages = BuildMessages(session, userMessage);
 
+        // Capture diagnostics before the LLM call so they're available even on failure
+        var systemPrompt = messages.Count > 0 && messages[0].Role == ChatRole.System
+            ? messages[0].Text ?? string.Empty
+            : string.Empty;
+        var diagnostics = new SessionDiagnostics
+        {
+            SystemPrompt = systemPrompt,
+            UserMessage = userMessage,
+            SessionHistoryCount = session?.MessageHistory.Count ?? 0,
+            TotalMessageCount = messages.Count,
+            ToolNames = chatOptions.Tools?.Select(t => t is AIFunction f ? f.Name : t.GetType().Name).ToList()
+                        ?? new List<string>(),
+            WorkDirectory = _options.WorkDirectory,
+            EnableBash = _options.EnableBash,
+            EnableFileWrites = _options.EnableFileWrites,
+            AutoLoadedWorkspaceInstructions = _options.AutoLoadWorkspaceInstructions,
+            SkillsEnabled = _options.EnableSkills,
+            ReasoningEffort = _options.ReasoningEffort?.ToString(),
+            MaxSteps = _options.MaxSteps,
+        };
+
         try
         {
             var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
@@ -79,11 +100,11 @@ public sealed class CodingAgent
                 _logger.LogWarning(
                     "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
                     _options.MaxSteps, toolCalls);
-                return BuildResult("MaxStepsReached", finalText, response, toolCalls);
+                return BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics);
             }
 
             _logger.LogInformation("Task complete ({ToolCalls} tool calls).", toolCalls);
-            return BuildResult("Success", finalText, response, toolCalls);
+            return BuildResult("Success", finalText, response, toolCalls, diagnostics);
         }
         catch (OperationCanceledException)
         {
@@ -92,12 +113,12 @@ public sealed class CodingAgent
         catch (ArgumentOutOfRangeException ex)
         {
             _logger.LogError(ex, "SDK ArgumentOutOfRangeException — likely a malformed LLM response. Messages sent: {Count}", messages.Count);
-            return new AgentResult { Status = "Error", Message = $"SDK error (malformed LLM response): {ex.Message}" };
+            return new AgentResult { Status = "Error", Message = $"SDK error (malformed LLM response): {ex.Message}", Diagnostics = diagnostics };
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Agent execution failed.");
-            return new AgentResult { Status = "Error", Message = ex.Message };
+            return new AgentResult { Status = "Error", Message = ex.Message, Diagnostics = diagnostics };
         }
     }
 
@@ -199,7 +220,7 @@ public sealed class CodingAgent
             session.SessionId, session.MessageHistory.Count, session.EstimatedContextTokens, session.TotalToolCalls);
     }
 
-    private static AgentResult BuildResult(string status, string message, ChatResponse response, int toolCalls)
+    private static AgentResult BuildResult(string status, string message, ChatResponse response, int toolCalls, SessionDiagnostics? diagnostics = null)
     {
         return new AgentResult
         {
@@ -209,7 +230,8 @@ public sealed class CodingAgent
             ModelId = response.ModelId,
             FinishReason = response.FinishReason,
             Usage = response.Usage,
-            ToolCallCount = toolCalls
+            ToolCallCount = toolCalls,
+            Diagnostics = diagnostics,
         };
     }
 
