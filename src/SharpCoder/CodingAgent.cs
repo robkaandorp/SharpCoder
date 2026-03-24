@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -55,25 +56,7 @@ public sealed class CodingAgent
         var messages = BuildMessages(session, userMessage);
 
         // Capture diagnostics before the LLM call so they're available even on failure
-        var systemPrompt = messages.Count > 0 && messages[0].Role == ChatRole.System
-            ? messages[0].Text ?? string.Empty
-            : string.Empty;
-        var diagnostics = new SessionDiagnostics
-        {
-            SystemPrompt = systemPrompt,
-            UserMessage = userMessage,
-            SessionHistoryCount = session?.MessageHistory.Count ?? 0,
-            TotalMessageCount = messages.Count,
-            ToolNames = chatOptions.Tools?.Select(t => t is AIFunction f ? f.Name : t.GetType().Name).ToList()
-                        ?? new List<string>(),
-            WorkDirectory = _options.WorkDirectory,
-            EnableBash = _options.EnableBash,
-            EnableFileWrites = _options.EnableFileWrites,
-            AutoLoadedWorkspaceInstructions = _options.AutoLoadWorkspaceInstructions,
-            SkillsEnabled = _options.EnableSkills,
-            ReasoningEffort = _options.ReasoningEffort?.ToString(),
-            MaxSteps = _options.MaxSteps,
-        };
+        var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
         try
         {
@@ -119,6 +102,115 @@ public sealed class CodingAgent
         {
             _logger.LogError(ex, "Agent execution failed.");
             return new AgentResult { Status = "Error", Message = ex.Message, Diagnostics = diagnostics };
+        }
+    }
+
+    /// <summary>
+    /// Execute a task with streaming, yielding incremental text updates as they arrive.
+    /// The final update has <see cref="StreamingUpdateKind.Completed"/> with the full <see cref="AgentResult"/>.
+    /// </summary>
+    public async IAsyncEnumerable<StreamingUpdate> ExecuteStreamingAsync(
+        AgentSession? session,
+        string userMessage,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        _logger.LogInformation("Starting streaming coding agent task in {Dir}", _options.WorkDirectory);
+
+        if (session != null)
+        {
+            await _compactor.CompactIfNeededAsync(session, _options, ct);
+        }
+
+        var chatOptions = BuildChatOptions();
+        var wrappedClient = BuildWrappedClient();
+        var messages = BuildMessages(session, userMessage);
+        var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
+
+        var updates = new List<ChatResponseUpdate>();
+        Exception? streamError = null;
+
+        // Manually iterate the stream so we can catch errors from MoveNextAsync
+        // while still yielding text deltas (yield is not allowed inside try-catch,
+        // but IS allowed inside try-finally).
+        var enumerator = wrappedClient.GetStreamingResponseAsync(messages, chatOptions, ct)
+            .GetAsyncEnumerator(ct);
+        try
+        {
+            while (true)
+            {
+                bool hasNext;
+                try
+                {
+                    hasNext = await enumerator.MoveNextAsync();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    streamError = ex;
+                    break;
+                }
+
+                if (!hasNext) break;
+
+                var update = enumerator.Current;
+                updates.Add(update);
+
+                if (!string.IsNullOrEmpty(update.Text))
+                {
+                    yield return StreamingUpdate.TextDelta(update.Text);
+                }
+            }
+        }
+        finally
+        {
+            await enumerator.DisposeAsync();
+        }
+
+        if (streamError != null)
+        {
+            _logger.LogError(streamError, "Streaming agent execution failed.");
+            yield return StreamingUpdate.Completed(new AgentResult
+            {
+                Status = "Error",
+                Message = streamError.Message,
+                Diagnostics = diagnostics,
+            });
+            yield break;
+        }
+
+        // Build a ChatResponse from the accumulated stream updates for session tracking
+        var response = BuildResponseFromUpdates(updates);
+        var toolCalls = AgentResult.CountToolCalls(response.Messages);
+        var finalText = response.Text ?? "No text response.";
+
+        if (response.Usage != null)
+        {
+            _logger.LogInformation(
+                "Usage: inputTokens={InputTokens}, outputTokens={OutputTokens}, totalTokens={TotalTokens}",
+                response.Usage.InputTokenCount, response.Usage.OutputTokenCount, response.Usage.TotalTokenCount);
+        }
+
+        if (session != null)
+        {
+            UpdateSession(session, userMessage, response);
+        }
+
+        if (response.FinishReason == ChatFinishReason.ToolCalls)
+        {
+            _logger.LogWarning(
+                "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
+                _options.MaxSteps, toolCalls);
+            yield return StreamingUpdate.Completed(
+                BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics));
+        }
+        else
+        {
+            _logger.LogInformation("Streaming task complete ({ToolCalls} tool calls).", toolCalls);
+            yield return StreamingUpdate.Completed(
+                BuildResult("Success", finalText, response, toolCalls, diagnostics));
         }
     }
 
@@ -280,6 +372,69 @@ public sealed class CodingAgent
         }
 
         return sb.ToString();
+    }
+
+    private SessionDiagnostics BuildDiagnostics(
+        List<ChatMessage> messages,
+        ChatOptions chatOptions,
+        string userMessage,
+        AgentSession? session)
+    {
+        var systemPrompt = messages.Count > 0 && messages[0].Role == ChatRole.System
+            ? messages[0].Text ?? string.Empty
+            : string.Empty;
+
+        return new SessionDiagnostics
+        {
+            SystemPrompt = systemPrompt,
+            UserMessage = userMessage,
+            SessionHistoryCount = session?.MessageHistory.Count ?? 0,
+            TotalMessageCount = messages.Count,
+            ToolNames = chatOptions.Tools?.Select(t => t is AIFunction f ? f.Name : t.GetType().Name).ToList()
+                        ?? new List<string>(),
+            WorkDirectory = _options.WorkDirectory,
+            EnableBash = _options.EnableBash,
+            EnableFileWrites = _options.EnableFileWrites,
+            AutoLoadedWorkspaceInstructions = _options.AutoLoadWorkspaceInstructions,
+            SkillsEnabled = _options.EnableSkills,
+            ReasoningEffort = _options.ReasoningEffort?.ToString(),
+            MaxSteps = _options.MaxSteps,
+        };
+    }
+
+    private static ChatResponse BuildResponseFromUpdates(List<ChatResponseUpdate> updates)
+    {
+        var textBuilder = new StringBuilder();
+        ChatFinishReason? finishReason = null;
+        string? modelId = null;
+        UsageDetails? usage = null;
+
+        foreach (var update in updates)
+        {
+            if (!string.IsNullOrEmpty(update.Text))
+                textBuilder.Append(update.Text);
+
+            if (update.FinishReason != null)
+                finishReason = update.FinishReason;
+
+            if (update.ModelId != null)
+                modelId = update.ModelId;
+
+            // Usage details may appear as UsageContent in the final update
+            foreach (var content in update.Contents)
+            {
+                if (content is UsageContent uc)
+                    usage = uc.Details;
+            }
+        }
+
+        var message = new ChatMessage(ChatRole.Assistant, textBuilder.ToString());
+        return new ChatResponse(message)
+        {
+            FinishReason = finishReason,
+            ModelId = modelId,
+            Usage = usage,
+        };
     }
 
     private string GetWorkspaceInstructions()
