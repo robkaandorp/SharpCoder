@@ -89,6 +89,11 @@ public sealed class CodingAgent
         {
             throw;
         }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            _logger.LogError(ex, "SDK ArgumentOutOfRangeException — likely a malformed LLM response. Messages sent: {Count}", messages.Count);
+            return new AgentResult { Status = "Error", Message = $"SDK error (malformed LLM response): {ex.Message}" };
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Agent execution failed.");
