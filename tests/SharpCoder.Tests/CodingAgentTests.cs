@@ -58,18 +58,15 @@ public class CodingAgentTests
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             ReceivedMessages.Add(messages.ToList());
-            bool first = true;
             foreach (var chunk in _chunks)
             {
                 if (!string.IsNullOrEmpty(chunk))
                 {
-                    var update = new ChatResponseUpdate
+                    yield return new ChatResponseUpdate
                     {
+                        Role = ChatRole.Assistant,
                         Contents = [new TextContent(chunk)],
                     };
-                    if (first) update.Role = ChatRole.Assistant;
-                    first = false;
-                    yield return update;
                 }
                 await Task.Yield();
             }
