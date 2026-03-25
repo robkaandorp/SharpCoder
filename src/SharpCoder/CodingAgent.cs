@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -98,6 +99,10 @@ public sealed class CodingAgent
             _logger.LogError(ex, "SDK ArgumentOutOfRangeException — likely a malformed LLM response. Messages sent: {Count}", messages.Count);
             return new AgentResult { Status = "Error", Message = $"SDK error (malformed LLM response): {ex.Message}", Diagnostics = diagnostics };
         }
+        catch (HttpRequestException)
+        {
+            throw; // Propagate HTTP errors so callers can retry
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Agent execution failed.");
@@ -146,6 +151,10 @@ public sealed class CodingAgent
                 catch (OperationCanceledException)
                 {
                     throw;
+                }
+                catch (HttpRequestException)
+                {
+                    throw; // Propagate HTTP errors so callers can retry
                 }
                 catch (Exception ex)
                 {
