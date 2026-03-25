@@ -413,10 +413,11 @@ public sealed class CodingAgent
 
         foreach (var update in updates)
         {
-            // Detect new round (after tool invocations). Each round's first
-            // update carries Role; insert a paragraph break so rounds don't
-            // merge into a single wall of text.
-            if (update.Role is not null && hasText)
+            // Detect new round boundary. When FunctionInvokingChatClient
+            // handles tool calls, the previous round ends with a FinishReason.
+            // If text follows after that, it's a new round — insert a paragraph
+            // break so rounds don't merge into a single wall of text.
+            if (update.FinishReason is not null && hasText)
             {
                 needsSeparator = true;
             }
@@ -432,6 +433,7 @@ public sealed class CodingAgent
                 hasText = true;
             }
 
+            // Keep last FinishReason (the final round's reason)
             if (update.FinishReason != null)
                 finishReason = update.FinishReason;
 
