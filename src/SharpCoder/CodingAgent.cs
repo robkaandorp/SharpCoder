@@ -128,6 +128,8 @@ public sealed class CodingAgent
 
         var updates = new List<ChatResponseUpdate>();
         Exception? streamError = null;
+        bool hasEmittedText = false;
+        bool needsSeparator = false;
 
         // Manually iterate the stream so we can catch errors from MoveNextAsync
         // while still yielding text deltas (yield is not allowed inside try-catch,
@@ -158,8 +160,22 @@ public sealed class CodingAgent
                 var update = enumerator.Current;
                 updates.Add(update);
 
+                // Detect new streaming round (after tool invocations).
+                // Each round's first update carries Role; insert a separator
+                // so rounds don't merge into a single wall of text.
+                if (update.Role is not null && hasEmittedText)
+                {
+                    needsSeparator = true;
+                }
+
                 if (!string.IsNullOrEmpty(update.Text))
                 {
+                    if (needsSeparator)
+                    {
+                        yield return StreamingUpdate.TextDelta("\n\n");
+                        needsSeparator = false;
+                    }
+                    hasEmittedText = true;
                     yield return StreamingUpdate.TextDelta(update.Text);
                 }
             }
