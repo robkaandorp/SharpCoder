@@ -408,11 +408,29 @@ public sealed class CodingAgent
         ChatFinishReason? finishReason = null;
         string? modelId = null;
         UsageDetails? usage = null;
+        bool hasText = false;
+        bool needsSeparator = false;
 
         foreach (var update in updates)
         {
+            // Detect new round (after tool invocations). Each round's first
+            // update carries Role; insert a paragraph break so rounds don't
+            // merge into a single wall of text.
+            if (update.Role is not null && hasText)
+            {
+                needsSeparator = true;
+            }
+
             if (!string.IsNullOrEmpty(update.Text))
+            {
+                if (needsSeparator)
+                {
+                    textBuilder.Append("\n\n");
+                    needsSeparator = false;
+                }
                 textBuilder.Append(update.Text);
+                hasText = true;
+            }
 
             if (update.FinishReason != null)
                 finishReason = update.FinishReason;
