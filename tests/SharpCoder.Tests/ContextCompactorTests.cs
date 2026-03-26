@@ -216,4 +216,172 @@ public class ContextCompactorTests
         }
         return session;
     }
+
+    [Fact]
+    public void AdjustSplitPoint_NoToolResults_ReturnsOriginalSplitPoint()
+    {
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Hello"),
+            new(ChatRole.Assistant, "Hi"),
+            new(ChatRole.User, "How?"),
+            new(ChatRole.Assistant, "Like this"),
+        };
+
+        Assert.Equal(2, ContextCompactor.AdjustSplitPoint(messages, 2));
+    }
+
+    [Fact]
+    public void AdjustSplitPoint_ToolResultAtBoundary_MovesForward()
+    {
+        // Simulate: assistant made tool call (old), tool result at split point (orphaned)
+        var assistantWithCall = new ChatMessage(ChatRole.Assistant,
+            [new FunctionCallContent("call1", "grep", new Dictionary<string, object?> { ["pattern"] = "test" })]);
+        var toolResult = new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("call1", "result data")]);
+
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Find test"),
+            assistantWithCall,               // index 1 (old)
+            toolResult,                       // index 2 (would be start of recent — orphaned!)
+            new(ChatRole.Assistant, "Found"), // index 3
+            new(ChatRole.User, "Great"),      // index 4
+        };
+
+        // Original split at 2 would orphan the tool result
+        var adjusted = ContextCompactor.AdjustSplitPoint(messages, 2);
+
+        // Should move to 3, past the tool result
+        Assert.Equal(3, adjusted);
+    }
+
+    [Fact]
+    public void AdjustSplitPoint_MultipleToolResultsAtBoundary_MovesForwardPastAll()
+    {
+        var assistantWithCalls = new ChatMessage(ChatRole.Assistant,
+            [
+                new FunctionCallContent("c1", "grep", new Dictionary<string, object?> { ["p"] = "a" }),
+                new FunctionCallContent("c2", "read_file", new Dictionary<string, object?> { ["path"] = "f.cs" }),
+            ]);
+        var toolResult1 = new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("c1", "r1")]);
+        var toolResult2 = new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("c2", "r2")]);
+
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Search"),
+            assistantWithCalls,
+            toolResult1,                       // index 2 — orphaned
+            toolResult2,                       // index 3 — orphaned
+            new(ChatRole.Assistant, "Done"),    // index 4
+            new(ChatRole.User, "Next"),
+        };
+
+        var adjusted = ContextCompactor.AdjustSplitPoint(messages, 2);
+        Assert.Equal(4, adjusted);
+    }
+
+    [Fact]
+    public void AdjustSplitPoint_ToolCallAndResultInRecent_NoAdjustment()
+    {
+        var assistantWithCall = new ChatMessage(ChatRole.Assistant,
+            [new FunctionCallContent("c1", "grep", new Dictionary<string, object?> { ["p"] = "x" })]);
+        var toolResult = new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("c1", "found")]);
+
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Old msg 1"),
+            new(ChatRole.Assistant, "Old msg 2"),
+            assistantWithCall,                 // index 2 (start of recent — has tool call)
+            toolResult,                        // index 3 (tool result paired with index 2)
+            new(ChatRole.User, "Continue"),
+        };
+
+        // Split at 2 — tool call and result are both in recent, no orphan
+        var adjusted = ContextCompactor.AdjustSplitPoint(messages, 2);
+        Assert.Equal(2, adjusted);
+    }
+
+    [Fact]
+    public void AdjustSplitPoint_AtZero_ReturnsZero()
+    {
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Hello"),
+        };
+
+        Assert.Equal(0, ContextCompactor.AdjustSplitPoint(messages, 0));
+    }
+
+    [Fact]
+    public void AdjustSplitPoint_AtEnd_ReturnsEnd()
+    {
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.User, "Hello"),
+            new(ChatRole.Assistant, "Hi"),
+        };
+
+        Assert.Equal(2, ContextCompactor.AdjustSplitPoint(messages, 2));
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_OrphanedToolResults_IncludedInOldMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary with tools handled.");
+        var compactor = new ContextCompactor(mockClient);
+
+        var session = AgentSession.Create();
+
+        // Build a session with tool calls at the compaction boundary
+        for (int i = 0; i < 10; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Msg {i}: " + new string('x', 200)));
+
+        // Add assistant with tool call + tool results right before the last 5 messages
+        var assistantWithCall = new ChatMessage(ChatRole.Assistant,
+            [new FunctionCallContent("tc1", "read_file", new Dictionary<string, object?> { ["path"] = "test.cs" })]);
+        var toolResult = new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("tc1", "file contents here")]);
+
+        session.MessageHistory.Add(assistantWithCall);  // index 10
+        session.MessageHistory.Add(toolResult);         // index 11
+
+        // 5 more recent messages
+        for (int i = 12; i < 17; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Recent {i}: " + new string('y', 200)));
+
+        // 17 messages total. retainRecent=5, so original split at 12.
+        // msg[11] is a tool result → split should adjust to 12, which is not a tool result. Good.
+        // But if retainRecent=6, original split at 11 — msg[11] is tool result → adjust to 12.
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionThreshold = 0.01,
+            CompactionRetainRecent = 6
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // No message in the remaining history should be a lone tool result
+        // without a preceding assistant tool call
+        for (int i = 1; i < session.MessageHistory.Count; i++)
+        {
+            var msg = session.MessageHistory[i];
+            if (msg.Contents.OfType<FunctionResultContent>().Any())
+            {
+                // The preceding message must have tool calls
+                var prev = session.MessageHistory[i - 1];
+                Assert.True(prev.Contents.OfType<FunctionCallContent>().Any(),
+                    $"Tool result at index {i} has no preceding tool call");
+            }
+        }
+    }
 }

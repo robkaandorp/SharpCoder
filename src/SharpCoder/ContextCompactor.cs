@@ -52,8 +52,12 @@ public sealed class ContextCompactor
         var messages = session.MessageHistory;
         var retainCount = options.CompactionRetainRecent;
 
-        // Split: old messages to summarize, recent messages to keep
-        var splitPoint = messages.Count - retainCount;
+        // Split: old messages to summarize, recent messages to keep.
+        // Adjust the split point so we never orphan tool results — a tool result
+        // message must always be preceded by an assistant message with tool_calls.
+        var splitPoint = AdjustSplitPoint(messages, messages.Count - retainCount);
+        if (splitPoint <= 0)
+            return false; // No messages to compact after adjustment
         var oldMessages = messages.Take(splitPoint).ToList();
         var recentMessages = messages.Skip(splitPoint).ToList();
 
@@ -138,5 +142,25 @@ public sealed class ContextCompactor
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Adjusts the split point so that tool result messages at the start of the "recent"
+    /// portion are moved into the "old" portion. This prevents orphaned tool results
+    /// (role=tool without a preceding assistant tool_calls) which crash some LLM APIs.
+    /// </summary>
+    public static int AdjustSplitPoint(IList<ChatMessage> messages, int splitPoint)
+    {
+        if (splitPoint < 0) splitPoint = 0;
+        if (splitPoint >= messages.Count) return messages.Count;
+
+        // Move the split forward past any tool result messages at the boundary
+        while (splitPoint < messages.Count &&
+               messages[splitPoint].Contents.OfType<FunctionResultContent>().Any())
+        {
+            splitPoint++;
+        }
+
+        return splitPoint;
     }
 }
