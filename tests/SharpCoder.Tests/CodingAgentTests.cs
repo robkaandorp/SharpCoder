@@ -314,4 +314,256 @@ public class CodingAgentTests
         Assert.Equal("OK", secondCallMessages[2].Text);
         Assert.Equal("Turn 2", secondCallMessages[3].Text);
     }
+
+    // ── ShowToolCallsInStream tests ──
+
+    /// <summary>
+    /// Chat client that simulates tool calls: first response contains a FunctionCallContent,
+    /// second response (after tool result) returns final text.
+    /// </summary>
+    private sealed class ToolCallingClient : IChatClient
+    {
+        private readonly string _toolName;
+        private readonly Dictionary<string, object?> _toolArgs;
+        private readonly string _finalText;
+        private int _callCount;
+        public List<IList<ChatMessage>> ReceivedMessages { get; } = [];
+
+        public ToolCallingClient(string toolName, Dictionary<string, object?> toolArgs, string finalText)
+        {
+            _toolName = toolName;
+            _toolArgs = toolArgs;
+            _finalText = finalText;
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            ReceivedMessages.Add(messages.ToList());
+            _callCount++;
+
+            if (_callCount == 1)
+            {
+                // First round: text + tool call
+                yield return new ChatResponseUpdate
+                {
+                    Role = ChatRole.Assistant,
+                    Contents = [new TextContent("I'll create that for you.")]
+                };
+                await Task.Yield();
+                yield return new ChatResponseUpdate
+                {
+                    Contents = [new FunctionCallContent("call_1", _toolName, _toolArgs)]
+                };
+                yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.ToolCalls };
+            }
+            else
+            {
+                // Second round: final text
+                yield return new ChatResponseUpdate
+                {
+                    Role = ChatRole.Assistant,
+                    Contents = [new TextContent(_finalText)]
+                };
+                await Task.Yield();
+                yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.Stop };
+            }
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    private static AgentOptions ToolCallOptions() => new()
+    {
+        WorkDirectory = Path.GetTempPath(),
+        EnableBash = false,
+        EnableFileOps = false,
+        EnableSkills = false,
+        SystemPrompt = "You are a test agent.",
+        ShowToolCallsInStream = true,
+    };
+
+    [Fact]
+    public async Task ShowToolCalls_YieldsToolCallAndResultAsTextDelta()
+    {
+        var client = new ToolCallingClient(
+            "create_goal",
+            new Dictionary<string, object?> { ["id"] = "add-auth" },
+            "Done! Goal created.");
+
+        var opts = ToolCallOptions();
+        opts.CustomTools = [AIFunctionFactory.Create(
+            (string id) => $"✅ Goal created: {id}", "create_goal")];
+
+        var agent = new CodingAgent(client, opts);
+        var ct = TestContext.Current.CancellationToken;
+
+        var allText = new System.Text.StringBuilder();
+        StreamingUpdate? completed = null;
+        await foreach (var update in agent.ExecuteStreamingAsync(null, "Create a goal", ct))
+        {
+            if (update.Kind == StreamingUpdateKind.TextDelta)
+                allText.Append(update.Text);
+            if (update.Kind == StreamingUpdateKind.Completed)
+                completed = update;
+        }
+
+        var text = allText.ToString();
+
+        // Should contain the tool call markdown
+        Assert.Contains("`🔧 create_goal(", text);
+        Assert.Contains("id=\"add-auth\"", text);
+
+        // Should contain the tool result as blockquote
+        Assert.Contains("> ✅ Goal created: add-auth", text);
+
+        // Should contain text from both LLM rounds
+        Assert.Contains("I'll create that for you.", text);
+        Assert.Contains("Done! Goal created.", text);
+
+        // Completed result should report 1 tool call
+        Assert.NotNull(completed?.Result);
+        Assert.Equal(1, completed!.Result!.ToolCallCount);
+        Assert.Equal("Success", completed.Result.Status);
+    }
+
+    [Fact]
+    public async Task ShowToolCalls_SessionTrackingIncludesToolMessages()
+    {
+        var client = new ToolCallingClient(
+            "get_goal",
+            new Dictionary<string, object?> { ["id"] = "test" },
+            "Here are the details.");
+
+        var opts = ToolCallOptions();
+        opts.CustomTools = [AIFunctionFactory.Create(
+            (string id) => $"Goal {id}: Draft", "get_goal")];
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("tool-session");
+        var ct = TestContext.Current.CancellationToken;
+
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Show goal", ct)) { }
+
+        // Session should contain: user, assistant(with tool call), tool result, assistant(final)
+        Assert.True(session.MessageHistory.Count >= 4);
+        Assert.Equal(ChatRole.User, session.MessageHistory[0].Role);
+        Assert.Equal("Show goal", session.MessageHistory[0].Text);
+        Assert.Equal(1, session.TotalToolCalls);
+    }
+
+    [Fact]
+    public async Task ShowToolCalls_TextOrderIsCorrect()
+    {
+        var client = new ToolCallingClient(
+            "approve_goal",
+            new Dictionary<string, object?> { ["id"] = "my-goal" },
+            "All done.");
+
+        var opts = ToolCallOptions();
+        opts.CustomTools = [AIFunctionFactory.Create(
+            (string id) => $"Approved: {id}", "approve_goal")];
+
+        var agent = new CodingAgent(client, opts);
+        var ct = TestContext.Current.CancellationToken;
+
+        var textParts = new List<string>();
+        await foreach (var update in agent.ExecuteStreamingAsync(null, "Approve it", ct))
+        {
+            if (update.Kind == StreamingUpdateKind.TextDelta)
+                textParts.Add(update.Text!);
+        }
+
+        // Find indices to verify order: LLM text → tool call → result → LLM text
+        var llmTextIdx = textParts.FindIndex(t => t.Contains("I'll create that"));
+        var toolCallIdx = textParts.FindIndex(t => t.Contains("🔧 approve_goal"));
+        var resultIdx = textParts.FindIndex(t => t.Contains("Approved:"));
+        var finalIdx = textParts.FindIndex(t => t.Contains("All done."));
+
+        Assert.True(llmTextIdx < toolCallIdx, "LLM text should come before tool call");
+        Assert.True(toolCallIdx < resultIdx, "Tool call should come before result");
+        Assert.True(resultIdx < finalIdx, "Result should come before final text");
+    }
+
+    [Fact]
+    public async Task ShowToolCalls_DisabledByDefault_NoToolCallText()
+    {
+        // When ShowToolCallsInStream is false (default), tool calls
+        // are handled by FunctionInvokingChatClient — no tool text injected.
+        // This test ensures the default path still works with a simple response.
+        var client = new StreamingResponseClient("Simple response");
+        var agent = new CodingAgent(client, MinimalOptions());
+        var ct = TestContext.Current.CancellationToken;
+
+        var allText = new System.Text.StringBuilder();
+        await foreach (var update in agent.ExecuteStreamingAsync(null, "Test", ct))
+        {
+            if (update.Kind == StreamingUpdateKind.TextDelta)
+                allText.Append(update.Text);
+        }
+
+        Assert.Equal("Simple response", allText.ToString());
+        Assert.DoesNotContain("🔧", allText.ToString());
+    }
+
+    // ── FormatToolCallArgs / TruncateFirstLine unit tests ──
+
+    [Fact]
+    public void FormatToolCallArgs_FormatsKeyValuePairs()
+    {
+        var args = new Dictionary<string, object?>
+        {
+            ["id"] = "add-auth",
+            ["priority"] = "High"
+        };
+        var result = CodingAgent.FormatToolCallArgs(args);
+        Assert.Contains("id=\"add-auth\"", result);
+        Assert.Contains("priority=\"High\"", result);
+    }
+
+    [Fact]
+    public void FormatToolCallArgs_TruncatesLongValues()
+    {
+        var args = new Dictionary<string, object?>
+        {
+            ["description"] = new string('x', 100)
+        };
+        var result = CodingAgent.FormatToolCallArgs(args);
+        Assert.Contains("…", result);
+        Assert.True(result.Length <= 102); // maxLength + quotes
+    }
+
+    [Fact]
+    public void FormatToolCallArgs_NullOrEmpty_ReturnsEmpty()
+    {
+        Assert.Equal("", CodingAgent.FormatToolCallArgs(null));
+        Assert.Equal("", CodingAgent.FormatToolCallArgs(new Dictionary<string, object?>()));
+    }
+
+    [Fact]
+    public void TruncateFirstLine_ReturnsFirstLine()
+    {
+        Assert.Equal("first line", CodingAgent.TruncateFirstLine("first line\nsecond line", 120));
+    }
+
+    [Fact]
+    public void TruncateFirstLine_TruncatesLongLine()
+    {
+        var result = CodingAgent.TruncateFirstLine(new string('a', 200), 50);
+        Assert.Equal(50, result.Length);
+        Assert.EndsWith("…", result);
+    }
+
+    [Fact]
+    public void TruncateFirstLine_ShortLine_ReturnsAsIs()
+    {
+        Assert.Equal("short", CodingAgent.TruncateFirstLine("short", 120));
+    }
 }

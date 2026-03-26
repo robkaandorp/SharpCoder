@@ -83,4 +83,17 @@ public sealed class AgentOptions
     /// When <c>null</c>, no reasoning configuration is sent (provider default).
     /// </summary>
     public ReasoningEffort? ReasoningEffort { get; set; }
+
+    /// <summary>
+    /// When <c>true</c>, tool calls are surfaced as markdown-formatted
+    /// <see cref="StreamingUpdateKind.TextDelta"/> events during streaming,
+    /// inserted at the correct position between LLM text chunks.
+    /// <para>
+    /// Each tool call appears as an inline-code line with the tool name and
+    /// truncated arguments, followed by a blockquote with a one-line result summary.
+    /// </para>
+    /// Defaults to <c>false</c> (tool calls are invisible in the stream, handled by
+    /// <c>FunctionInvokingChatClient</c> as a black box).
+    /// </summary>
+    public bool ShowToolCallsInStream { get; set; }
 }

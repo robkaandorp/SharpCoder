@@ -126,6 +126,15 @@ public sealed class CodingAgent
             await _compactor.CompactIfNeededAsync(session, _options, ct);
         }
 
+        // When ShowToolCallsInStream is enabled, handle the tool loop manually
+        // so we can inject markdown-formatted tool call text at the right position.
+        if (_options.ShowToolCallsInStream)
+        {
+            await foreach (var update in StreamWithToolCallsAsync(session, userMessage, ct))
+                yield return update;
+            yield break;
+        }
+
         var chatOptions = BuildChatOptions();
         var wrappedClient = BuildWrappedClient();
         var messages = BuildMessages(session, userMessage);
@@ -221,6 +230,218 @@ public sealed class CodingAgent
             yield return StreamingUpdate.Completed(
                 BuildResult("Success", finalText, response, toolCalls, diagnostics));
         }
+    }
+
+    /// <summary>
+    /// Streaming path that handles the tool invocation loop manually,
+    /// injecting markdown-formatted tool call info into the text stream.
+    /// </summary>
+    private async IAsyncEnumerable<StreamingUpdate> StreamWithToolCallsAsync(
+        AgentSession? session,
+        string userMessage,
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        var chatOptions = BuildChatOptions();
+        var messages = BuildMessages(session, userMessage);
+        var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
+
+        var allResponseMessages = new List<ChatMessage>();
+        int totalToolCalls = 0;
+        int steps = 0;
+        string? lastModelId = null;
+        UsageDetails? lastUsage = null;
+
+        while (steps <= _options.MaxSteps)
+        {
+            // Stream one round from the raw client (no FunctionInvokingChatClient)
+            var streamUpdates = new List<ChatResponseUpdate>();
+            Exception? streamError = null;
+
+            var enumerator = _client.GetStreamingResponseAsync(messages, chatOptions, ct)
+                .GetAsyncEnumerator(ct);
+            try
+            {
+                while (true)
+                {
+                    bool hasNext;
+                    try { hasNext = await enumerator.MoveNextAsync(); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (HttpRequestException) { throw; }
+                    catch (Exception ex) { streamError = ex; break; }
+
+                    if (!hasNext) break;
+
+                    var update = enumerator.Current;
+                    streamUpdates.Add(update);
+
+                    if (!string.IsNullOrEmpty(update.Text))
+                        yield return StreamingUpdate.TextDelta(update.Text);
+                }
+            }
+            finally
+            {
+                await enumerator.DisposeAsync();
+            }
+
+            if (streamError != null)
+            {
+                _logger.LogError(streamError, "Streaming agent execution failed.");
+                yield return StreamingUpdate.Completed(new AgentResult
+                {
+                    Status = "Error",
+                    Message = streamError.Message,
+                    Diagnostics = diagnostics,
+                });
+                yield break;
+            }
+
+            // Reconstruct the response from streaming updates
+            var response = streamUpdates.ToChatResponse();
+            if (response.ModelId != null) lastModelId = response.ModelId;
+            if (response.Usage != null) lastUsage = response.Usage;
+
+            // Track response messages for session
+            foreach (var msg in response.Messages)
+                allResponseMessages.Add(msg);
+
+            // Extract tool calls from the response
+            var functionCalls = response.Messages
+                .SelectMany(m => m.Contents)
+                .OfType<FunctionCallContent>()
+                .ToList();
+
+            if (functionCalls.Count == 0)
+                break; // No tool calls — final text response
+
+            // Add assistant response (containing tool calls) to the conversation
+            foreach (var msg in response.Messages)
+                messages.Add(msg);
+
+            // Process each tool call
+            foreach (var fc in functionCalls)
+            {
+                steps++;
+                totalToolCalls++;
+
+                // Yield formatted tool call as markdown
+                var argsStr = FormatToolCallArgs(fc.Arguments);
+                yield return StreamingUpdate.TextDelta($"\n\n`🔧 {fc.Name}({argsStr})`\n");
+
+                // Find and invoke the matching tool
+                var tool = chatOptions.Tools?.OfType<AIFunction>().FirstOrDefault(f => f.Name == fc.Name);
+                object? result;
+                if (tool != null)
+                {
+                    try
+                    {
+                        result = await tool.InvokeAsync(
+                            new AIFunctionArguments(fc.Arguments ?? new Dictionary<string, object?>()), ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Tool {ToolName} failed", fc.Name);
+                        result = $"Error: {ex.Message}";
+                    }
+                }
+                else
+                {
+                    result = $"Unknown tool: {fc.Name}";
+                }
+
+                // Yield formatted result (first line, truncated)
+                var resultStr = result?.ToString() ?? "(no result)";
+                var firstLine = TruncateFirstLine(resultStr, 120);
+                yield return StreamingUpdate.TextDelta($"> {firstLine}\n");
+
+                // Add tool result to conversation for the next round
+                var resultMessage = new ChatMessage(ChatRole.Tool,
+                    new AIContent[] { new FunctionResultContent(fc.CallId, result) });
+                messages.Add(resultMessage);
+                allResponseMessages.Add(resultMessage);
+            }
+        }
+
+        // Update session with all messages
+        if (session != null)
+        {
+            session.MessageHistory.Add(new ChatMessage(ChatRole.User, userMessage));
+            foreach (var msg in allResponseMessages)
+            {
+                if (msg.Role != ChatRole.System)
+                    session.MessageHistory.Add(msg);
+            }
+            session.TotalToolCalls += totalToolCalls;
+            session.LastActivityAt = DateTimeOffset.UtcNow;
+            if (lastUsage != null)
+            {
+                session.InputTokensUsed += lastUsage.InputTokenCount ?? 0;
+                session.OutputTokensUsed += lastUsage.OutputTokenCount ?? 0;
+            }
+        }
+
+        // Build final text from all assistant text messages
+        var finalText = string.Join("\n\n",
+            allResponseMessages
+                .Where(m => m.Role == ChatRole.Assistant && !string.IsNullOrWhiteSpace(m.Text))
+                .Select(m => m.Text));
+        if (string.IsNullOrEmpty(finalText)) finalText = "No text response.";
+
+        var status = steps >= _options.MaxSteps ? "MaxStepsReached" : "Success";
+        if (status == "MaxStepsReached")
+        {
+            _logger.LogWarning("Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls.",
+                _options.MaxSteps, totalToolCalls);
+        }
+        else
+        {
+            _logger.LogInformation("Streaming task complete ({ToolCalls} tool calls).", totalToolCalls);
+        }
+
+        yield return StreamingUpdate.Completed(new AgentResult
+        {
+            Status = status,
+            Message = finalText,
+            Messages = allResponseMessages,
+            ModelId = lastModelId,
+            FinishReason = steps >= _options.MaxSteps ? ChatFinishReason.ToolCalls : ChatFinishReason.Stop,
+            Usage = lastUsage,
+            ToolCallCount = totalToolCalls,
+            Diagnostics = diagnostics,
+        });
+    }
+
+    /// <summary>Formats tool call arguments as a truncated key=value string.</summary>
+    internal static string FormatToolCallArgs(IDictionary<string, object?>? args, int maxLength = 100)
+    {
+        if (args == null || args.Count == 0) return "";
+        var parts = args.Select(a =>
+        {
+            var val = a.Value?.ToString() ?? "null";
+            if (val.Length > 40) val = val.Substring(0, 39) + "…";
+            return $"{a.Key}={FormatArgValue(val)}";
+        });
+        var joined = string.Join(", ", parts);
+        if (joined.Length > maxLength)
+            joined = joined.Substring(0, maxLength - 1) + "…";
+        return joined;
+    }
+
+    private static string FormatArgValue(string val)
+    {
+        // Wrap string values in quotes for readability
+        if (val == "null" || val == "true" || val == "false") return val;
+        if (int.TryParse(val, out _) || double.TryParse(val, out _)) return val;
+        return "\"" + val + "\"";
+    }
+
+    /// <summary>Returns the first line of text, truncated to maxLength.</summary>
+    internal static string TruncateFirstLine(string text, int maxLength)
+    {
+        var newline = text.IndexOfAny(new[] { '\n', '\r' });
+        var line = newline >= 0 ? text.Substring(0, newline) : text;
+        if (line.Length > maxLength)
+            line = line.Substring(0, maxLength - 1) + "…";
+        return line;
     }
 
     private ChatOptions BuildChatOptions()
