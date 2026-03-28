@@ -2,6 +2,7 @@ name: Build and Publish NuGet Package
 
 on:
   push:
+    branches: [develop]  # beta packages
     tags:
       - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
   pull_request:
@@ -45,9 +46,19 @@ jobs:
         
     - name: Build
       run: dotnet build src/SharpCoder/SharpCoder.csproj --configuration Release
+
+    - name: Set version
+      id: version
+      run: |
+        if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          echo "suffix=" >> $GITHUB_OUTPUT
+        else
+          echo "suffix=--version-suffix beta.${{ github.run_number }}" >> $GITHUB_OUTPUT
+        fi
         
     - name: Pack
-      run: dotnet pack src/SharpCoder/SharpCoder.csproj --configuration Release --no-build -o ./nupkg
+      run: dotnet pack src/SharpCoder/SharpCoder.csproj --configuration Release --no-build -o ./nupkg ${{ steps.version.outputs.suffix }}
       
     - name: Push to NuGet
       run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
