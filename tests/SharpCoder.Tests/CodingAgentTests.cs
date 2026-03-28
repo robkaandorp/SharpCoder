@@ -566,4 +566,122 @@ public class CodingAgentTests
     {
         Assert.Equal("short", CodingAgent.TruncateFirstLine("short", 120));
     }
+
+    // ── LastKnownContextTokens tests ──
+
+    /// <summary>
+    /// Chat client that returns a fixed response with token usage information.
+    /// </summary>
+    private sealed class UsageTrackingClient : IChatClient
+    {
+        private readonly int? _inputTokenCount;
+        private readonly int? _outputTokenCount;
+        public List<IList<ChatMessage>> ReceivedMessages { get; } = [];
+
+        public UsageTrackingClient(int? inputTokenCount = null, int? outputTokenCount = null)
+        {
+            _inputTokenCount = inputTokenCount;
+            _outputTokenCount = outputTokenCount;
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            ReceivedMessages.Add(messages.ToList());
+            var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, "Done."));
+            if (_inputTokenCount.HasValue)
+            {
+                response.Usage = new UsageDetails
+                {
+                    InputTokenCount = _inputTokenCount,
+                    OutputTokenCount = _outputTokenCount ?? 0,
+                    TotalTokenCount = (_inputTokenCount ?? 0) + (_outputTokenCount ?? 0)
+                };
+            }
+            return Task.FromResult(response);
+        }
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            ReceivedMessages.Add(messages.ToList());
+            
+            // Yield text content
+            yield return new ChatResponseUpdate
+            {
+                Role = ChatRole.Assistant,
+                Contents = [new TextContent("Done.")]
+            };
+            await Task.Yield();
+            
+            // Yield usage content if specified
+            if (_inputTokenCount.HasValue)
+            {
+                yield return new ChatResponseUpdate
+                {
+                    Contents = [new UsageContent(new UsageDetails
+                    {
+                        InputTokenCount = _inputTokenCount,
+                        OutputTokenCount = _outputTokenCount ?? 0,
+                        TotalTokenCount = (_inputTokenCount ?? 0) + (_outputTokenCount ?? 0)
+                    })]
+                };
+            }
+            
+            yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.Stop };
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_UpdatesLastKnownContextTokens_FromInputTokenCount()
+    {
+        // Arrange: client returns exact InputTokenCount = 50000
+        var client = new UsageTrackingClient(inputTokenCount: 50000, outputTokenCount: 1000);
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("token-test");
+
+        // Act
+        await agent.ExecuteAsync(session, "Hello", TestContext.Current.CancellationToken);
+
+        // Assert: session.LastKnownContextTokens should be set to exact value from API
+        Assert.Equal(50000, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_NullInputTokenCount_DoesNotUpdateLastKnownContextTokens()
+    {
+        // Arrange: client returns response without usage (null InputTokenCount)
+        var client = new UsageTrackingClient(inputTokenCount: null);
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("null-usage-test");
+        session.LastKnownContextTokens = 12345; // Pre-set a value
+
+        // Act
+        await agent.ExecuteAsync(session, "Hello", TestContext.Current.CancellationToken);
+
+        // Assert: LastKnownContextTokens should remain unchanged (not set to 0)
+        Assert.Equal(12345, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task ExecuteStreamingAsync_UpdatesLastKnownContextTokens_FromInputTokenCount()
+    {
+        // Arrange: client returns InputTokenCount = 75000 in streaming response
+        var client = new UsageTrackingClient(inputTokenCount: 75000, outputTokenCount: 500);
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("stream-token-test");
+
+        // Act
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Stream test", TestContext.Current.CancellationToken)) { }
+
+        // Assert: LastKnownContextTokens should be updated from usage
+        Assert.Equal(75000, session.LastKnownContextTokens);
+    }
 }

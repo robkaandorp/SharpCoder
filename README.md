@@ -67,7 +67,7 @@ var restored = await AgentSession.LoadAsync("session.json");
 await agent.ExecuteAsync(restored, "What did we do so far?");
 ```
 
-Sessions track cumulative token usage, tool call counts, and estimated context size.
+Sessions track cumulative token usage, tool call counts, and exact context size from the most recent API response.
 
 ## Streaming
 
@@ -174,7 +174,8 @@ result.Diagnostics   // Snapshot of everything sent to the LLM (system prompt, t
 
 Long-running sessions can exceed model context limits. SharpCoder automatically compacts conversation history by summarizing older messages while preserving recent context:
 
-- Triggered when estimated tokens exceed `CompactionThreshold × MaxContextTokens`
+- Triggered when tokens exceed `CompactionThreshold × MaxContextTokens`
+- Uses exact token counts from API responses (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call
 - Older messages are summarized into a single `[CONTEXT SUMMARY]` message
 - Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
 - Key decisions, findings, and file paths are preserved in the summary

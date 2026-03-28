@@ -73,6 +73,9 @@ public sealed class CodingAgent
                     response.Usage.InputTokenCount, response.Usage.OutputTokenCount, response.Usage.TotalTokenCount);
             }
 
+            if (session != null && response.Usage?.InputTokenCount != null)
+                session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
+
             // Update session with new messages and usage
             if (session != null)
             {
@@ -310,6 +313,9 @@ public sealed class CodingAgent
             var response = streamUpdates.ToChatResponse();
             if (response.ModelId != null) lastModelId = response.ModelId;
             if (response.Usage != null) lastUsage = response.Usage;
+
+            if (session != null && response.Usage?.InputTokenCount != null)
+                session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
 
             // Track response messages for session
             foreach (var msg in response.Messages)
@@ -550,6 +556,9 @@ public sealed class CodingAgent
             session.InputTokensUsed += response.Usage.InputTokenCount ?? 0;
             session.OutputTokensUsed += response.Usage.OutputTokenCount ?? 0;
         }
+
+        if (response.Usage?.InputTokenCount != null)
+            session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
 
         _logger.LogDebug(
             "Session {SessionId}: {MessageCount} messages, ~{Tokens} context tokens, {TotalTools} total tool calls",

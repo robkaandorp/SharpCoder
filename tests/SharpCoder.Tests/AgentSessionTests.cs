@@ -201,4 +201,69 @@ public class AgentSessionTests
         Assert.InRange(session.CreatedAt, before, after);
         Assert.InRange(session.LastActivityAt, before, after);
     }
+
+    [Fact]
+    public async Task SaveAndLoad_RoundTripsLastKnownContextTokens()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var session = AgentSession.Create("token-roundtrip");
+        session.LastKnownContextTokens = 12345;
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "Hello"));
+
+        var path = Path.Combine(Path.GetTempPath(), $"session-tokens-{Guid.NewGuid()}.json");
+        try
+        {
+            await session.SaveAsync(path, ct);
+            Assert.True(File.Exists(path));
+
+            var loaded = await AgentSession.LoadAsync(path, ct);
+            Assert.Equal("token-roundtrip", loaded.SessionId);
+            Assert.Equal(12345, loaded.LastKnownContextTokens);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void LastKnownContextTokens_DefaultsToZero()
+    {
+        var session = AgentSession.Create();
+        Assert.Equal(0, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public void ClearHistory_ResetsLastKnownContextTokens()
+    {
+        var session = AgentSession.Create();
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "hello"));
+        session.LastKnownContextTokens = 42_000;
+
+        session.ClearHistory();
+
+        Assert.Equal(0, session.LastKnownContextTokens);
+        Assert.Empty(session.MessageHistory);
+    }
+
+    [Fact]
+    public async Task SaveAndLoad_LastKnownContextTokens_DefaultsToZeroWhenNotSet()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var session = AgentSession.Create("default-tokens");
+        // Don't set LastKnownContextTokens - should remain 0
+        Assert.Equal(0, session.LastKnownContextTokens);
+
+        var path = Path.Combine(Path.GetTempPath(), $"session-default-tokens-{Guid.NewGuid()}.json");
+        try
+        {
+            await session.SaveAsync(path, ct);
+            var loaded = await AgentSession.LoadAsync(path, ct);
+            Assert.Equal(0, loaded.LastKnownContextTokens);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
 }

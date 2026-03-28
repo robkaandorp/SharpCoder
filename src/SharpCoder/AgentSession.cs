@@ -39,6 +39,14 @@ public sealed class AgentSession
     public DateTimeOffset LastActivityAt { get; set; } = DateTimeOffset.UtcNow;
 
     /// <summary>
+    /// Exact input token count from the most recent API response.
+    /// Represents the actual context size the model processed, including system prompt,
+    /// message history, tool definitions, and all overhead. Updated after each API call.
+    /// Zero until the first API response is received.
+    /// </summary>
+    public long LastKnownContextTokens { get; set; }
+
+    /// <summary>
     /// Estimated token count of the current message history.
     /// Uses a rough heuristic (~4 chars per token).
     /// </summary>
@@ -78,7 +86,8 @@ public sealed class AgentSession
             OutputTokensUsed = OutputTokensUsed,
             CreatedAt = CreatedAt,
             LastActivityAt = LastActivityAt,
-            Messages = MessageHistory
+            Messages = MessageHistory,
+            LastKnownContextTokens = LastKnownContextTokens
         };
 
         var json = JsonSerializer.Serialize(data, SerializerOptions);
@@ -103,7 +112,8 @@ public sealed class AgentSession
             InputTokensUsed = data.InputTokensUsed,
             OutputTokensUsed = data.OutputTokensUsed,
             CreatedAt = data.CreatedAt,
-            LastActivityAt = data.LastActivityAt
+            LastActivityAt = data.LastActivityAt,
+            LastKnownContextTokens = data.LastKnownContextTokens
         };
     }
 
@@ -120,6 +130,7 @@ public sealed class AgentSession
     public void ClearHistory()
     {
         MessageHistory.Clear();
+        LastKnownContextTokens = 0;
     }
 
     private static long EstimateArgumentsLength(FunctionCallContent fc)
@@ -157,5 +168,6 @@ public sealed class AgentSession
         public long OutputTokensUsed { get; set; }
         public DateTimeOffset CreatedAt { get; set; }
         public DateTimeOffset LastActivityAt { get; set; }
+        public long LastKnownContextTokens { get; set; }
     }
 }

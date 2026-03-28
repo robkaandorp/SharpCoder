@@ -624,4 +624,169 @@ public class ContextCompactorTests
             }
         }
     }
+
+    [Fact]
+    public async Task CompactIfNeeded_PrefersExactLastKnownContextTokens_OverEstimate()
+    {
+        // Arrange: session has exact token count (50000) and heuristic is higher (70000)
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+        
+        // Add messages that would give a higher heuristic estimate
+        // ~800 chars per message → ~200 tokens per message, 30 messages → ~6000 tokens estimated
+        for (int i = 0; i < 30; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message {i}: " + new string('x', 800)));
+        
+        // Set exact count to 50000 (lower than heuristic ~6000)
+        session.LastKnownContextTokens = 50000;
+        
+        // Options: threshold = 50000 * 0.5 = 25000 tokens
+        // With exact count (50000 >= 25000) → compaction triggered
+        // With heuristic (~6000 < 25000) → NO compaction
+        // This test verifies the exact count is used
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 50000,
+            CompactionThreshold = 0.5, // threshold = 25000
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction should be triggered because 50000 >= 25000 (exact count used)
+        Assert.True(result, "Compaction should be triggered when exact count exceeds threshold");
+        Assert.Equal(1, mockClient.CallCount);
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_FallsBackToEstimate_WhenExactCountIsZero()
+    {
+        // Arrange: session has LastKnownContextTokens = 0 (no API response yet), use estimate
+        var client = new ThrowingClient(); // Should not be called if below threshold
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+        
+        // Add small messages → low estimate
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "Hello"));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, "Hi"));
+        
+        // LastKnownContextTokens = 0 by default
+        Assert.Equal(0, session.LastKnownContextTokens);
+        
+        // High threshold - compaction should NOT trigger
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction should NOT trigger because estimate is below threshold
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_ResetsLastKnownContextTokens_AfterCompaction()
+    {
+        // Arrange
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                new string('x', 400)));
+
+        // Set a non-zero value to simulate stale token count
+        session.LastKnownContextTokens = 99_000;
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.9, // threshold = 90000 — below LastKnownContextTokens
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction succeeded and LastKnownContextTokens is reset to 0
+        Assert.True(result);
+        Assert.Equal(0, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_ResetsLastKnownContextTokens_AfterCompaction()
+    {
+        // Arrange
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message {i}"));
+
+        session.LastKnownContextTokens = 55_000;
+
+        var options = new AgentOptions { CompactionRetainRecent = 5 };
+
+        // Act
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(result);
+        Assert.Equal(0, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_ResetsLastKnownContextTokens_AfterCompaction()
+    {
+        // Arrange
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "You are an agent.")
+        };
+
+        for (int i = 0; i < 20; i++)
+            messages.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                new string('x', 400)));
+
+        // Sync session history (no system prompt)
+        foreach (var m in messages.Skip(1))
+            session.MessageHistory.Add(m);
+
+        session.LastKnownContextTokens = 77_000;
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 10_000,
+            CompactionThreshold = 0.1, // very low so compaction triggers on estimated chars
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(result);
+        Assert.Equal(0, session.LastKnownContextTokens);
+    }
 }

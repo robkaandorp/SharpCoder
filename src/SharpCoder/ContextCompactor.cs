@@ -37,7 +37,9 @@ public sealed class ContextCompactor
         if (!options.EnableAutoCompaction) return false;
 
         var threshold = (long)(options.MaxContextTokens * options.CompactionThreshold);
-        var estimated = session.EstimatedContextTokens;
+        var estimated = session.LastKnownContextTokens > 0
+            ? session.LastKnownContextTokens
+            : session.EstimatedContextTokens;
 
         if (estimated < threshold) return false;
         if (session.MessageHistory.Count <= options.CompactionRetainRecent + 1)
@@ -90,6 +92,7 @@ public sealed class ContextCompactor
                 tokensBefore, session.EstimatedContextTokens,
                 messagesBefore, session.MessageHistory.Count));
 
+            session.LastKnownContextTokens = 0;
             return true;
         }
         catch (System.Exception ex)
@@ -183,6 +186,7 @@ public sealed class ContextCompactor
             tokensBefore, session.EstimatedContextTokens,
             messagesBefore, session.MessageHistory.Count));
 
+        session.LastKnownContextTokens = 0;
         return true;
     }
 
@@ -288,6 +292,8 @@ public sealed class ContextCompactor
                 tokensBefore, session?.EstimatedContextTokens ?? 0,
                 messagesBefore, messagesAfter));
 
+            if (session != null)
+                session.LastKnownContextTokens = 0;
             return true;
         }
         catch (System.Exception ex)
