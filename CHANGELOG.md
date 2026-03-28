@@ -22,3 +22,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Improved resilience of long-running streaming sessions with large tool results by proactively compacting context between tool rounds.
+- **Version infrastructure** — Changed from `<Version>` to `<VersionPrefix>` in `SharpCoder.csproj` to support CI-driven versioning. The base version is now `0.5.0` (was `0.4.4`). CI can append `-beta.N` suffix via `--version-suffix` for develop builds; release builds use the prefix as-is.
