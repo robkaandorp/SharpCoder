@@ -285,6 +285,17 @@ public sealed class CodingAgent
 
             if (streamError != null)
             {
+                if (ContextCompactor.IsContextOverflowError(streamError))
+                {
+                    _logger.LogWarning(streamError, "Context overflow — compacting and retrying");
+                    if (session != null && await _compactor.ForceCompactAsync(session, _options, ct))
+                    {
+                        messages = BuildMessages(session, ""); // rebuild from compacted session
+                        messages.RemoveAt(messages.Count - 1); // remove the empty user message
+                        continue; // retry the round
+                    }
+                }
+
                 _logger.LogError(streamError, "Streaming agent execution failed.");
                 yield return StreamingUpdate.Completed(new AgentResult
                 {
@@ -359,6 +370,9 @@ public sealed class CodingAgent
                 messages.Add(resultMessage);
                 allResponseMessages.Add(resultMessage);
             }
+
+            // Mid-loop compaction: check before next API call
+            await _compactor.CompactIfNeededAsync(session, messages, _options, ct);
         }
 
         // Update session with all messages

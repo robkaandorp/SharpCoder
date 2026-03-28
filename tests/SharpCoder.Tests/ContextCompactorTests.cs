@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using Microsoft.Extensions.AI;
 using SharpCoder;
 
@@ -203,6 +205,244 @@ public class ContextCompactorTests
 
         Assert.False(result);
         Assert.Equal(originalCount, session.MessageHistory.Count); // History unchanged
+    }
+
+    [Fact]
+    public void IsContextOverflowError_MatchingMessage_ReturnsTrue()
+    {
+        var ex = new InvalidOperationException("Request failed: model_max_prompt_tokens_exceeded");
+        Assert.True(ContextCompactor.IsContextOverflowError(ex));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_InnerExceptionMatches_ReturnsTrue()
+    {
+        var inner = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+        var outer = new Exception("Outer error", inner);
+        Assert.True(ContextCompactor.IsContextOverflowError(outer));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_NoMatch_ReturnsFalse()
+    {
+        var ex = new InvalidOperationException("Some other error");
+        Assert.False(ContextCompactor.IsContextOverflowError(ex));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_NullException_ReturnsFalse()
+    {
+        Assert.False(ContextCompactor.IsContextOverflowError(null));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_NestedInnerException_ThreeLevelsDeep_ReturnsTrue()
+    {
+        // 3 levels deep: outer -> middle -> inner (where inner has the error)
+        var inner = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+        var middle = new Exception("Middle exception", inner);
+        var outer = new Exception("Outer exception", middle);
+        Assert.True(ContextCompactor.IsContextOverflowError(outer));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_ErrorInData_DoesNotMatch()
+    {
+        // Error string in ex.Data should NOT match - only message and InnerException chain
+        var ex = new InvalidOperationException("Some other error");
+        ex.Data["error"] = "model_max_prompt_tokens_exceeded";
+        Assert.False(ContextCompactor.IsContextOverflowError(ex));
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_BelowThreshold_StillCompacts()
+    {
+        // ForceCompactAsync should compact even if token count is below threshold
+        var mockClient = new MockSummarizingClient("Forced summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add enough messages to compact (more than CompactionRetainRecent + 1)
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message {i}"));
+
+        // Options with a very high threshold — normal compaction would NOT trigger
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 10_000_000,
+            CompactionThreshold = 0.99,
+            CompactionRetainRecent = 5,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        // 1 summary + 5 recent = 6
+        Assert.Equal(6, session.MessageHistory.Count);
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+        Assert.Contains("Forced summary.", session.MessageHistory[0].Text!);
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_InvokesOnCompactedCallback()
+    {
+        var mockClient = new MockSummarizingClient("Summary text.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = CreateLargeSession(20);
+
+        CompactionResult? callbackResult = null;
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 5,
+            OnCompacted = r => callbackResult = r,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.NotNull(callbackResult);
+        Assert.True(callbackResult!.TokensBefore > 0);
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_RespectsCompactionRetainRecent()
+    {
+        // Verify that the last N messages remain verbatim after ForceCompactAsync
+        var mockClient = new MockSummarizingClient("Summary of old messages.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add exactly 15 messages with distinct content
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"UniqueMessage-{i}"));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 4,  // Keep last 4 messages verbatim
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // 1 summary + 4 recent = 5 total
+        Assert.Equal(5, session.MessageHistory.Count);
+
+        // First message is the summary
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+
+        // Last 4 messages should be verbatim (indices 11, 12, 13, 14 from original)
+        // After compaction they are at indices 1, 2, 3, 4
+        Assert.Equal("UniqueMessage-11", session.MessageHistory[1].Text);
+        Assert.Equal("UniqueMessage-12", session.MessageHistory[2].Text);
+        Assert.Equal("UniqueMessage-13", session.MessageHistory[3].Text);
+        Assert.Equal("UniqueMessage-14", session.MessageHistory[4].Text);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_OverThreshold_CompactsAndUpdatesSession()
+    {
+        var mockClient = new MockSummarizingClient("Live compaction summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build a live messages list with a system prompt + many large messages
+        var messages = new List<Microsoft.Extensions.AI.ChatMessage>
+        {
+            new(Microsoft.Extensions.AI.ChatRole.System, "You are a helpful assistant.")
+        };
+        for (int i = 0; i < 20; i++)
+            messages.Add(new Microsoft.Extensions.AI.ChatMessage(
+                i % 2 == 0 ? Microsoft.Extensions.AI.ChatRole.User : Microsoft.Extensions.AI.ChatRole.Assistant,
+                $"Message {i}: " + new string('x', 200)));
+
+        // Sync session history to non-system messages (mimicking in-loop state)
+        session.MessageHistory = new List<Microsoft.Extensions.AI.ChatMessage>(messages.Skip(1));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,       // Very low to trigger compaction
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 5,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // Live messages list: system prompt + summary + 5 recent = 7
+        Assert.Equal(7, messages.Count);
+        Assert.Equal(Microsoft.Extensions.AI.ChatRole.System, messages[0].Role);
+        Assert.Contains("[CONTEXT SUMMARY", messages[1].Text!);
+        Assert.Contains("Live compaction summary.", messages[1].Text!);
+
+        // session.MessageHistory should also be updated (without system prompt)
+        Assert.Equal(6, session.MessageHistory.Count);
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_BelowThreshold_DoesNotCompact()
+    {
+        var client = new ThrowingClient();
+        var compactor = new ContextCompactor(client);
+
+        var messages = new List<Microsoft.Extensions.AI.ChatMessage>
+        {
+            new(Microsoft.Extensions.AI.ChatRole.User, "Hello"),
+            new(Microsoft.Extensions.AI.ChatRole.Assistant, "Hi"),
+        };
+
+        var options = new AgentOptions { MaxContextTokens = 100_000 };
+
+        var result = await compactor.CompactIfNeededAsync(null, messages, options, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        Assert.Equal(2, messages.Count);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_OverThreshold_InvokesOnCompactedCallback()
+    {
+        // Verify that mid-loop compaction invokes the OnCompacted callback
+        var mockClient = new MockSummarizingClient("Mid-loop summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build a live messages list with a system prompt + many large messages
+        var messages = new List<Microsoft.Extensions.AI.ChatMessage>
+        {
+            new(Microsoft.Extensions.AI.ChatRole.System, "You are a helpful assistant.")
+        };
+        for (int i = 0; i < 20; i++)
+            messages.Add(new Microsoft.Extensions.AI.ChatMessage(
+                i % 2 == 0 ? Microsoft.Extensions.AI.ChatRole.User : Microsoft.Extensions.AI.ChatRole.Assistant,
+                $"Message {i}: " + new string('x', 200)));
+
+        // Sync session history to non-system messages (mimicking in-loop state)
+        session.MessageHistory = new List<Microsoft.Extensions.AI.ChatMessage>(messages.Skip(1));
+
+        CompactionResult? callbackResult = null;
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,       // Very low to trigger compaction
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 5,
+            OnCompacted = r => callbackResult = r,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.NotNull(callbackResult);
+        Assert.True(callbackResult!.TokensBefore > 0);
+        Assert.True(callbackResult.MessagesBefore > callbackResult.MessagesAfter);
+        // Verify compaction occurred: before count should be greater than after count
+        Assert.Equal(20, callbackResult.MessagesBefore); // 20 non-system messages before
+        Assert.Equal(6, callbackResult.MessagesAfter);   // 1 summary + 5 recent after
     }
 
     private static AgentSession CreateLargeSession(int messageCount)
