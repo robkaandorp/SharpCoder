@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-07-15
+
 ### Added
 
 - **Context overflow recovery** — When the API returns a `model_max_prompt_tokens_exceeded` error, the agent now automatically force-compacts the session and retries the request once. Previously, the agent would fail without attempting recovery.
