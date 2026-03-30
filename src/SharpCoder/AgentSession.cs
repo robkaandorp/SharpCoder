@@ -126,6 +126,36 @@ public sealed class AgentSession
         };
     }
 
+    /// <summary>
+    /// Creates a deep copy of this session with a new session ID, zeroed token counters,
+    /// and fresh timestamps. The message history is deep-copied via JSON serialization so
+    /// mutations to either session's history do not affect the other.
+    /// <c>LastKnownContextTokens</c> is copied from the original.
+    /// </summary>
+    /// <param name="sessionId">Optional custom session ID for the forked session. If null, a new GUID is generated.</param>
+    /// <returns>A new <see cref="AgentSession"/> branched from the current state.</returns>
+    public AgentSession Fork(string? sessionId = null)
+    {
+        // Deep-copy MessageHistory via JSON round-trip using the same options that handle
+        // ChatMessage / AIContent polymorphism (TextContent, FunctionCallContent, etc.).
+        var json = JsonSerializer.Serialize(MessageHistory, SerializerOptions);
+        var clonedHistory = JsonSerializer.Deserialize<IList<ChatMessage>>(json, SerializerOptions)
+            ?? new List<ChatMessage>();
+
+        var now = DateTimeOffset.UtcNow;
+        return new AgentSession
+        {
+            SessionId = sessionId ?? Guid.NewGuid().ToString("N"),
+            MessageHistory = clonedHistory,
+            TotalToolCalls = 0,
+            InputTokensUsed = 0,
+            OutputTokensUsed = 0,
+            LastKnownContextTokens = LastKnownContextTokens,
+            CreatedAt = now,
+            LastActivityAt = now
+        };
+    }
+
     /// <summary>Reset conversation history while preserving identity and counters.</summary>
     public void ClearHistory()
     {
