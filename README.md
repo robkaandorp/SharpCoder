@@ -67,6 +67,24 @@ var restored = await AgentSession.LoadAsync("session.json");
 await agent.ExecuteAsync(restored, "What did we do so far?");
 ```
 
+### Session Forking
+
+`AgentSession.Fork()` creates a deep copy of a session — useful for branching a conversation without affecting the original:
+
+```csharp
+var session = AgentSession.Create();
+await agent.ExecuteAsync(session, "Analyse the codebase");
+
+// Fork the session for an independent sub-task
+var forked = session.Fork();
+await agent.ExecuteAsync(forked, "Now refactor the Parser class");
+
+// Original session is unaffected — continue where you left off
+await agent.ExecuteAsync(session, "Now add tests for what you found");
+```
+
+Forked sessions get a new session ID, zeroed token counters, and fresh timestamps. Message history is deep-copied so mutations to either session are independent. `LastKnownContextTokens` is preserved for accurate compaction decisions.
+
 Sessions track cumulative token usage, tool call counts, and exact context size from the most recent API response.
 
 ## Streaming
