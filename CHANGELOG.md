@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.6.0] - 2026-03-31
+
+### Added
+
+- **`AgentSession.Fork()`** — Creates a deep copy of a session with a new session ID, zeroed token counters, and fresh timestamps. Message history is deep-copied via JSON serialization so mutations to either session don't affect the other. `LastKnownContextTokens` is preserved from the original. Accepts an optional custom `sessionId` parameter.
+
+### Fixed
+
+- **Version prefix double-beta** — Fixed `SharpCoder.csproj` version infrastructure that produced double-beta NuGet package versions (e.g. `0.5.0-beta-beta.42`). Changed from `<VersionSuffix>beta</VersionSuffix>` to CI-driven `--version-suffix` approach so release builds use the clean `<VersionPrefix>` value.
+
+### Changed
+
+- Bumped version from 0.5.0 to 0.6.0.
 
 ## [0.5.0] - 2025-07-15
 
@@ -18,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- **Mid-loop context compaction gap** — `StreamWithToolCallsAsync` now checks for context compaction after each tool execution round, before the next API call. Previously, compaction only occurred at the start of streaming, allowing large tool results (e.g., 50K tokens from web search) to blow past the context limit in subsequent rounds.
+- **Mid-loop context compaction gap** — `StreamWithToolCallsAsync` now checks for context compaction after each tool execution round, before the next API call. Previously, compaction only occurred at the start of streaming, allowing large tool results (e.g. 50K tokens from web search) to blow past the context limit in subsequent rounds.
 - **Stale token count in compaction decisions** — `AgentSession` now tracks `LastKnownContextTokens`, the exact input token count from the most recent API response (`response.Usage.InputTokenCount`). `ContextCompactor` uses this precise count instead of the heuristic `~4 chars per token` estimate when available. The heuristic remains as fallback before the first API call. This value persists across session save/load.
 
 ### Changed
