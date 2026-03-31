@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Bumped version from 0.5.0 to 0.6.0.
 
-## [0.5.0] - 2025-07-15
+## [0.5.0] - 2026-03-29
 
 ### Added
 
