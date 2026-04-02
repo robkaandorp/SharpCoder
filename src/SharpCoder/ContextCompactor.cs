@@ -73,6 +73,8 @@ public sealed class ContextCompactor
 
         try
         {
+            options.OnCompacting?.Invoke();
+
             var summaryResponse = await _client.GetResponseAsync(summaryMessages, cancellationToken: ct);
             var summary = summaryResponse.Text ?? "No summary available.";
 
@@ -166,6 +168,8 @@ public sealed class ContextCompactor
         };
 
         // Allow exceptions to propagate — the caller decides how to handle failures.
+        options.OnCompacting?.Invoke();
+
         var summaryResponse = await _client.GetResponseAsync(summaryMessages, cancellationToken: ct);
         var summary = summaryResponse.Text;
 
@@ -261,6 +265,8 @@ public sealed class ContextCompactor
 
         try
         {
+            options.OnCompacting?.Invoke();
+
             var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
             var summary = summaryResponse.Text ?? "No summary available.";
 

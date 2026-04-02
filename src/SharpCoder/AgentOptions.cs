@@ -69,6 +69,12 @@ public sealed class AgentOptions
     public bool EnableAutoCompaction { get; set; } = true;
 
     /// <summary>
+    /// Optional callback invoked immediately before context compaction begins (before the
+    /// summarisation LLM call). Use to show a "compacting…" indicator in the UI.
+    /// </summary>
+    public Action? OnCompacting { get; set; }
+
+    /// <summary>
     /// Optional callback invoked after context compaction completes.
     /// Receives the number of messages compacted, the message count remaining,
     /// and the estimated token count after compaction.
