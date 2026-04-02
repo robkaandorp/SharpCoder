@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.0] - 2026-04-02
+
+### Added
+
+- **`AgentOptions.OnCompacting`** — New optional `Action?` callback invoked immediately before context compaction begins (before the summarisation LLM call). Complements the existing `OnCompacted` callback and allows callers to show a live "compacting…" indicator in the UI. Fires in all three compaction paths: threshold-based, force-compact (overflow recovery), and mid-loop streaming compaction.
+
 ## [0.6.0] - 2026-03-31
 
 ### Added
