@@ -328,7 +328,12 @@ public sealed class CodingAgent
                 .ToList();
 
             if (functionCalls.Count == 0)
-                break; // No tool calls — final text response
+            {
+                // No tool calls — final text response. Add to messages before breaking.
+                foreach (var msg in response.Messages)
+                    messages.Add(msg);
+                break;
+            }
 
             // Add assistant response (containing tool calls) to the conversation
             foreach (var msg in response.Messages)
@@ -381,15 +386,14 @@ public sealed class CodingAgent
             await _compactor.CompactIfNeededAsync(session, messages, _options, ct);
         }
 
-        // Update session with all messages
+        // Update session from the authoritative messages list.
+        // messages contains: [system prompt, (compacted summary OR full history), user message, tool calls/results...]
+        // We strip the system prompt to get the session history.
         if (session != null)
         {
-            session.MessageHistory.Add(new ChatMessage(ChatRole.User, userMessage));
-            foreach (var msg in allResponseMessages)
-            {
-                if (msg.Role != ChatRole.System)
-                    session.MessageHistory.Add(msg);
-            }
+            var startIdx = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+            session.MessageHistory = new List<ChatMessage>(messages.Skip(startIdx));
+
             session.TotalToolCalls += totalToolCalls;
             session.LastActivityAt = DateTimeOffset.UtcNow;
             if (lastUsage != null)

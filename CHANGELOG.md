@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.1]
+
+### Fixed
+
+- **Session corruption after mid-loop compaction** — `StreamWithToolCallsAsync` no longer re-appends response messages to the session after mid-loop compaction has already rebuilt the history. Previously, when compaction fired during a streaming tool loop, all pre-compaction messages were duplicated in the session, causing context overflow on subsequent iterations.
+
 ## [0.7.0] - 2026-04-02
 
 ### Added

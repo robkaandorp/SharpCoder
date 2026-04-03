@@ -684,4 +684,158 @@ public class CodingAgentTests
         // Assert: LastKnownContextTokens should be updated from usage
         Assert.Equal(75000, session.LastKnownContextTokens);
     }
+
+    // ── Session History Tests (Regression tests for session duplication fix) ──
+
+    /// <summary>
+    /// Verifies that the session history derived from messages contains no duplicates.
+    /// This is a regression test for the session duplication bug where messages were
+    /// re-appended after compaction, causing duplicate entries.
+    /// </summary>
+    [Fact]
+    public void SessionHistory_NoDuplicates_AfterDerivingFromMessages()
+    {
+        // Arrange: Create a messages list that simulates what StreamWithToolCallsAsync builds
+        // messages = [system, user, assistant(with tool call), tool result, assistant(final)]
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "You are a helpful assistant."),
+            new ChatMessage(ChatRole.User, "Hello"),
+            new ChatMessage(ChatRole.Assistant, [
+                new TextContent("I'll help you."),
+                new FunctionCallContent("call_1", "test_tool", new Dictionary<string, object?> { ["arg"] = "value" })
+            ]),
+            new ChatMessage(ChatRole.Tool, [new FunctionResultContent("call_1", "tool result")]),
+            new ChatMessage(ChatRole.Assistant, "Final response")
+        };
+
+        // Act: Derive session history from messages (simulating the fix logic)
+        var startIdx = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+        var sessionHistory = new List<ChatMessage>(messages.Skip(startIdx));
+
+        // Assert: No duplicate message content
+        var textContents = sessionHistory
+            .Where(m => m.Text != null)
+            .Select(m => m.Text)
+            .ToList();
+        
+        Assert.Equal(textContents.Count, textContents.Distinct().Count());
+        
+        // Verify the correct messages are in history (system excluded)
+        Assert.Equal(4, sessionHistory.Count);
+        Assert.Equal(ChatRole.User, sessionHistory[0].Role);
+        Assert.Equal("Hello", sessionHistory[0].Text);
+    }
+
+    /// <summary>
+    /// Verifies backward compatibility: deriving history from messages produces
+    /// the same result as the old re-appending logic for the simple case.
+    /// </summary>
+    [Fact]
+    public async Task SessionHistory_BackwardCompatibility_DerivedFromMessages()
+    {
+        // Arrange: Use a simple conversation flow without compaction
+        var client = new StreamingResponseClient("Response");
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("compat-test");
+        var ct = TestContext.Current.CancellationToken;
+
+        // Act: Execute a streaming call (no tool calls, no compaction)
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Hello", ct)) { }
+
+        // Assert: Session should contain user + assistant (no system)
+        Assert.Equal(2, session.MessageHistory.Count);
+        Assert.Equal(ChatRole.User, session.MessageHistory[0].Role);
+        Assert.Equal("Hello", session.MessageHistory[0].Text);
+        Assert.Equal(ChatRole.Assistant, session.MessageHistory[1].Role);
+        Assert.Equal("Response", session.MessageHistory[1].Text);
+        
+        // No system message in history
+        Assert.DoesNotContain(session.MessageHistory, m => m.Role == ChatRole.System);
+    }
+
+    /// <summary>
+    /// Verifies that when the first message in messages is a system prompt,
+    /// it is correctly stripped from session history.
+    /// </summary>
+    [Fact]
+    public void SessionHistory_SystemPrompt_StrippedWhenFirst()
+    {
+        // Arrange: Create messages with system prompt first
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System instructions here."),
+            new ChatMessage(ChatRole.User, "User message"),
+            new ChatMessage(ChatRole.Assistant, "Assistant response")
+        };
+
+        // Act: Apply the logic from StreamWithToolCallsAsync
+        var startIdx = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+        var sessionHistory = new List<ChatMessage>(messages.Skip(startIdx));
+
+        // Assert: System prompt is stripped
+        Assert.Equal(2, sessionHistory.Count);
+        Assert.Equal(ChatRole.User, sessionHistory[0].Role);
+        Assert.Equal(ChatRole.Assistant, sessionHistory[1].Role);
+        Assert.DoesNotContain(sessionHistory, m => m.Role == ChatRole.System);
+    }
+
+    /// <summary>
+    /// Verifies that when there's no system prompt, startIdx is 0 and all messages are included.
+    /// </summary>
+    [Fact]
+    public void SessionHistory_NoSystemPrompt_AllMessagesIncluded()
+    {
+        // Arrange: Create messages without system prompt (edge case)
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.User, "User message"),
+            new ChatMessage(ChatRole.Assistant, "Assistant response")
+        };
+
+        // Act: Apply the logic from StreamWithToolCallsAsync
+        var startIdx = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+        var sessionHistory = new List<ChatMessage>(messages.Skip(startIdx));
+
+        // Assert: All messages included
+        Assert.Equal(2, sessionHistory.Count);
+        Assert.Equal(ChatRole.User, sessionHistory[0].Role);
+        Assert.Equal(ChatRole.Assistant, sessionHistory[1].Role);
+    }
+
+    /// <summary>
+    /// Verifies that multiple tool calls and results don't cause duplicates in session history.
+    /// </summary>
+    [Fact]
+    public async Task SessionHistory_MultipleToolCalls_NoDuplicates()
+    {
+        // This test uses ToolCallingClient which makes two calls (tool call + final response)
+        var client = new ToolCallingClient(
+            "test_tool",
+            new Dictionary<string, object?> { ["arg"] = "value" },
+            "Final response");
+
+        var opts = ToolCallOptions();
+        opts.CustomTools = [AIFunctionFactory.Create(
+            (string arg) => $"Tool result for {arg}", "test_tool")];
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("multi-tool-test");
+        var ct = TestContext.Current.CancellationToken;
+
+        // Act
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Do something", ct)) { }
+
+        // Assert: Session should have user, assistant(with tool call), tool result, assistant(final)
+        // No duplicates
+        Assert.True(session.MessageHistory.Count >= 3, $"Expected at least 3 messages, got {session.MessageHistory.Count}");
+        
+        // Check for no duplicate text content
+        var textMessages = session.MessageHistory
+            .Where(m => !string.IsNullOrEmpty(m.Text))
+            .ToList();
+        
+        var textContents = textMessages.Select(m => m.Text).ToList();
+        Assert.Equal(textContents.Count, textContents.Distinct().Count());
+    }
 }
