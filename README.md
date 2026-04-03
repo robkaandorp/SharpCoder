@@ -201,7 +201,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
 - Key decisions, findings, and file paths are preserved in the summary
 - **Automatic recovery** — If an API call fails due to context overflow (`model_max_prompt_tokens_exceeded`), the agent force-compacts the session and retries once
-- **Mid-loop compaction** — During streaming with tool calls, compaction occurs between tool rounds to handle large tool results (e.g., web search returning 50K tokens)
+- **Mid-loop compaction** — During streaming with tool calls, compaction occurs between tool rounds to handle large tool results (e.g., web search returning 50K tokens). Session history is synchronized from the authoritative messages list after compaction to prevent duplicate entries.
 
 - Disable with `EnableAutoCompaction = false` if you manage context manually.
 - Use `OnCompacting` / `OnCompacted` callbacks to hook into the compaction lifecycle — e.g. to show a loading indicator before the summarisation call starts.
