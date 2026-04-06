@@ -841,4 +841,216 @@ public class ContextCompactorTests
         Assert.True(result);
         Assert.Equal(0, session.LastKnownContextTokens);
     }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_UsesExactTokenCountWhenAvailable()
+    {
+        // Arrange: session has exact token count (50000) and heuristic estimate is lower (~6000)
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build messages with system prompt + many large messages (high heuristic estimate)
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System prompt")
+        };
+        for (int i = 0; i < 20; i++)
+            messages.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Message " + i + ": " + new string('x', 400)));
+
+        // Sync session history (no system prompt)
+        session.MessageHistory = new List<ChatMessage>(messages.Skip(1));
+
+        // Set exact count to 50000 (triggers compaction)
+        session.LastKnownContextTokens = 50_000;
+
+        // Options: threshold = 10000 * 0.5 = 5000 tokens
+        // With exact count (50000 >= 5000) → compaction triggered
+        // With heuristic estimate (~6000 >= 5000) → also triggered, but we verify exact count wins
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 10_000,
+            CompactionThreshold = 0.5, // threshold = 5000
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction triggered because exact count is used
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        // Messages should be: system + summary + 5 recent = 7
+        Assert.Equal(7, messages.Count);
+        Assert.Contains("[CONTEXT SUMMARY", messages[1].Text!);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_FallsBackToEstimate_WhenLastKnownIsZero()
+    {
+        // Arrange: session has LastKnownContextTokens = 0 (no exact data), uses heuristic
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build small messages with system prompt
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System prompt")
+        };
+        for (int i = 0; i < 10; i++)
+            messages.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Small message " + i));
+
+        session.MessageHistory = new List<ChatMessage>(messages.Skip(1));
+
+        // LastKnownContextTokens = 0 (default)
+        Assert.Equal(0, session.LastKnownContextTokens);
+
+        // Options: threshold = 100000 * 0.1 = 10000 tokens
+        // Heuristic estimate is small → NO compaction unless exact count triggers it
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.1, // threshold = 10000
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert: should NOT compact because both exact (0) and estimate (small) are below threshold
+        Assert.False(result);
+        Assert.Equal(0, mockClient.CallCount);
+        // Messages unchanged
+        Assert.Equal(11, messages.Count); // system + 10 messages
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_WithExactTokens_CompactsWhenEstimateWouldNot()
+    {
+        // Key test: verify exact token count is used over heuristic
+        // Session has exact count that triggers compaction, but heuristic is below threshold
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build small messages (low heuristic)
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System prompt")
+        };
+        // 10 small messages (~200 chars each → ~500 tokens estimated)
+        for (int i = 0; i < 10; i++)
+            messages.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Msg " + i));
+
+        session.MessageHistory = new List<ChatMessage>(messages.Skip(1));
+
+        // Exact count is high enough to trigger compaction (but heuristic is not)
+        session.LastKnownContextTokens = 80_000;
+
+        // threshold = 100000 * 0.5 = 50000
+        // With exact count: 80000 >= 50000 → compaction
+        // With heuristic: ~500 < 50000 → no compaction
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.5, // threshold = 50000
+            CompactionRetainRecent = 3,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction SHOULD be triggered (exact count wins)
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_NullSession_UsesEstimate()
+    {
+        // Arrange: null session, only heuristic estimate is available
+        var client = new ThrowingClient(); // Should not be called if below threshold
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+
+        // Small messages with system prompt
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System")
+        };
+        messages.Add(new ChatMessage(ChatRole.User, "Hello"));
+        messages.Add(new ChatMessage(ChatRole.Assistant, "Hi"));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.5,
+            EnableAutoCompaction = true
+        };
+
+        // Act: pass null session
+        var result = await compactor.CompactIfNeededAsync(null, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert: should use estimate and not compact (small messages below threshold)
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessages_TriggersOnCurrentEstimate_WhenLastKnownIsStale()
+    {
+        // Arrange: LastKnownContextTokens (40,000) is lower than current heuristic estimate (~60,000).
+        // After tool execution, the live messages list has grown past what the previous
+        // API response reflected. Compaction MUST be triggered because the estimate
+        // exceeds the threshold, even though the exact count does not.
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Build messages with system prompt + many large messages
+        // ~80 chars per message → ~20 tokens each, 300 messages → ~6000 tokens estimated
+        // We need to exceed threshold = 50000, so we need ~200,000+ tokens (chars/4)
+        // Using ~680 chars per message to get ~51,000 tokens estimated
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, "System prompt")
+        };
+        for (int i = 0; i < 300; i++)
+            messages.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Message " + i + ": " + new string('x', 680)));
+
+        session.MessageHistory = new List<ChatMessage>(messages.Skip(1));
+
+        // Exact count is 40,000 (stale — does not reflect the 300 new messages)
+        session.LastKnownContextTokens = 40_000;
+
+        // Options: threshold = 100000 * 0.5 = 50000 tokens
+        // With LastKnownContextTokens alone (40000 >= 50000): NO compaction
+        // With heuristic estimate (~60000 >= 50000): compaction triggered
+        // This test verifies the max() logic catches the stale case
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100_000,
+            CompactionThreshold = 0.5, // threshold = 50000
+            CompactionRetainRecent = 5,
+            EnableAutoCompaction = true
+        };
+
+        // Act
+        var result = await compactor.CompactIfNeededAsync(session, messages, options, TestContext.Current.CancellationToken);
+
+        // Assert: compaction SHOULD be triggered because current heuristic estimate exceeds threshold
+        Assert.True(result, "Compaction should be triggered when heuristic estimate exceeds threshold even if LastKnownContextTokens is lower");
+        Assert.Equal(1, mockClient.CallCount);
+    }
 }

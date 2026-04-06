@@ -223,9 +223,17 @@ public sealed class ContextCompactor
     {
         if (!options.EnableAutoCompaction) return false;
 
-        // Estimate tokens from the live messages list (excluding system prompt at index 0)
-        long chars = 0;
+        // Use a safe comparison for the threshold check:
+        // - When LastKnownContextTokens is available (>0), use it as the base.
+        // - In mid-loop scenarios, the live messages list may have grown since the
+        //   last API response (assistant reply + tool results appended), so we take the
+        //   maximum of the exact count and the current heuristic estimate.
+        // - When no exact count is available, fall back to heuristic estimation.
+        long estimated;
         int startIndex = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+
+        // Compute heuristic estimate from current message content
+        long chars = 0;
         for (int i = startIndex; i < messages.Count; i++)
         {
             foreach (var content in messages[i].Contents)
@@ -238,7 +246,18 @@ public sealed class ContextCompactor
                     chars += EstimateResultLength(fr);
             }
         }
-        var estimated = chars / 4;
+        var heuristicEstimate = chars / 4;
+
+        if (session != null && session.LastKnownContextTokens > 0)
+        {
+            // Prefer exact count, but cap upward with current heuristic in case the
+            // live list has grown past what the previous response reflected.
+            estimated = Math.Max(session.LastKnownContextTokens, heuristicEstimate);
+        }
+        else
+        {
+            estimated = heuristicEstimate;
+        }
 
         var threshold = (long)(options.MaxContextTokens * options.CompactionThreshold);
         if (estimated < threshold) return false;
