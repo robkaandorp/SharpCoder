@@ -106,8 +106,9 @@ public sealed class ContextCompactor
 
     /// <summary>
     /// Returns <c>true</c> if the exception (or any inner exception in its chain)
-    /// contains the string <c>model_max_prompt_tokens_exceeded</c>, which indicates
-    /// the request was rejected because the context window was too large.
+    /// contains a string indicating the context window was exceeded, such as
+    /// "model_max_prompt_tokens_exceeded", "context window exceeds limit",
+    /// "maximum context length", "max prompt tokens", or "prompt too long".
     /// </summary>
     /// <param name="ex">The exception to inspect.</param>
     /// <returns><c>true</c> if a context-overflow error was found; otherwise <c>false</c>.</returns>
@@ -115,8 +116,15 @@ public sealed class ContextCompactor
     {
         while (ex != null)
         {
-            if (ex.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase))
+            var msg = ex.Message;
+            if (msg.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase) ||
+                (msg.Contains("context window exceeds", StringComparison.OrdinalIgnoreCase) && msg.Contains("limit", StringComparison.OrdinalIgnoreCase)) ||
+                msg.Contains("maximum context length", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("max prompt tokens", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("prompt too long", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
             ex = ex.InnerException;
         }
         return false;

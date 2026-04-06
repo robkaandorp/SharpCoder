@@ -254,6 +254,58 @@ public class ContextCompactorTests
         Assert.False(ContextCompactor.IsContextOverflowError(ex));
     }
 
+    [Theory]
+    [InlineData("context window exceeds limit")]
+    [InlineData("context window exceeds the limit")]
+    [InlineData("CONTEXT WINDOW EXCEEDS LIMIT")]
+    [InlineData("Maximum context length")]
+    [InlineData("maximum context length exceeded")]
+    [InlineData("Max prompt tokens exceeded")]
+    [InlineData("max prompt tokens")]
+    [InlineData("Prompt too long")]
+    [InlineData("prompt too long for model")]
+    public void IsContextOverflowError_ProviderVariants_ReturnsTrue(string errorPhrase)
+    {
+        var ex = new InvalidOperationException($"API error: {errorPhrase}");
+        Assert.True(ContextCompactor.IsContextOverflowError(ex), $"Expected true for: {errorPhrase}");
+    }
+
+    [Theory]
+    [InlineData("context window")]
+    [InlineData("context limit")]
+    [InlineData("max tokens")]
+    [InlineData("prompt is long")]
+    [InlineData("maximum length exceeded")]  // missing "context"
+    [InlineData("The prompt is too long for the model")] // different phrase
+    public void IsContextOverflowError_UnrelatedErrors_ReturnsFalse(string errorPhrase)
+    {
+        var ex = new InvalidOperationException(errorPhrase);
+        Assert.False(ContextCompactor.IsContextOverflowError(ex), $"Expected false for: {errorPhrase}");
+    }
+
+    [Fact]
+    public void IsContextOverflowError_NestedInnerException_VariantInMiddle_ReturnsTrue()
+    {
+        var inner = new InvalidOperationException("context window exceeds limit");
+        var outer = new Exception("Outer error", inner);
+        Assert.True(ContextCompactor.IsContextOverflowError(outer));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_OriginalPhraseStillWorks_ReturnsTrue()
+    {
+        var ex = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+        Assert.True(ContextCompactor.IsContextOverflowError(ex));
+    }
+
+    [Fact]
+    public void IsContextOverflowError_InnerExceptionWithVariant_ReturnsTrue()
+    {
+        var inner = new Exception("maximum context length");
+        var outer = new Exception("Some other outer error", inner);
+        Assert.True(ContextCompactor.IsContextOverflowError(outer));
+    }
+
     [Fact]
     public async Task ForceCompactAsync_BelowThreshold_StillCompacts()
     {
