@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.2] - 2026-04-06
+
+### Fixed
+
+- **Broadened context-overflow error detection** — `ContextCompactor.IsContextOverflowError()` now recognizes additional provider error variants beyond `model_max_prompt_tokens_exceeded`: `"context window exceeds ... limit"`, `"maximum context length"`, `"max prompt tokens"`, and `"prompt too long"`. This ensures automatic compaction recovery works across more LLM providers.
+
+- **Stale token count in mid-loop compaction** — The live-message `CompactIfNeededAsync` overload (used during streaming tool loops) now uses `Math.Max(LastKnownContextTokens, heuristicEstimate)` as the estimated token count. Previously it used only the heuristic estimate, which could be significantly lower than the actual count after tool results were appended — causing compaction to not trigger when needed during long tool-call chains.
+
 ## [0.7.1]
 
 ### Fixed
