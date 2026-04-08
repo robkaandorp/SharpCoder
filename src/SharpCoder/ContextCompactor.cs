@@ -106,8 +106,9 @@ public sealed class ContextCompactor
 
     /// <summary>
     /// Returns <c>true</c> if the exception (or any inner exception in its chain)
-    /// contains the string <c>model_max_prompt_tokens_exceeded</c>, which indicates
-    /// the request was rejected because the context window was too large.
+    /// contains a string indicating the context window was exceeded, such as
+    /// "model_max_prompt_tokens_exceeded", "context window exceeds limit",
+    /// "maximum context length", "max prompt tokens", or "prompt too long".
     /// </summary>
     /// <param name="ex">The exception to inspect.</param>
     /// <returns><c>true</c> if a context-overflow error was found; otherwise <c>false</c>.</returns>
@@ -115,8 +116,15 @@ public sealed class ContextCompactor
     {
         while (ex != null)
         {
-            if (ex.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase))
+            var msg = ex.Message;
+            if (msg.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase) ||
+                (msg.Contains("context window exceeds", StringComparison.OrdinalIgnoreCase) && msg.Contains("limit", StringComparison.OrdinalIgnoreCase)) ||
+                msg.Contains("maximum context length", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("max prompt tokens", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("prompt too long", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
             ex = ex.InnerException;
         }
         return false;
@@ -215,9 +223,17 @@ public sealed class ContextCompactor
     {
         if (!options.EnableAutoCompaction) return false;
 
-        // Estimate tokens from the live messages list (excluding system prompt at index 0)
-        long chars = 0;
+        // Use a safe comparison for the threshold check:
+        // - When LastKnownContextTokens is available (>0), use it as the base.
+        // - In mid-loop scenarios, the live messages list may have grown since the
+        //   last API response (assistant reply + tool results appended), so we take the
+        //   maximum of the exact count and the current heuristic estimate.
+        // - When no exact count is available, fall back to heuristic estimation.
+        long estimated;
         int startIndex = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
+
+        // Compute heuristic estimate from current message content
+        long chars = 0;
         for (int i = startIndex; i < messages.Count; i++)
         {
             foreach (var content in messages[i].Contents)
@@ -230,7 +246,18 @@ public sealed class ContextCompactor
                     chars += EstimateResultLength(fr);
             }
         }
-        var estimated = chars / 4;
+        var heuristicEstimate = chars / 4;
+
+        if (session != null && session.LastKnownContextTokens > 0)
+        {
+            // Prefer exact count, but cap upward with current heuristic in case the
+            // live list has grown past what the previous response reflected.
+            estimated = Math.Max(session.LastKnownContextTokens, heuristicEstimate);
+        }
+        else
+        {
+            estimated = heuristicEstimate;
+        }
 
         var threshold = (long)(options.MaxContextTokens * options.CompactionThreshold);
         if (estimated < threshold) return false;
