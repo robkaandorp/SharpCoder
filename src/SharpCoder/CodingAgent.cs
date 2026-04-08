@@ -25,7 +25,7 @@ public sealed class CodingAgent
         _client = client;
         _options = options;
         _logger = options.Logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
-        _compactor = new ContextCompactor(client, _logger);
+        _compactor = new ContextCompactor(options.CompactionClient ?? client, _logger);
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 using SharpCoder;
@@ -837,5 +838,47 @@ public class CodingAgentTests
         
         var textContents = textMessages.Select(m => m.Text).ToList();
         Assert.Equal(textContents.Count, textContents.Distinct().Count());
+    }
+
+    // ── CompactionClient tests ──
+
+    [Fact]
+    public void CompactionClient_WhenSet_IsPassedToCompactor()
+    {
+        // Verifies that when AgentOptions.CompactionClient is set, the CodingAgent
+        // passes it to ContextCompactor instead of the main client.
+        var compactionClient = new FixedResponseClient("compaction-response");
+        var mainClient = new FixedResponseClient("main-response");
+        var options = MinimalOptions();
+        options.CompactionClient = compactionClient;
+
+        var agent = new CodingAgent(mainClient, options);
+
+        // Use reflection to inspect the private _compactor field
+        var compactorField = typeof(CodingAgent).GetField("_compactor", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var compactor = compactorField.GetValue(agent);
+        var compactorClientField = compactor!.GetType().GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var actualClient = compactorClientField.GetValue(compactor);
+
+        Assert.Same(compactionClient, actualClient);
+    }
+
+    [Fact]
+    public void CompactionClient_WhenNull_CompactorUsesMainClient()
+    {
+        // Verifies that when AgentOptions.CompactionClient is null (the default),
+        // the CodingAgent passes the main client to ContextCompactor.
+        var mainClient = new FixedResponseClient("main-response");
+        var options = MinimalOptions();
+        // CompactionClient is null by default — no need to set it
+
+        var agent = new CodingAgent(mainClient, options);
+
+        var compactorField = typeof(CodingAgent).GetField("_compactor", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var compactor = compactorField.GetValue(agent);
+        var compactorClientField = compactor!.GetType().GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var actualClient = compactorClientField.GetValue(compactor);
+
+        Assert.Same(mainClient, actualClient);
     }
 }
