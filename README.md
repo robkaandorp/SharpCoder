@@ -152,6 +152,9 @@ var options = new AgentOptions
     CompactionRetainRecent = 10,  // keep last 10 messages verbatim
     EnableAutoCompaction = true,  // enabled by default
 
+    // Optional: separate (cheaper) model for context compaction summaries
+    CompactionClient = new OllamaChatClient("http://localhost:11434", "llama3.2"),
+
     // Optional: reasoning effort for models with extended thinking
     ReasoningEffort = ReasoningEffort.Medium,
 
@@ -205,6 +208,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 
 - Disable with `EnableAutoCompaction = false` if you manage context manually.
 - Use `OnCompacting` / `OnCompacted` callbacks to hook into the compaction lifecycle — e.g. to show a loading indicator before the summarisation call starts.
+- **Separate compaction model** — Configure `CompactionClient` to use a cheaper/smaller model (e.g., `llama3.2` via Ollama) just for context compaction summaries. When not set, the main `IChatClient` is used (backward compatible).
 
 ## Skills
 
