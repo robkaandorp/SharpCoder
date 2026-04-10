@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.0] - 2026-04-08
+
+### Added
+
+- **`AgentOptions.CompactionClient`** — New optional `IChatClient?` property to configure a dedicated LLM for context compaction summaries. When set, the compactor uses this client instead of the main `IChatClient`, allowing cheaper models to summarize old context. Falls back to the main client when not configured.
+
 ## [0.7.2] - 2026-04-06
 
 ### Fixed

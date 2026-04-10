@@ -9,7 +9,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>SharpCoder</PackageId>
-    <VersionPrefix>0.7.2</VersionPrefix>
+    <VersionPrefix>0.8.0</VersionPrefix>
     <Authors>Rob</Authors>
     <Description>A standalone, embeddable autonomous coding agent loop for .NET applications, built on Microsoft.Extensions.AI.</Description>
     <PackageTags>ai;agent;llm;copilot;coding;automation</PackageTags>

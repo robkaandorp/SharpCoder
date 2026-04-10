@@ -102,4 +102,12 @@ public sealed class AgentOptions
     /// <c>FunctionInvokingChatClient</c> as a black box).
     /// </summary>
     public bool ShowToolCallsInStream { get; set; }
+
+    /// <summary>
+    /// Optional <see cref="IChatClient"/> to use for context compaction summaries.
+    /// When <c>null</c>, the main agent client is used (default behavior).
+    /// Set this to a cheaper/faster model to avoid consuming the main model's
+    /// rate limit or context window during compaction.
+    /// </summary>
+    public IChatClient? CompactionClient { get; set; }
 }
