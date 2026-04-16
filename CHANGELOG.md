@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.1] - 2026-04-13
+
+### Changed
+
+- Updated `Microsoft.Extensions.AI` NuGet package to `10.5.0`
+- Updated `Microsoft.Extensions.Logging.Abstractions` NuGet package to `10.0.6`
+- Updated `Microsoft.Extensions.AI.OpenAI` NuGet package to `10.5.0` (CliAgent example)
+- Updated `Microsoft.Extensions.Logging` and `Microsoft.Extensions.Logging.Console` NuGet packages to `10.0.6` (CliAgent example)
+- Updated `Microsoft.NET.Test.Sdk` NuGet package to `18.4.0` (test project)
+
 ## [0.8.0] - 2026-04-08
 
 ### Added
