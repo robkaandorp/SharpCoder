@@ -152,7 +152,11 @@ static async Task<int> RunAsync(
     Console.WriteLine();
 
     // Build Ollama Cloud chat client
-    using var httpClient = new HttpClient(new Http11Handler(new HttpClientHandler())) { BaseAddress = new Uri("https://ollama.com") };
+    using var httpClient = new HttpClient(new Http11Handler(new HttpClientHandler()))
+    {
+        BaseAddress = new Uri("https://ollama.com"),
+        Timeout = TimeSpan.FromMinutes(30),
+    };
     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
     var ollamaClient = new OllamaApiClient(httpClient) { SelectedModel = model };
