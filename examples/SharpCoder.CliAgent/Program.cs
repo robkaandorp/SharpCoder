@@ -180,7 +180,13 @@ static async Task<int> RunAsync(
     Exception? failure = null;
     try
     {
-        result = await agent.ExecuteAsync(assignmentText, ct);
+        await foreach (var update in agent.ExecuteStreamingAsync(null, assignmentText, ct))
+        {
+            if (update.Kind == StreamingUpdateKind.Completed)
+            {
+                result = update.Result;
+            }
+        }
     }
     catch (Exception ex)
     {
