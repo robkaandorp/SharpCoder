@@ -13,7 +13,9 @@ using SharpCoder.CliAgent;
 
 var modelOption = new Option<string>("--model", "-m")
 {
-    Description = "Ollama Cloud model id (e.g. gpt-oss:120b, qwen3-coder:480b).",
+    Description = "Model id. Default provider is Ollama Cloud (e.g. qwen3-coder:480b). "
+        + "Prefix with 'copilot/' to use GitHub Copilot (e.g. copilot/claude-sonnet-4.6, "
+        + "copilot/gpt-5.4-mini).",
     DefaultValueFactory = _ => "gpt-oss:120b"
 };
 
@@ -96,13 +98,45 @@ static async Task<int> RunAsync(
     CancellationToken ct)
 {
     // Ollama Cloud API key
-    var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
-    if (string.IsNullOrEmpty(apiKey))
+    // Select provider from the model string. Default is Ollama Cloud;
+    // prefix `copilot/` switches to the GitHub Copilot API.
+    var isCopilot = model.StartsWith("copilot/", StringComparison.OrdinalIgnoreCase);
+
+    HttpClient? httpClient = null;
+    IChatClient chatClient;
+    if (isCopilot)
     {
-        Console.Error.WriteLine("Error: OLLAMA_API_KEY environment variable is not set.");
-        Console.Error.WriteLine("Create an API key at https://ollama.com/settings/keys");
-        return 2;
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN")
+            ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (string.IsNullOrEmpty(ghToken))
+        {
+            Console.Error.WriteLine("Error: GH_TOKEN or GITHUB_TOKEN environment variable is not set.");
+            Console.Error.WriteLine("Copilot API requires a GitHub token with copilot scope.");
+            return 2;
+        }
+        chatClient = ChatClientFactory.Create(model);
     }
+    else
+    {
+        var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            Console.Error.WriteLine("Error: OLLAMA_API_KEY environment variable is not set.");
+            Console.Error.WriteLine("Create an API key at https://ollama.com/settings/keys");
+            return 2;
+        }
+
+        httpClient = new HttpClient(new Http11Handler(new HttpClientHandler()))
+        {
+            BaseAddress = new Uri("https://ollama.com"),
+            Timeout = TimeSpan.FromMinutes(30),
+        };
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        chatClient = new OllamaApiClient(httpClient) { SelectedModel = model };
+    }
+
+    var (shellPath, shellArgsFormat, shellHint) = ResolveShell(shell);
 
     // Validate assignment file
     if (!assignment.Exists)
@@ -152,17 +186,9 @@ static async Task<int> RunAsync(
     Console.WriteLine();
 
     // Build Ollama Cloud chat client
-    using var httpClient = new HttpClient(new Http11Handler(new HttpClientHandler()))
-    {
-        BaseAddress = new Uri("https://ollama.com"),
-        Timeout = TimeSpan.FromMinutes(30),
-    };
-    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+    using var _httpClientLifetime = httpClient;
 
-    var ollamaClient = new OllamaApiClient(httpClient) { SelectedModel = model };
-    IChatClient chatClient = ollamaClient;
-
-    var (shellPath, shellArgsFormat, shellHint) = ResolveShell(shell);
+    // (chatClient already created above based on provider)
 
     var agentOptions = new AgentOptions
     {
