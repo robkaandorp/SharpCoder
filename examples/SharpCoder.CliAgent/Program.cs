@@ -142,7 +142,7 @@ static async Task<int> RunAsync(
     Console.WriteLine();
 
     // Build Ollama Cloud chat client
-    using var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com") };
+    using var httpClient = new HttpClient(new Http11Handler(new HttpClientHandler())) { BaseAddress = new Uri("https://ollama.com") };
     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
     var ollamaClient = new OllamaApiClient(httpClient) { SelectedModel = model };
@@ -175,12 +175,13 @@ static async Task<int> RunAsync(
     };
 
     var agent = new CodingAgent(chatClient, agentOptions);
+    var session = new AgentSession();
 
     AgentResult? result = null;
     Exception? failure = null;
     try
     {
-        await foreach (var update in agent.ExecuteStreamingAsync(null, assignmentText, ct))
+        await foreach (var update in agent.ExecuteStreamingAsync(session, assignmentText, ct))
         {
             if (update.Kind == StreamingUpdateKind.Completed)
             {
@@ -195,7 +196,7 @@ static async Task<int> RunAsync(
     }
     finally
     {
-        WriteFooter(fileLogProvider, startedAt, result, failure);
+        WriteFooter(fileLogProvider, startedAt, result, failure, session);
     }
 
     if (failure != null)
@@ -268,7 +269,7 @@ static void WriteHeader(
     log.WriteLine("------------------ Agent log -------------------------------");
 }
 
-static void WriteFooter(FileLoggerProvider log, DateTime startedAt, AgentResult? result, Exception? failure)
+static void WriteFooter(FileLoggerProvider log, DateTime startedAt, AgentResult? result, Exception? failure, AgentSession? session = null)
 {
     var finishedAt = DateTime.Now;
     var duration = finishedAt - startedAt;
@@ -322,8 +323,13 @@ static void WriteFooter(FileLoggerProvider log, DateTime startedAt, AgentResult?
 
         log.WriteLine();
         log.WriteLine("------------------ Full message history --------------------");
+        // Prefer the full session history (captures every tool round across streaming
+        // loops). Fall back to result.Messages if no session was provided.
+        IList<ChatMessage> history = session is not null
+            ? session.MessageHistory
+            : (IList<ChatMessage>)result.Messages;
         var i = 0;
-        foreach (var msg in result.Messages)
+        foreach (var msg in history)
         {
             log.WriteLine($"--- [{i++}] {msg.Role} ---");
             var text = msg.Text;
