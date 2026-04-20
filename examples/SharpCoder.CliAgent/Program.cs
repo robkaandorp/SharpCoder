@@ -53,6 +53,12 @@ var contextWindowOption = new Option<int>("--context-window", "-c")
     DefaultValueFactory = _ => 131_072
 };
 
+var shellOption = new Option<ShellChoice>("--shell")
+{
+    Description = "Shell used by execute_bash_command. 'cmd' is the default on Windows (but the tool is advertised as 'bash' to the LLM, which confuses bash-tuned models). 'bash' invokes bash.exe (WSL2 / Git Bash) — inside WSL, the Windows dotnet SDK is reachable as 'dotnet.exe'. 'pwsh' uses PowerShell 7+. On non-Windows hosts the default is always /bin/bash regardless of this flag.",
+    DefaultValueFactory = _ => ShellChoice.Cmd
+};
+
 var rootCommand = new RootCommand("SharpCoder CLI Agent — run coding assignments against Ollama Cloud models and capture a full log per run for side-by-side comparison.")
 {
     modelOption,
@@ -61,7 +67,8 @@ var rootCommand = new RootCommand("SharpCoder CLI Agent — run coding assignmen
     assignmentOption,
     logDirOption,
     maxStepsOption,
-    contextWindowOption
+    contextWindowOption,
+    shellOption
 };
 
 rootCommand.SetAction((parseResult, ct) => RunAsync(
@@ -72,6 +79,7 @@ rootCommand.SetAction((parseResult, ct) => RunAsync(
     logDirArg:     parseResult.GetValue(logDirOption)!,
     maxSteps:      parseResult.GetValue(maxStepsOption),
     contextWindow: parseResult.GetValue(contextWindowOption),
+    shell:         parseResult.GetValue(shellOption),
     ct:            ct));
 
 return await rootCommand.Parse(args).InvokeAsync();
@@ -84,6 +92,7 @@ static async Task<int> RunAsync(
     string logDirArg,
     int maxSteps,
     int contextWindow,
+    ShellChoice shell,
     CancellationToken ct)
 {
     // Ollama Cloud API key
@@ -131,13 +140,14 @@ static async Task<int> RunAsync(
     var logger = loggerFactory.CreateLogger<CodingAgent>();
 
     // Write log header
-    WriteHeader(fileLogProvider, startedAt, model, reasoning, workDir, assignment.FullName, assignmentText, maxSteps, contextWindow, logFilePath);
+    WriteHeader(fileLogProvider, startedAt, model, reasoning, workDir, assignment.FullName, assignmentText, maxSteps, contextWindow, logFilePath, shell);
 
     Console.WriteLine($"Model:       {model}");
     Console.WriteLine($"Reasoning:   {reasoning}");
     Console.WriteLine($"Work dir:    {workDir}");
     Console.WriteLine($"Assignment:  {assignment.FullName}");
     Console.WriteLine($"Context:     {contextWindow:N0} tokens");
+    Console.WriteLine($"Shell:       {shell}");
     Console.WriteLine($"Log file:    {logFilePath}");
     Console.WriteLine();
 
@@ -147,6 +157,8 @@ static async Task<int> RunAsync(
 
     var ollamaClient = new OllamaApiClient(httpClient) { SelectedModel = model };
     IChatClient chatClient = ollamaClient;
+
+    var (shellPath, shellArgsFormat, shellHint) = ResolveShell(shell);
 
     var agentOptions = new AgentOptions
     {
@@ -158,6 +170,9 @@ static async Task<int> RunAsync(
         Logger = logger,
         MaxContextTokens = contextWindow,
         ReasoningEffort = MapReasoning(reasoning),
+        BashShellPath = shellPath,
+        BashShellArgsFormat = shellArgsFormat,
+        CustomInstructions = shellHint,
         OnCompacting = () =>
         {
             fileLogProvider.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [Compaction ] Compacting context…");
@@ -250,7 +265,8 @@ static void WriteHeader(
     string assignmentText,
     int maxSteps,
     int contextWindow,
-    string logFilePath)
+    string logFilePath,
+    ShellChoice shell)
 {
     log.WriteLine("============================================================");
     log.WriteLine($"  SharpCoder CliAgent run");
@@ -261,12 +277,50 @@ static void WriteHeader(
     log.WriteLine($"Work dir:     {workDir}");
     log.WriteLine($"Max steps:    {maxSteps}");
     log.WriteLine($"Context:      {contextWindow:N0} tokens");
+    log.WriteLine($"Shell:        {shell}");
     log.WriteLine($"Assignment:   {assignmentPath}");
     log.WriteLine($"Log file:     {logFilePath}");
     log.WriteLine();
     log.WriteLine("------------------ Assignment ------------------------------");
     log.WriteLine(assignmentText);
     log.WriteLine("------------------ Agent log -------------------------------");
+}
+
+// Maps the --shell choice to concrete BashTools overrides + a system-prompt hint.
+// Returns (shellPath, argsFormat, hint). Null values mean "use platform default".
+static (string? path, Func<string, string>? args, string? hint) ResolveShell(ShellChoice choice)
+{
+    var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+        System.Runtime.InteropServices.OSPlatform.Windows);
+
+    if (!isWindows || choice == ShellChoice.Cmd)
+    {
+        // Library default (cmd.exe on Windows, /bin/bash on Unix) — no hint needed.
+        return (null, null, null);
+    }
+
+    if (choice == ShellChoice.Bash)
+    {
+        // WSL bash.exe (or Git Bash). The Windows dotnet SDK is on WSL's $PATH but
+        // only resolves via the `.exe` suffix, so steer the model there.
+        return (
+            "bash.exe",
+            cmd => "-c \"" + cmd.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"",
+            "Your execute_bash_command tool runs under bash (WSL on Windows). Use Unix shell "
+            + "syntax. Note: the .NET SDK lives on the Windows host, so invoke it as "
+            + "'dotnet.exe' (with the .exe suffix) — plain 'dotnet' will not resolve. "
+            + "Paths you pass to dotnet.exe should be POSIX-style (e.g. /mnt/c/...); "
+            + "files you create with write_file use the Windows working directory as usual.");
+    }
+
+    // PowerShell 7+ (or 5.x as pwsh.exe fallback).
+    return (
+        "pwsh.exe",
+        cmd => "-NoProfile -NonInteractive -Command \"" + cmd.Replace("\"", "`\"") + "\"",
+        "Your execute_bash_command tool runs under PowerShell 7 (not bash). Use PowerShell "
+        + "syntax: '$env:FOO' for env vars, 'Get-ChildItem' or 'ls' (aliased), "
+        + "'Remove-Item' or 'rm', and forward-slashes or backslashes both work in paths. "
+        + "'&&' and '||' are supported in PowerShell 7+.");
 }
 
 static void WriteFooter(FileLoggerProvider log, DateTime startedAt, AgentResult? result, Exception? failure, AgentSession? session = null)
@@ -372,4 +426,14 @@ internal enum ReasoningLevel
     Low,
     Medium,
     High
+}
+
+internal enum ShellChoice
+{
+    /// <summary>Platform default: cmd.exe on Windows, /bin/bash on Unix. (library default)</summary>
+    Cmd,
+    /// <summary>bash.exe — WSL2 on Windows, /bin/bash on Unix. Bash-tuned models work best here.</summary>
+    Bash,
+    /// <summary>PowerShell 7+ (pwsh.exe). No effect on non-Windows hosts.</summary>
+    Pwsh
 }
