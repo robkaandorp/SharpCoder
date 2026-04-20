@@ -61,6 +61,11 @@ var shellOption = new Option<ShellChoice>("--shell")
     DefaultValueFactory = _ => ShellChoice.Cmd
 };
 
+var seedOption = new Option<DirectoryInfo?>("--seed")
+{
+    Description = "Optional directory whose contents are copied into the work directory before the agent starts. Use this to give the agent a starting codebase (e.g. for test-writing assignments).",
+};
+
 var rootCommand = new RootCommand("SharpCoder CLI Agent — run coding assignments against Ollama Cloud models and capture a full log per run for side-by-side comparison.")
 {
     modelOption,
@@ -70,7 +75,8 @@ var rootCommand = new RootCommand("SharpCoder CLI Agent — run coding assignmen
     logDirOption,
     maxStepsOption,
     contextWindowOption,
-    shellOption
+    shellOption,
+    seedOption
 };
 
 rootCommand.SetAction((parseResult, ct) => RunAsync(
@@ -82,6 +88,7 @@ rootCommand.SetAction((parseResult, ct) => RunAsync(
     maxSteps:      parseResult.GetValue(maxStepsOption),
     contextWindow: parseResult.GetValue(contextWindowOption),
     shell:         parseResult.GetValue(shellOption),
+    seed:          parseResult.GetValue(seedOption),
     ct:            ct));
 
 return await rootCommand.Parse(args).InvokeAsync();
@@ -95,6 +102,7 @@ static async Task<int> RunAsync(
     int maxSteps,
     int contextWindow,
     ShellChoice shell,
+    DirectoryInfo? seed,
     CancellationToken ct)
 {
     // Ollama Cloud API key
@@ -156,6 +164,17 @@ static async Task<int> RunAsync(
     }
     Directory.CreateDirectory(workDir);
 
+    // Optionally seed the work directory with a starter codebase
+    if (seed is not null)
+    {
+        if (!seed.Exists)
+        {
+            Console.Error.WriteLine($"Error: seed directory not found: {seed.FullName}");
+            return 2;
+        }
+        CopyDirectoryRecursive(seed.FullName, workDir);
+    }
+
     // Prepare log directory + file
     var logDir = Path.GetFullPath(logDirArg);
     Directory.CreateDirectory(logDir);
@@ -179,6 +198,7 @@ static async Task<int> RunAsync(
     Console.WriteLine($"Model:       {model}");
     Console.WriteLine($"Reasoning:   {reasoning}");
     Console.WriteLine($"Work dir:    {workDir}");
+    if (seed is not null) Console.WriteLine($"Seed:        {seed.FullName}");
     Console.WriteLine($"Assignment:  {assignment.FullName}");
     Console.WriteLine($"Context:     {contextWindow:N0} tokens");
     Console.WriteLine($"Shell:       {shell}");
@@ -283,6 +303,21 @@ static string Sanitize(string value)
         sb.Append(invalid.Contains(c) ? '-' : c);
     }
     return sb.ToString();
+}
+
+static void CopyDirectoryRecursive(string sourceDir, string destDir)
+{
+    Directory.CreateDirectory(destDir);
+    foreach (var file in Directory.EnumerateFiles(sourceDir))
+    {
+        File.Copy(file, Path.Combine(destDir, Path.GetFileName(file)), overwrite: true);
+    }
+    foreach (var dir in Directory.EnumerateDirectories(sourceDir))
+    {
+        var name = Path.GetFileName(dir);
+        if (name is "bin" or "obj" or ".git" or ".vs") continue;
+        CopyDirectoryRecursive(dir, Path.Combine(destDir, name));
+    }
 }
 
 static void WriteHeader(
