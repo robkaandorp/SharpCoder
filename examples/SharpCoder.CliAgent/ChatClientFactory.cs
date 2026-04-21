@@ -221,7 +221,8 @@ public static class ChatClientFactory
                 new OpenAIClientOptions
                 {
                     Endpoint = new Uri("https://api.githubcopilot.com"),
-                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
+                    NetworkTimeout = TimeSpan.FromMinutes(30)
                 }
             );
             return openAiClient.GetResponsesClient().AsIChatClient(model);
@@ -236,7 +237,8 @@ public static class ChatClientFactory
                 new OpenAIClientOptions
                 {
                     Endpoint = new Uri("https://api.githubcopilot.com"),
-                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
+                    NetworkTimeout = TimeSpan.FromMinutes(30)
                 }
             );
             return openAiClient.GetChatClient(model).AsIChatClient();
