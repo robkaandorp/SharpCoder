@@ -43,6 +43,26 @@ public sealed class AgentOptions
     /// </summary>
     public bool EnableBash { get; set; } = false;
 
+    /// <summary>
+    /// Optional shell executable override used by <c>execute_bash_command</c>. When set,
+    /// this path is used instead of the platform default (<c>cmd.exe</c> on Windows,
+    /// <c>/bin/bash</c> elsewhere). Typical uses on Windows: <c>bash.exe</c> (WSL),
+    /// <c>C:\Program Files\Git\bin\bash.exe</c> (Git Bash), or <c>pwsh.exe</c>.
+    /// <para>
+    /// When overriding, also set <see cref="BashShellArgsFormat"/> if the shell's flag
+    /// for passing a single command string is not <c>-c "..."</c>.
+    /// </para>
+    /// </summary>
+    public string? BashShellPath { get; set; }
+
+    /// <summary>
+    /// Optional formatter that converts the LLM-supplied command string into the
+    /// arguments passed to <see cref="BashShellPath"/>. Receives the raw command,
+    /// returns the full argument string. Defaults to <c>-c "{command}"</c> with
+    /// double-quote escaping (bash-style) when <see cref="BashShellPath"/> is set.
+    /// </summary>
+    public Func<string, string>? BashShellArgsFormat { get; set; }
+
     public bool EnableFileOps { get; set; } = true;
     public bool EnableFileWrites { get; set; } = true;
     public bool EnableSkills { get; set; } = true;

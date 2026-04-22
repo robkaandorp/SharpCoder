@@ -14,12 +14,26 @@ public sealed class BashTools
     private readonly string _workingDirectory;
     private readonly int _timeoutMs;
     private readonly ILogger _logger;
+    private readonly string? _shellPathOverride;
+    private readonly Func<string, string>? _shellArgsFormat;
 
     public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null)
+        : this(workingDirectory, timeoutMs, logger, null, null)
+    {
+    }
+
+    public BashTools(
+        string workingDirectory,
+        int timeoutMs,
+        ILogger? logger,
+        string? shellPathOverride,
+        Func<string, string>? shellArgsFormat)
     {
         _workingDirectory = workingDirectory;
         _timeoutMs = timeoutMs > 0 ? timeoutMs : 120000;
         _logger = logger ?? NullLogger.Instance;
+        _shellPathOverride = shellPathOverride;
+        _shellArgsFormat = shellArgsFormat;
     }
 
     [Description("Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.")]
@@ -31,8 +45,21 @@ public sealed class BashTools
         try
         {
             var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
-            var shell = isWindows ? "cmd.exe" : "/bin/bash";
-            var args = isWindows ? $"/c \"{command}\"" : $"-c \"{command.Replace("\"", "\\\"")}\"";
+            string shell;
+            string args;
+            if (!string.IsNullOrEmpty(_shellPathOverride))
+            {
+                shell = _shellPathOverride!;
+                args = _shellArgsFormat is not null
+                    ? _shellArgsFormat(command)
+                    // Default assumes a bash-compatible shell: -c "<cmd>" with "-escaping.
+                    : $"-c \"{command.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"";
+            }
+            else
+            {
+                shell = isWindows ? "cmd.exe" : "/bin/bash";
+                args = isWindows ? $"/c \"{command}\"" : $"-c \"{command.Replace("\"", "\\\"")}\"";
+            }
 
             var processStartInfo = new ProcessStartInfo
             {

@@ -483,7 +483,12 @@ public sealed class CodingAgent
 
         if (_options.EnableBash)
         {
-            var bashTools = new BashTools(_options.WorkDirectory, logger: _logger);
+            var bashTools = new BashTools(
+                _options.WorkDirectory,
+                timeoutMs: 120000,
+                logger: _logger,
+                shellPathOverride: _options.BashShellPath,
+                shellArgsFormat: _options.BashShellArgsFormat);
             chatOptions.Tools.Add(AIFunctionFactory.Create(bashTools.execute_bash_command));
         }
 

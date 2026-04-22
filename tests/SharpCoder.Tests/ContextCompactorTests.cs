@@ -510,6 +510,223 @@ public class ContextCompactorTests
     }
 
     [Fact]
+    public async Task CompactIfNeeded_PreservesOneLeadingSystemMessage()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 1 system message at index 0
+        const string systemPrompt = "You are a helpful coding assistant.";
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt));
+
+        // Add 20 non-system messages large enough to trigger compaction
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 3
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // System message preserved at index 0
+        Assert.Equal(ChatRole.System, session.MessageHistory[0].Role);
+        Assert.Equal(systemPrompt, session.MessageHistory[0].Text);
+        // Summary at index 1
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[1].Text!);
+        // Total: 1 (system) + 1 (summary) + 3 (recent) = 5
+        Assert.Equal(5, session.MessageHistory.Count);
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_PreservesTwoLeadingSystemMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 2 consecutive system messages at indices 0 and 1
+        const string systemPrompt1 = "You are a helpful coding assistant.";
+        const string systemPrompt2 = "Always respond in markdown.";
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt1));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt2));
+
+        // Add 20 non-system messages large enough to trigger compaction
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 3
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // Two system messages preserved at indices 0 and 1
+        Assert.Equal(ChatRole.System, session.MessageHistory[0].Role);
+        Assert.Equal(systemPrompt1, session.MessageHistory[0].Text);
+        Assert.Equal(ChatRole.System, session.MessageHistory[1].Role);
+        Assert.Equal(systemPrompt2, session.MessageHistory[1].Text);
+        // Summary at index 2
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[2].Text!);
+        // Total: 2 (system) + 1 (summary) + 3 (recent) = 6
+        Assert.Equal(6, session.MessageHistory.Count);
+    }
+
+    [Fact]
+    public async Task ForceCompact_PreservesOneLeadingSystemMessage()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 1 system message at index 0
+        const string systemPrompt = "You are a helpful coding assistant.";
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt));
+
+        // Add 15 non-system messages
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // System message preserved at index 0
+        Assert.Equal(ChatRole.System, session.MessageHistory[0].Role);
+        Assert.Equal(systemPrompt, session.MessageHistory[0].Text);
+        // Summary at index 1
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[1].Text!);
+        // Total: 1 (system) + 1 (summary) + 3 (recent) = 5
+        Assert.Equal(5, session.MessageHistory.Count);
+    }
+
+    [Fact]
+    public async Task ForceCompact_PreservesTwoLeadingSystemMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 2 consecutive system messages at indices 0 and 1
+        const string systemPrompt1 = "You are a helpful coding assistant.";
+        const string systemPrompt2 = "Always respond in markdown.";
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt1));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt2));
+
+        // Add 15 non-system messages
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // Two system messages preserved at indices 0 and 1
+        Assert.Equal(ChatRole.System, session.MessageHistory[0].Role);
+        Assert.Equal(systemPrompt1, session.MessageHistory[0].Text);
+        Assert.Equal(ChatRole.System, session.MessageHistory[1].Role);
+        Assert.Equal(systemPrompt2, session.MessageHistory[1].Text);
+        // Summary at index 2
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[2].Text!);
+        // Total: 2 (system) + 1 (summary) + 3 (recent) = 6
+        Assert.Equal(6, session.MessageHistory.Count);
+    }
+
+    [Fact]
+    public async Task CompactionResult_CountsExcludeSystemMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 1 system message
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, "You are a helpful assistant."));
+
+        // Add 20 non-system messages large enough to trigger compaction
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        CompactionResult? callbackResult = null;
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 3,
+            OnCompacted = r => callbackResult = r
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.NotNull(callbackResult);
+        // MessagesBefore excludes the system message: 20 non-system messages
+        Assert.Equal(20, callbackResult!.MessagesBefore);
+        // MessagesAfter excludes the system message: 1 summary + 3 recent = 4
+        Assert.Equal(4, callbackResult.MessagesAfter);
+    }
+
+    [Fact]
+    public async Task SystemMessageAfterNonSystem_IsCompacted()
+    {
+        var mockClient = new MockSummarizingClient("Summary of prior conversation.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // NO leading system messages. Start with a User message, then a System message at index 1
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "First user message " + new string('x', 200)));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, "Mid-list system message " + new string('x', 200)));
+
+        // Add 18 more alternating User/Assistant messages large enough to trigger compaction
+        for (int i = 0; i < 18; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        // Total: 20 messages, none leading system
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionThreshold = 0.1,
+            CompactionRetainRecent = 3
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // The first message after compaction should NOT be a system message
+        Assert.NotEqual(ChatRole.System, session.MessageHistory[0].Role);
+        // The mid-list system message was compacted; the first message is the summary
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+    }
+
+    [Fact]
     public void AdjustSplitPoint_NoToolResults_ReturnsOriginalSplitPoint()
     {
         var messages = new List<ChatMessage>

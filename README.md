@@ -202,6 +202,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Uses exact token counts from API responses (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call
 - Older messages are summarized into a single `[CONTEXT SUMMARY]` message
 - Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
+- **Leading system messages are preserved** — all consecutive `ChatRole.System` messages at the start of the history are kept intact and are never included in the summary. Callers do not need to re-add the system prompt after compaction.
 - Key decisions, findings, and file paths are preserved in the summary
 - **Automatic recovery** — If an API call fails due to context overflow (`model_max_prompt_tokens_exceeded`), the agent force-compacts the session and retries once
 - **Mid-loop compaction** — During streaming with tool calls, compaction occurs between tool rounds to handle large tool results (e.g., web search returning 50K tokens). Session history is synchronized from the authoritative messages list after compaction to prevent duplicate entries.
@@ -232,6 +233,46 @@ The agent calls `list_skills` to discover what's available and `load_skill` to r
 - **Path traversal protection** — all file operations are confined to `WorkDirectory`
 - **Bash disabled by default** — opt in explicitly with `EnableBash = true`
 - **No sandboxing for bash** — when enabled, the agent has full shell access with the process's privileges. Only enable in trusted environments (containers, CI runners)
+
+## Example: comparing models with `SharpCoder.CliAgent`
+
+The `examples/SharpCoder.CliAgent` project is a small command-line harness for
+running coding assignments against **Ollama Cloud** models and capturing a full
+log per run — useful for comparing the coding skills and output quality of
+different models side by side.
+
+```bash
+export OLLAMA_API_KEY=...   # create at https://ollama.com/settings/keys
+
+dotnet run --project examples/SharpCoder.CliAgent -- \
+    --model gpt-oss:120b \
+    --reasoning Medium \
+    --work-dir runs/todo-api-gpt-oss \
+    --assignment assignments/todo-api.md \
+    --log-dir logs \
+    --max-steps 50
+```
+
+| Flag | Description |
+|------|-------------|
+| `-m`, `--model` | Ollama Cloud model id (default `gpt-oss:120b`) |
+| `-r`, `--reasoning` | `None`, `Low`, `Medium`, or `High` (default `Medium`) |
+| `-w`, `--work-dir` | Directory the agent creates and uses as the project root. **Fails if it already exists** to protect prior experiments |
+| `-a`, `--assignment` | Path to a markdown file describing the task |
+| `-l`, `--log-dir` | Where per-run log files are written (default `logs`) |
+| `-s`, `--max-steps` | Maximum agent iterations (default `50`) |
+| `-c`, `--context-window` | Model context-window size in tokens (default `131072`). Bump for larger-context models (e.g. `262144` for Qwen3-Coder). |
+
+Each run produces a single log file named
+`{timestamp}_{model}_{reasoning}_{workdir}.log` that contains the flags,
+assignment text, every `ILogger` event the agent emitted (tool calls,
+compaction, errors), the final `AgentResult` (status, token usage, finish
+reason), and the complete message history including all tool calls and
+tool results. This makes it straightforward to diff two runs of the same
+assignment across different models.
+
+Bash and file writes are both enabled in this example — only run it against
+trusted assignments.
 
 ## License
 

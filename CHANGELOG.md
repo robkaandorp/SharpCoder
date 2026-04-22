@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.9.0] - 2026-04-14
+
+### Changed
+
+- **Compaction code deduplication** — `ContextCompactor` now uses a single private `CompactMessageSliceAsync` core method for LLM summarization, summary building, and message list reconstruction. This consolidates logic that was previously duplicated across `CompactIfNeededAsync`, `ForceCompactAsync`, and the mid-loop `CompactIfNeededAsync` overload.
+
+### Fixed
+
+- **System message preservation** — `ContextCompactor` now preserves all consecutive leading `ChatRole.System` messages at the start of `session.MessageHistory` during both automatic (`CompactIfNeededAsync`) and force compaction (`ForceCompactAsync`). Callers no longer need to re-add the system prompt after compaction.
+
 ## [0.8.1] - 2026-04-13
 
 ### Changed

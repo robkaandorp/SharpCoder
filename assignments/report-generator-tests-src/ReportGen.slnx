@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ReportGen.Cli/ReportGen.Cli.csproj" />
+  <Project Path="ReportGen.Core/ReportGen.Core.csproj" />
+</Solution>
