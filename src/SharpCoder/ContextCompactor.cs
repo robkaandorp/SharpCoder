@@ -42,11 +42,13 @@ public sealed class ContextCompactor
             : session.EstimatedContextTokens;
 
         if (estimated < threshold) return false;
-        if (session.MessageHistory.Count <= options.CompactionRetainRecent + 1)
+
+        var startIndex = FindStartIndex(session.MessageHistory);
+        if (session.MessageHistory.Count - startIndex <= options.CompactionRetainRecent + 1)
             return false; // Not enough messages to compact
 
         var tokensBefore = estimated;
-        var messagesBefore = session.MessageHistory.Count;
+        var messagesBefore = session.MessageHistory.Count - startIndex;
 
         _logger.LogInformation(
             "Context compaction triggered: ~{Tokens} tokens (threshold: {Threshold}), {Messages} messages",
@@ -55,20 +57,21 @@ public sealed class ContextCompactor
         try
         {
             var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-                session.MessageHistory, 0, options.CompactionRetainRecent, options,
+                session.MessageHistory, startIndex, options.CompactionRetainRecent, options,
                 substituteNullSummary: true, ct);
 
             if (!compacted) return false;
 
-            session.MessageHistory = new List<ChatMessage>(compactedMessages);
+            var systemPrefix = session.MessageHistory.Take(startIndex).ToList();
+            session.MessageHistory = new List<ChatMessage>(systemPrefix.Concat(compactedMessages));
 
             _logger.LogInformation(
                 "Compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
-                oldCount, session.MessageHistory.Count, session.EstimatedContextTokens);
+                oldCount, session.MessageHistory.Count - startIndex, session.EstimatedContextTokens);
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session.EstimatedContextTokens,
-                messagesBefore, session.MessageHistory.Count));
+                messagesBefore, session.MessageHistory.Count - startIndex));
 
             session.LastKnownContextTokens = 0;
             return true;
@@ -106,6 +109,14 @@ public sealed class ContextCompactor
         return false;
     }
 
+    private static int FindStartIndex(IList<ChatMessage> messages)
+    {
+        int i = 0;
+        while (i < messages.Count && messages[i].Role == ChatRole.System)
+            i++;
+        return i;
+    }
+
     /// <summary>
     /// Compacts the session unconditionally, regardless of whether the token threshold
     /// has been reached. Useful when the API has already rejected the request due to
@@ -127,11 +138,12 @@ public sealed class ContextCompactor
     {
         var messages = session.MessageHistory;
 
-        if (messages.Count <= options.CompactionRetainRecent + 1)
+        var startIndex = FindStartIndex(messages);
+        if (messages.Count - startIndex <= options.CompactionRetainRecent + 1)
             return false; // Not enough messages to compact
 
         var tokensBefore = session.EstimatedContextTokens;
-        var messagesBefore = messages.Count;
+        var messagesBefore = messages.Count - startIndex;
 
         _logger.LogInformation(
             "Force context compaction: ~{Tokens} tokens, {Messages} messages",
@@ -139,20 +151,20 @@ public sealed class ContextCompactor
 
         // Exceptions from the summarization client propagate to the caller.
         var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-            messages, 0, options.CompactionRetainRecent, options,
+            messages, startIndex, options.CompactionRetainRecent, options,
             substituteNullSummary: false, ct);
 
         if (!compacted) return false;
 
-        session.MessageHistory = new List<ChatMessage>(compactedMessages);
+        session.MessageHistory = new List<ChatMessage>(messages.Take(startIndex).Concat(compactedMessages));
 
         _logger.LogInformation(
             "Force-compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
-            oldCount, session.MessageHistory.Count, session.EstimatedContextTokens);
+            oldCount, session.MessageHistory.Count - startIndex, session.EstimatedContextTokens);
 
         options.OnCompacted?.Invoke(new CompactionResult(
             tokensBefore, session.EstimatedContextTokens,
-            messagesBefore, session.MessageHistory.Count));
+            messagesBefore, session.MessageHistory.Count - startIndex));
 
         session.LastKnownContextTokens = 0;
         return true;
