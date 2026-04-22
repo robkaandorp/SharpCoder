@@ -50,45 +50,21 @@ public sealed class ContextCompactor
 
         _logger.LogInformation(
             "Context compaction triggered: ~{Tokens} tokens (threshold: {Threshold}), {Messages} messages",
-            estimated, threshold, session.MessageHistory.Count);
-
-        var messages = session.MessageHistory;
-        var retainCount = options.CompactionRetainRecent;
-
-        // Split: old messages to summarize, recent messages to keep.
-        // Adjust the split point so we never orphan tool results — a tool result
-        // message must always be preceded by an assistant message with tool_calls.
-        var splitPoint = AdjustSplitPoint(messages, messages.Count - retainCount);
-        if (splitPoint <= 0)
-            return false; // No messages to compact after adjustment
-        var oldMessages = messages.Take(splitPoint).ToList();
-        var recentMessages = messages.Skip(splitPoint).ToList();
-
-        // Build summary of old messages
-        var summaryText = BuildSummaryPrompt(oldMessages);
-        var summaryMessages = new List<ChatMessage>
-        {
-            new ChatMessage(ChatRole.User, summaryText)
-        };
+            estimated, threshold, messagesBefore);
 
         try
         {
-            options.OnCompacting?.Invoke();
+            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
+                session.MessageHistory, 0, options.CompactionRetainRecent, options,
+                substituteNullSummary: true, ct);
 
-            var summaryResponse = await _client.GetResponseAsync(summaryMessages, cancellationToken: ct);
-            var summary = summaryResponse.Text ?? "No summary available.";
+            if (!compacted) return false;
 
-            // Replace old messages with a single summary message
-            session.MessageHistory = new List<ChatMessage>();
-            session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
-                $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]\n{summary}"));
-
-            foreach (var msg in recentMessages)
-                session.MessageHistory.Add(msg);
+            session.MessageHistory = new List<ChatMessage>(compactedMessages);
 
             _logger.LogInformation(
                 "Compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
-                oldMessages.Count, session.MessageHistory.Count, session.EstimatedContextTokens);
+                oldCount, session.MessageHistory.Count, session.EstimatedContextTokens);
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session.EstimatedContextTokens,
@@ -161,38 +137,18 @@ public sealed class ContextCompactor
             "Force context compaction: ~{Tokens} tokens, {Messages} messages",
             tokensBefore, messagesBefore);
 
-        var retainCount = options.CompactionRetainRecent;
-        var splitPoint = AdjustSplitPoint(messages, messages.Count - retainCount);
-        if (splitPoint <= 0)
-            return false;
+        // Exceptions from the summarization client propagate to the caller.
+        var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
+            messages, 0, options.CompactionRetainRecent, options,
+            substituteNullSummary: false, ct);
 
-        var oldMessages = messages.Take(splitPoint).ToList();
-        var recentMessages = messages.Skip(splitPoint).ToList();
+        if (!compacted) return false;
 
-        var summaryText = BuildSummaryPrompt(oldMessages);
-        var summaryMessages = new List<ChatMessage>
-        {
-            new ChatMessage(ChatRole.User, summaryText)
-        };
-
-        // Allow exceptions to propagate — the caller decides how to handle failures.
-        options.OnCompacting?.Invoke();
-
-        var summaryResponse = await _client.GetResponseAsync(summaryMessages, cancellationToken: ct);
-        var summary = summaryResponse.Text;
-
-        if (string.IsNullOrWhiteSpace(summary))
-            return false;
-
-        session.MessageHistory = new List<ChatMessage>();
-        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
-            $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]\n{summary}"));
-        foreach (var msg in recentMessages)
-            session.MessageHistory.Add(msg);
+        session.MessageHistory = new List<ChatMessage>(compactedMessages);
 
         _logger.LogInformation(
             "Force-compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
-            oldMessages.Count, session.MessageHistory.Count, session.EstimatedContextTokens);
+            oldCount, session.MessageHistory.Count, session.EstimatedContextTokens);
 
         options.OnCompacted?.Invoke(new CompactionResult(
             tokensBefore, session.EstimatedContextTokens,
@@ -272,41 +228,22 @@ public sealed class ContextCompactor
 
         _logger.LogInformation(
             "Mid-loop context compaction triggered: ~{Tokens} tokens (threshold: {Threshold}), {Messages} non-system messages",
-            estimated, threshold, nonSystemCount);
-
-        var retainCount = options.CompactionRetainRecent;
-        // Work on non-system slice of the list
-        var nonSystemMessages = messages.Skip(startIndex).ToList();
-        var splitPoint = AdjustSplitPoint(nonSystemMessages, nonSystemMessages.Count - retainCount);
-        if (splitPoint <= 0)
-            return false;
-
-        var oldMessages = nonSystemMessages.Take(splitPoint).ToList();
-        var recentMessages = nonSystemMessages.Skip(splitPoint).ToList();
-
-        var summaryText = BuildSummaryPrompt(oldMessages);
-        var summaryPromptMessages = new List<ChatMessage>
-        {
-            new ChatMessage(ChatRole.User, summaryText)
-        };
+            estimated, threshold, messagesBefore);
 
         try
         {
-            options.OnCompacting?.Invoke();
+            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
+                messages, startIndex, options.CompactionRetainRecent, options,
+                substituteNullSummary: true, ct);
 
-            var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
-            var summary = summaryResponse.Text ?? "No summary available.";
-
-            var summaryMessage = new ChatMessage(ChatRole.Assistant,
-                $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]\n{summary}");
+            if (!compacted) return false;
 
             // Rebuild the live messages list in-place
-            // Keep system prompt if present, then summary, then recent
+            // Keep system prompt if present, then append compacted messages (summary + recent)
             while (messages.Count > startIndex)
                 messages.RemoveAt(messages.Count - 1);
 
-            messages.Add(summaryMessage);
-            foreach (var msg in recentMessages)
+            foreach (var msg in compactedMessages)
                 messages.Add(msg);
 
             // Sync session.MessageHistory to match
@@ -319,7 +256,7 @@ public sealed class ContextCompactor
 
             _logger.LogInformation(
                 "Mid-loop compacted {OldCount} messages into summary. {NewCount} messages remaining",
-                oldMessages.Count, messagesAfter);
+                oldCount, messagesAfter);
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session?.EstimatedContextTokens ?? 0,
@@ -334,6 +271,84 @@ public sealed class ContextCompactor
             _logger.LogWarning(ex, "Mid-loop context compaction failed, continuing with full history");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Core compaction logic: computes the split, invokes the LLM to summarize the old messages,
+    /// and returns the assembled compacted list (summary followed by recent messages).
+    /// </summary>
+    /// <param name="messages">The full message list to compact.</param>
+    /// <param name="startIndex">
+    /// Number of leading messages to skip (0 for session-based methods,
+    /// 1 when a system prompt is present at index 0 in the mid-loop overload).
+    /// </param>
+    /// <param name="retainCount">Number of recent messages to preserve verbatim.</param>
+    /// <param name="options">Agent options (used for <see cref="AgentOptions.OnCompacting"/>).</param>
+    /// <param name="substituteNullSummary">
+    /// When <c>true</c>, a null/whitespace LLM response is replaced with <c>"No summary available."</c>.
+    /// When <c>false</c>, a null/whitespace LLM response causes this method to return
+    /// <c>(false, empty)</c> so the caller can signal failure without mutating state.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// A tuple of <c>(compacted, compactedMessages, oldCount)</c>. When <c>compacted</c> is
+    /// <c>true</c>, <c>compactedMessages</c> contains a single summary message followed by the
+    /// retained recent messages, and <c>oldCount</c> is the number of messages that were summarized.
+    /// </returns>
+    private async Task<(bool compacted, IList<ChatMessage> compactedMessages, int oldCount)>
+        CompactMessageSliceAsync(
+            IList<ChatMessage> messages,
+            int startIndex,
+            int retainCount,
+            AgentOptions options,
+            bool substituteNullSummary,
+            CancellationToken ct)
+    {
+        int nonSkippedCount = messages.Count - startIndex;
+        if (nonSkippedCount <= retainCount + 1)
+            return (false, Array.Empty<ChatMessage>(), 0);
+
+        var slice = messages.Skip(startIndex).ToList();
+        var splitPoint = AdjustSplitPoint(slice, slice.Count - retainCount);
+        if (splitPoint <= 0)
+            return (false, Array.Empty<ChatMessage>(), 0);
+
+        var oldMessages = slice.Take(splitPoint).ToList();
+        var recentMessages = slice.Skip(splitPoint).ToList();
+
+        var summaryPromptText = BuildSummaryPrompt(oldMessages);
+        var summaryPromptMessages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.User, summaryPromptText)
+        };
+
+        options.OnCompacting?.Invoke();
+
+        var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
+        var rawSummary = summaryResponse.Text;
+
+        string summary;
+        if (string.IsNullOrWhiteSpace(rawSummary))
+        {
+            if (!substituteNullSummary)
+                return (false, Array.Empty<ChatMessage>(), 0);
+            summary = "No summary available.";
+        }
+        else
+        {
+            summary = rawSummary!;
+        }
+
+        var compactedMessages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.Assistant,
+                $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]\n{summary}")
+        };
+
+        foreach (var msg in recentMessages)
+            compactedMessages.Add(msg);
+
+        return (true, compactedMessages, oldMessages.Count);
     }
 
     private static long EstimateArgumentsLength(FunctionCallContent fc)
