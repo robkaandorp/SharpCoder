@@ -202,6 +202,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Uses exact token counts from API responses (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call
 - Older messages are summarized into a single `[CONTEXT SUMMARY]` message
 - Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
+- **Leading system messages are preserved** — all consecutive `ChatRole.System` messages at the start of the history are kept intact and are never included in the summary. Callers do not need to re-add the system prompt after compaction.
 - Key decisions, findings, and file paths are preserved in the summary
 - **Automatic recovery** — If an API call fails due to context overflow (`model_max_prompt_tokens_exceeded`), the agent force-compacts the session and retries once
 - **Mid-loop compaction** — During streaming with tool calls, compaction occurs between tool rounds to handle large tool results (e.g., web search returning 50K tokens). Session history is synchronized from the authoritative messages list after compaction to prevent duplicate entries.
