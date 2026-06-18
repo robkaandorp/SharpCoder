@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.10.0] - 2026-06-18
+
+### Added
+
+- **`AgentOptions.CompactionMaxTokens`** — New nullable `int?` property that specifies the compaction model's context window size. When set, enables chunked compaction: if old messages exceed this budget, they are split into token-budgeted chunks (75% of the budget), each summarized separately, and the per-chunk summaries are concatenated into one summary message. When null (default), falls back to `MaxContextTokens` and uses the existing single-call summarization path (no behavior change).
+
+### Fixed
+
+- **`ForceCompactAsync` exception propagation** — `ForceCompactAsync` now catches exceptions from the compaction LLM call, logs a warning, and returns `false` instead of propagating the exception to the caller. Previously, when the compaction model rejected an oversized summary prompt, the exception would crash the agent with no fallback.
+
 ## [0.9.0] - 2026-04-14
 
 ### Changed
