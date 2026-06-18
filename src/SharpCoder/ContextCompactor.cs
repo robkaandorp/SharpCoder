@@ -149,25 +149,34 @@ public sealed class ContextCompactor
             "Force context compaction: ~{Tokens} tokens, {Messages} messages",
             tokensBefore, messagesBefore);
 
-        // Exceptions from the summarization client propagate to the caller.
-        var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-            messages, startIndex, options.CompactionRetainRecent, options,
-            substituteNullSummary: false, ct);
+        try
+        {
+            // Exceptions from the summarization client are now caught and logged
+            // instead of propagating to the caller.
+            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
+                messages, startIndex, options.CompactionRetainRecent, options,
+                substituteNullSummary: false, ct);
 
-        if (!compacted) return false;
+            if (!compacted) return false;
 
-        session.MessageHistory = new List<ChatMessage>(messages.Take(startIndex).Concat(compactedMessages));
+            session.MessageHistory = new List<ChatMessage>(messages.Take(startIndex).Concat(compactedMessages));
 
-        _logger.LogInformation(
-            "Force-compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
-            oldCount, session.MessageHistory.Count - startIndex, session.EstimatedContextTokens);
+            _logger.LogInformation(
+                "Force-compacted {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
+                oldCount, session.MessageHistory.Count - startIndex, session.EstimatedContextTokens);
 
-        options.OnCompacted?.Invoke(new CompactionResult(
-            tokensBefore, session.EstimatedContextTokens,
-            messagesBefore, session.MessageHistory.Count - startIndex));
+            options.OnCompacted?.Invoke(new CompactionResult(
+                tokensBefore, session.EstimatedContextTokens,
+                messagesBefore, session.MessageHistory.Count - startIndex));
 
-        session.LastKnownContextTokens = 0;
-        return true;
+            session.LastKnownContextTokens = 0;
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            _logger.LogWarning(ex, "Force context compaction failed, returning false");
+            return false;
+        }
     }
 
     /// <summary>
@@ -328,39 +337,168 @@ public sealed class ContextCompactor
         var oldMessages = slice.Take(splitPoint).ToList();
         var recentMessages = slice.Skip(splitPoint).ToList();
 
-        var summaryPromptText = BuildSummaryPrompt(oldMessages);
-        var summaryPromptMessages = new List<ChatMessage>
-        {
-            new ChatMessage(ChatRole.User, summaryPromptText)
-        };
+        // Budget is 75% of the compaction model's context window. When no dedicated
+        // compaction limit is configured, fall back to the main model's limit.
+        var budget = (long)((options.CompactionMaxTokens ?? options.MaxContextTokens) * 0.75);
+        var oldTokens = EstimateTokens(oldMessages);
 
-        options.OnCompacting?.Invoke();
-
-        var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
-        var rawSummary = summaryResponse.Text;
-
+        int chunkCount;
         string summary;
-        if (string.IsNullOrWhiteSpace(rawSummary))
+
+        if (oldTokens > budget)
         {
-            if (!substituteNullSummary)
+            var (success, chunkedSummary, chunksUsed) = await SummarizeInChunksAsync(
+                oldMessages, (int)budget, options, substituteNullSummary, ct);
+
+            if (!success)
                 return (false, Array.Empty<ChatMessage>(), 0);
-            summary = "No summary available.";
+
+            summary = chunkedSummary;
+            chunkCount = chunksUsed;
         }
         else
         {
-            summary = rawSummary!;
+            // Single-call path: preserve exact existing behavior and output format.
+            chunkCount = 1;
+            var summaryPromptText = BuildSummaryPrompt(oldMessages);
+            var summaryPromptMessages = new List<ChatMessage>
+            {
+                new ChatMessage(ChatRole.User, summaryPromptText)
+            };
+
+            options.OnCompacting?.Invoke();
+
+            var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
+            var rawSummary = summaryResponse.Text;
+
+            if (string.IsNullOrWhiteSpace(rawSummary))
+            {
+                if (!substituteNullSummary)
+                    return (false, Array.Empty<ChatMessage>(), 0);
+                summary = "No summary available.";
+            }
+            else
+            {
+                summary = rawSummary!;
+            }
         }
+
+        string header = chunkCount > 1
+            ? $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted in {chunkCount} chunks]"
+            : $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]";
 
         var compactedMessages = new List<ChatMessage>
         {
-            new ChatMessage(ChatRole.Assistant,
-                $"[CONTEXT SUMMARY — {oldMessages.Count} messages compacted]\n{summary}")
+            new ChatMessage(ChatRole.Assistant, $"{header}\n{summary}")
         };
 
         foreach (var msg in recentMessages)
             compactedMessages.Add(msg);
 
         return (true, compactedMessages, oldMessages.Count);
+    }
+
+    private static long EstimateTokens(IList<ChatMessage> messages)
+    {
+        long chars = 0;
+        foreach (var msg in messages)
+        {
+            foreach (var content in msg.Contents)
+            {
+                if (content is TextContent tc)
+                    chars += tc.Text?.Length ?? 0;
+                else if (content is FunctionCallContent fc)
+                    chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
+                else if (content is FunctionResultContent fr)
+                    chars += EstimateResultLength(fr);
+            }
+        }
+        return chars / 4;
+    }
+
+    private async Task<(bool success, string summary, int chunkCount)> SummarizeInChunksAsync(
+        IList<ChatMessage> oldMessages,
+        int budgetTokens,
+        AgentOptions options,
+        bool substituteNullSummary,
+        CancellationToken ct)
+    {
+        var chunks = new List<List<ChatMessage>>();
+        var currentChunk = new List<ChatMessage>();
+
+        foreach (var msg in oldMessages)
+        {
+            // Check whether this single message alone exceeds the budget.
+            var msgTokens = EstimateTokens(new[] { msg });
+
+            if (currentChunk.Count == 0)
+            {
+                // Always start a new chunk with this message. If the message itself
+                // is over budget, it'll land in its own single-element chunk —
+                // unavoidable since we have to send it to the compaction model.
+                currentChunk.Add(msg);
+            }
+            else
+            {
+                // Greedy: would adding this message exceed the budget?
+                var candidateTokens = EstimateTokens(currentChunk.Append(msg).ToList());
+                if (candidateTokens <= budgetTokens)
+                {
+                    currentChunk.Add(msg);
+                }
+                else
+                {
+                    // Close current chunk (it's within budget) and start a new one
+                    // with this message.
+                    chunks.Add(currentChunk);
+                    currentChunk = new List<ChatMessage> { msg };
+                }
+            }
+        }
+
+        if (currentChunk.Count > 0)
+        {
+            chunks.Add(currentChunk);
+        }
+
+        options.OnCompacting?.Invoke();
+
+        var summaries = new List<string>();
+        foreach (var chunk in chunks)
+        {
+            string? raw;
+            try
+            {
+                var promptText = BuildSummaryPrompt(chunk);
+                var promptMessages = new List<ChatMessage>
+                {
+                    new ChatMessage(ChatRole.User, promptText)
+                };
+
+                var response = await _client.GetResponseAsync(promptMessages, cancellationToken: ct);
+                raw = response.Text;
+            }
+            catch (System.Exception ex)
+            {
+                if (!substituteNullSummary)
+                    return (false, string.Empty, 0);
+
+                _logger.LogWarning(ex, "Chunk summarization failed, using fallback");
+                raw = "No summary available for this section.";
+            }
+
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                if (!substituteNullSummary)
+                    return (false, string.Empty, 0);
+                raw = "No summary available for this section.";
+            }
+
+            summaries.Add(raw!);
+        }
+
+        var combinedSummary = string.Join("\n\n", summaries);
+        return (true, combinedSummary, chunks.Count);
     }
 
     private static long EstimateArgumentsLength(FunctionCallContent fc)

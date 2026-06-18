@@ -155,6 +155,9 @@ var options = new AgentOptions
     // Optional: separate (cheaper) model for context compaction summaries
     CompactionClient = new OllamaChatClient("http://localhost:11434", "llama3.2"),
 
+    // Optional: compaction model's context window (enables chunked compaction when set)
+    CompactionMaxTokens = 16_000, // compaction model's context window; null = use MaxContextTokens
+
     // Optional: reasoning effort for models with extended thinking
     ReasoningEffort = ReasoningEffort.Medium,
 
@@ -210,6 +213,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Disable with `EnableAutoCompaction = false` if you manage context manually.
 - Use `OnCompacting` / `OnCompacted` callbacks to hook into the compaction lifecycle — e.g. to show a loading indicator before the summarisation call starts.
 - **Separate compaction model** — Configure `CompactionClient` to use a cheaper/smaller model (e.g., `llama3.2` via Ollama) just for context compaction summaries. When not set, the main `IChatClient` is used (backward compatible).
+- **Chunked compaction** — When `CompactionMaxTokens` is set and old messages exceed that budget, they are split into token-budgeted chunks and each chunk is summarized separately. The per-chunk summaries are concatenated into one summary message. This prevents the compaction model from overflowing when it has a smaller context window than the main model. When `CompactionMaxTokens` is null (default), all old messages are summarized in a single call (existing behavior).
 
 ## Skills
 
@@ -255,7 +259,7 @@ dotnet run --project examples/SharpCoder.CliAgent -- \
 
 | Flag | Description |
 |------|-------------|
-| `-m`, `--model` | Ollama Cloud model id (default `gpt-oss:120b`) |
+| `-m`, `--model` | Model id. Default provider is Ollama Cloud; prefix with `copilot/`, `ollama-local/`, or `ollama-cloud/` to choose a provider explicitly. |
 | `-r`, `--reasoning` | `None`, `Low`, `Medium`, or `High` (default `Medium`) |
 | `-w`, `--work-dir` | Directory the agent creates and uses as the project root. **Fails if it already exists** to protect prior experiments |
 | `-a`, `--assignment` | Path to a markdown file describing the task |
