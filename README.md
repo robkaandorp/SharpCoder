@@ -259,7 +259,7 @@ dotnet run --project examples/SharpCoder.CliAgent -- \
 
 | Flag | Description |
 |------|-------------|
-| `-m`, `--model` | Ollama Cloud model id (default `gpt-oss:120b`) |
+| `-m`, `--model` | Model id. Default provider is Ollama Cloud; prefix with `copilot/`, `ollama-local/`, or `ollama-cloud/` to choose a provider explicitly. |
 | `-r`, `--reasoning` | `None`, `Low`, `Medium`, or `High` (default `Medium`) |
 | `-w`, `--work-dir` | Directory the agent creates and uses as the project root. **Fails if it already exists** to protect prior experiments |
 | `-a`, `--assignment` | Path to a markdown file describing the task |

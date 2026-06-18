@@ -58,7 +58,12 @@ public static class ChatClientFactory
                 {
                     var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
                     model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
-                    var ollamaClient = new OllamaApiClient(new Uri(url));
+                    var httpClient = new HttpClient(CreateResilientHandler())
+                    {
+                        BaseAddress = new Uri(url),
+                        Timeout = Timeout.InfiniteTimeSpan,
+                    };
+                    var ollamaClient = new OllamaApiClient(httpClient);
                     ollamaClient.SelectedModel = model;
                     return ollamaClient;
                 }

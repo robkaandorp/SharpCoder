@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - **`ForceCompactAsync` exception propagation** — `ForceCompactAsync` now catches exceptions from the compaction LLM call, logs a warning, and returns `false` instead of propagating the exception to the caller. Previously, when the compaction model rejected an oversized summary prompt, the exception would crash the agent with no fallback.
+- **CliAgent Ollama Cloud retries** — `examples\SharpCoder.CliAgent` now uses the existing resilient HTTP pipeline for Ollama Cloud runs while still forcing HTTP/1.1. This lets the example retry transient `503 Service Unavailable` responses from ollama.com instead of failing the run immediately.
+- **CliAgent local-provider selection and retries** — `examples\SharpCoder.CliAgent` now routes non-Copilot model strings through `ChatClientFactory`, so `ollama-local/...` and `ollama-cloud/...` prefixes work as documented. Local Ollama runs also use the resilient HTTP pipeline, reducing failures against cloud-backed local models that intermittently return `503 Service Unavailable`.
 
 ## [0.9.0] - 2026-04-14
 
