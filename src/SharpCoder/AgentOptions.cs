@@ -130,4 +130,13 @@ public sealed class AgentOptions
     /// rate limit or context window during compaction.
     /// </summary>
     public IChatClient? CompactionClient { get; set; }
+
+    /// <summary>
+    /// Maximum context window size in tokens for the compaction model.
+    /// When null (default), falls back to <see cref="MaxContextTokens"/>.
+    /// Set this to the compaction model's actual context window to enable
+    /// chunked compaction — if old messages exceed this budget, they are
+    /// summarized in chunks that each fit within this limit.
+    /// </summary>
+    public int? CompactionMaxTokens { get; set; }
 }

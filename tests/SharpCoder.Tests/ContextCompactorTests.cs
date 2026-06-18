@@ -120,6 +120,7 @@ public class ContextCompactorTests
         var options = new AgentOptions
         {
             MaxContextTokens = 100, // Very low threshold to trigger compaction
+            CompactionMaxTokens = 2000, // Keep old messages within the chunk budget so the single-call path is used
             CompactionThreshold = 0.5,
             CompactionRetainRecent = 5
         };
@@ -189,6 +190,8 @@ public class ContextCompactorTests
     [Fact]
     public async Task CompactIfNeeded_SummarizationFails_ReturnsFalseAndPreservesHistory()
     {
+        // Use ForceCompactAsync to exercise the substituteNullSummary=false path,
+        // where per-chunk failures must cause the whole compaction to return false.
         var client = new FailingClient();
         var compactor = new ContextCompactor(client);
         var session = CreateLargeSession(20);
@@ -201,7 +204,7 @@ public class ContextCompactorTests
             CompactionRetainRecent = 5
         };
 
-        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
 
         Assert.False(result);
         Assert.Equal(originalCount, session.MessageHistory.Count); // History unchanged
@@ -1269,5 +1272,438 @@ public class ContextCompactorTests
         // Assert: compaction SHOULD be triggered because current heuristic estimate exceeds threshold
         Assert.True(result, "Compaction should be triggered when heuristic estimate exceeds threshold even if LastKnownContextTokens is lower");
         Assert.Equal(1, mockClient.CallCount);
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_LargeHistory_ChunksSummarization()
+    {
+        var mockClient = new MockSummarizingClient("Chunked summary text.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1000,
+            CompactionMaxTokens = 200,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.True(mockClient.CallCount > 1, $"Expected multiple calls, got {mockClient.CallCount}");
+        var summary = session.MessageHistory[0].Text!;
+        Assert.Contains("messages compacted in", summary);
+        Assert.Matches(@"\d+ chunks", summary);
+    }
+
+    [Fact]
+    public async Task CompactIfNeeded_SingleChunkWhenWithinBudget()
+    {
+        var mockClient = new MockSummarizingClient("Single summary text.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Messages large enough to trigger compaction at a low threshold, but small enough
+        // to fit within the explicit compaction chunk budget as a single chunk.
+        for (int i = 0; i < 10; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 25)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 100,
+            CompactionMaxTokens = 200,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        var summary = session.MessageHistory[0].Text!;
+        Assert.Contains("[CONTEXT SUMMARY — 8 messages compacted]", summary);
+        Assert.DoesNotContain("in 1 chunks", summary);
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_CompactionModelOverflow_ReturnsFalseNotException()
+    {
+        var client = new FailingClient();
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message {i}: " + new string('x', 500)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 5,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        Assert.Equal(15, session.MessageHistory.Count);
+    }
+
+    private sealed class RecordingMockClient : IChatClient
+    {
+        private readonly string _summary;
+        public int CallCount { get; private set; }
+        public List<IList<ChatMessage>> Calls { get; } = new();
+
+        public RecordingMockClient(string summary = "Recorded summary.")
+        {
+            _summary = summary;
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            var list = messages.ToList();
+            CallCount++;
+            Calls.Add(list);
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, _summary)));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    private static long EstimateTokensForTest(IList<ChatMessage> messages)
+    {
+        long chars = 0;
+        foreach (var msg in messages)
+        {
+            foreach (var content in msg.Contents)
+            {
+                if (content is TextContent tc)
+                    chars += tc.Text?.Length ?? 0;
+                else if (content is FunctionCallContent fc)
+                    chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLengthForTest(fc);
+                else if (content is FunctionResultContent fr)
+                    chars += fr.Result?.ToString()?.Length ?? 0;
+            }
+        }
+        return chars / 4;
+    }
+
+    private static long EstimateArgumentsLengthForTest(FunctionCallContent fc)
+    {
+        if (fc.Arguments == null) return 0;
+        long len = 0;
+        foreach (var kvp in fc.Arguments)
+        {
+            len += kvp.Key?.Length ?? 0;
+            len += kvp.Value?.ToString()?.Length ?? 0;
+        }
+        return len;
+    }
+
+    [Fact]
+    public async Task SummarizeInChunks_RespectsTokenBudget()
+    {
+        var mockClient = new RecordingMockClient("Chunk summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 12; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1000,
+            CompactionMaxTokens = 300,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.True(mockClient.CallCount > 1, $"Expected multiple calls, got {mockClient.CallCount}");
+
+        int budget = (int)(options.CompactionMaxTokens!.Value * 0.75);
+        foreach (var call in mockClient.Calls)
+        {
+            var userMessage = call[0];
+            var estimated = EstimateTokensForTest(new[] { userMessage });
+            Assert.True(estimated <= budget,
+                $"Chunk prompt estimated {estimated} tokens, exceeds budget {budget}. Text length {userMessage.Text?.Length}");
+            Assert.True((userMessage.Text?.Length ?? 0) / 4 <= budget,
+                $"Chunk prompt text length / 4 = {(userMessage.Text?.Length ?? 0) / 4} exceeds budget {budget}");
+        }
+    }
+
+    /// <summary>
+    /// Verifies that when chunked compaction is enabled and a chunk returns a
+    /// null/empty summary while substituteNullSummary is false (the ForceCompactAsync
+    /// path), the compaction returns false and preserves the session history verbatim.
+    /// This exercises the substituteNullSummary=false branch inside SummarizeInChunksAsync.
+    /// </summary>
+    [Fact]
+    public async Task ForceCompactAsync_ChunkedNullSummary_ReturnsFalseAndPreservesHistory()
+    {
+        var client = new NullReturningClient();
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+
+        // Large messages so old slice exceeds the chunk budget -> triggers chunked path.
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+
+        var originalCount = session.MessageHistory.Count;
+
+        var options = new AgentOptions
+        {
+            CompactionMaxTokens = 200, // small budget forces chunking
+            CompactionRetainRecent = 5,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.False(result, "ForceCompactAsync should return false when a chunk yields no summary content");
+        Assert.Equal(originalCount, session.MessageHistory.Count);
+    }
+
+    /// <summary>
+    /// Verifies chunked compaction handles messages containing function-call and
+    /// function-result content (not just plain text) — the EstimateTokens helper must
+    /// account for these content types so chunk boundaries are computed correctly and
+    /// multiple LLM calls are made.
+    /// </summary>
+    [Fact]
+    public async Task CompactIfNeeded_ChunkedMixedContent_MakesMultipleCalls()
+    {
+        var mockClient = new RecordingMockClient("Mixed chunk summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 16; i++)
+        {
+            if (i % 4 == 1)
+            {
+                // assistant message with a function call
+                var fc = new FunctionCallContent($"call-{i}", "read_file", new Dictionary<string, object?>
+                {
+                    ["path"] = $"file-{i}.txt"
+                });
+                session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, [fc]));
+            }
+            else if (i % 4 == 2)
+            {
+                // tool result message
+                var fr = new FunctionResultContent($"call-{i}", "result content " + new string('y', 400));
+                session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, [fr]));
+            }
+            else
+            {
+                session.MessageHistory.Add(new ChatMessage(
+                    i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                    $"Message-{i}: " + new string('x', 400)));
+            }
+        }
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1000,
+            CompactionMaxTokens = 200,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.True(mockClient.CallCount > 1,
+            $"Expected multiple chunk calls for mixed content, got {mockClient.CallCount}");
+        var summary = session.MessageHistory[0].Text!;
+        Assert.Contains("messages compacted in", summary);
+        Assert.Matches(@"\d+ chunks", summary);
+    }
+
+    /// <summary>Client that returns a null/whitespace summary, simulating a model
+    /// that produces no usable output (exercises the substituteNullSummary=false
+    /// branch in the chunked path).</summary>
+    private sealed class NullReturningClient : IChatClient
+    {
+        public int CallCount { get; private set; }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            // Return an assistant message with whitespace-only text so summaryResponse.Text
+            // is null/whitespace, triggering the null-summary branch.
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "   ")));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Verifies the exception-fallback path in SummarizeInChunksAsync (Bug #3 fix).
+    /// When the compaction client throws on every chunk call but
+    /// substituteNullSummary is true (the public CompactIfNeededAsync path),
+    /// the compactor must NOT propagate the exception. Instead it substitutes
+    /// "No summary available for this section." for each failed chunk and returns
+    /// true, producing a valid summary message containing the fallback text.
+    /// </summary>
+    [Fact]
+    public async Task CompactIfNeeded_ChunkedException_SubstitutesFallback()
+    {
+        // FailingClient throws on every GetResponseAsync call. When wired as the
+        // compactor's client, every chunk summarization call throws.
+        var failingClient = new FailingClient();
+        var compactor = new ContextCompactor(failingClient);
+        var session = AgentSession.Create();
+
+        // 12 large messages (~500 chars each) so the old slice far exceeds the
+        // chunk budget and the chunked path is triggered.
+        for (int i = 0; i < 12; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1000,
+            CompactionMaxTokens = 200,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        // The public CompactIfNeededAsync path uses substituteNullSummary: true,
+        // so exceptions are caught and substituted rather than propagated.
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result, "CompactIfNeededAsync should succeed with fallback sections, not throw");
+
+        var summary = session.MessageHistory[0].Text!;
+        Assert.Contains("No summary available for this section.", summary);
+    }
+
+    /// <summary>
+    /// Verifies Bug #1 fix: when CompactionMaxTokens is null, the chunk budget
+    /// falls back to MaxContextTokens. With a small MaxContextTokens and large
+    /// messages, the chunked path must still be triggered and produce multiple
+    /// LLM calls.
+    /// </summary>
+    [Fact]
+    public async Task CompactIfNeeded_NullCompactionMaxTokens_FallsBackToMaxContextTokens()
+    {
+        var mockClient = new RecordingMockClient("Fallback-budget chunk summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 8 large messages (~500 chars each) so old slice exceeds the budget
+        // derived from MaxContextTokens (200 * 0.75 = 150 tokens).
+        for (int i = 0; i < 8; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 200,
+            CompactionMaxTokens = null, // fall back to MaxContextTokens
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 1,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result, "Compaction should trigger with null CompactionMaxTokens falling back to MaxContextTokens");
+        Assert.True(mockClient.CallCount > 1,
+            $"Expected multiple chunk calls when CompactionMaxTokens is null, got {mockClient.CallCount}");
+    }
+
+    /// <summary>
+    /// Locks in greedy chunk packing (iteration 3 fix): when each message is small
+    /// enough that multiple fit within the chunk budget, the greedy packer must
+    /// combine them into multi-message chunks rather than emitting one chunk per
+    /// message. This guards against a regression to the non-greedy "every message
+    /// its own chunk" behaviour.
+    /// </summary>
+    [Fact]
+    public async Task CompactIfNeeded_ModerateMessages_GreedyChunksPackMultipleMessages()
+    {
+        var mockClient = new RecordingMockClient("Greedy chunk summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 16 messages of ~250 chars each => ~62 tokens per message. The chunk
+        // budget is 200 * 0.75 = 150 tokens, so two messages (124 tokens) fit but
+        // three (186 tokens) do not. Greedy packing should yield ~2 messages per
+        // chunk, producing far fewer chunks than the 14 old messages.
+        for (int i = 0; i < 16; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 250)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1000,
+            CompactionMaxTokens = 200,
+            CompactionThreshold = 0.5,
+            CompactionRetainRecent = 2,
+        };
+
+        var result = await compactor.CompactIfNeededAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        // 14 old messages with ~2 per chunk => ~7 chunks. A non-greedy regression
+        // would produce 14 chunks (one per message), so the upper bound of 8
+        // catches that while allowing a little slack for boundary effects.
+        Assert.True(mockClient.CallCount >= 2 && mockClient.CallCount <= 8,
+            $"Expected 2-8 greedy chunks for 14 old messages, got {mockClient.CallCount}");
+
+        // At least one chunk must contain multiple packed messages. The prompt
+        // text from BuildSummaryPrompt emits one "[Role] Message-N ..." line per
+        // message, so we count "Message-" occurrences in the prompt text to
+        // determine how many messages each chunk holds.
+        var perChunkMessageCounts = new List<int>();
+        foreach (var call in mockClient.Calls)
+        {
+            var promptText = call[0].Text ?? string.Empty;
+            var count = System.Text.RegularExpressions.Regex.Matches(promptText, "Message-").Count;
+            perChunkMessageCounts.Add(count);
+        }
+
+        Assert.True(perChunkMessageCounts.Any(c => c >= 2),
+            $"Expected at least one chunk with multiple messages, but per-chunk counts were: [{string.Join(", ", perChunkMessageCounts)}]");
     }
 }
