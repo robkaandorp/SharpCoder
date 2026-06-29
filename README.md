@@ -214,6 +214,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Use `OnCompacting` / `OnCompacted` callbacks to hook into the compaction lifecycle — e.g. to show a loading indicator before the summarisation call starts.
 - **Separate compaction model** — Configure `CompactionClient` to use a cheaper/smaller model (e.g., `llama3.2` via Ollama) just for context compaction summaries. When not set, the main `IChatClient` is used (backward compatible).
 - **Chunked compaction** — When `CompactionMaxTokens` is set and old messages exceed that budget, they are split into token-budgeted chunks and each chunk is summarized separately. The per-chunk summaries are concatenated into one summary message. This prevents the compaction model from overflowing when it has a smaller context window than the main model. When `CompactionMaxTokens` is null (default), all old messages are summarized in a single call (existing behavior).
+- **Partial compaction** — `CompactOldestPercentAsync(session, options, percent, ct)` summarizes only the oldest X% of tokens, keeping the newest portion verbatim. Gentler than full compaction — preserves more recent context with full fidelity while reducing token usage.
 
 ## Skills
 
