@@ -118,6 +118,121 @@ public sealed class ContextCompactor
     }
 
     /// <summary>
+    /// Compacts the oldest <paramref name="percent"/> percent of the non-system message history,
+    /// preserving the remaining recent messages verbatim. Unlike <see cref="ForceCompactAsync"/>,
+    /// this method determines the split point by token-weighted percentage rather than by a fixed
+    /// recent-message count. This is useful for callers (such as CopilotHive) that want to trim
+    /// the oldest portion of the conversation without knowing the model's exact context budget.
+    /// </summary>
+    /// <param name="session">The session whose history should be compacted.</param>
+    /// <param name="options">Agent options (callback, retain-recent safety minimum, etc.).</param>
+    /// <param name="percent">Percentage of non-system messages to compact, in the range 1–95.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> if compaction succeeded; otherwise <c>false</c> when there are too few messages
+    /// to compact, summarization produced no content, or an exception occurred.
+    /// </returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="percent"/> is less than 1 or greater than 95.
+    /// </exception>
+    public async Task<bool> CompactOldestPercentAsync(
+        AgentSession session,
+        AgentOptions options,
+        int percent,
+        CancellationToken ct = default)
+    {
+        if (percent < 1 || percent > 95)
+            throw new ArgumentOutOfRangeException(nameof(percent), percent, "Percent must be between 1 and 95.");
+
+        var messages = session.MessageHistory;
+        var startIndex = FindStartIndex(messages);
+
+        if (messages.Count - startIndex <= options.CompactionRetainRecent + 1)
+            return false; // Not enough messages to compact
+
+        var tokensBefore = session.EstimatedContextTokens;
+        var messagesBefore = messages.Count - startIndex;
+
+        // Estimate per-message tokens for non-system messages
+        var perMessageTokens = new List<(int index, long tokens)>();
+        long totalTokens = 0;
+        for (int i = startIndex; i < messages.Count; i++)
+        {
+            var estimate = EstimateMessageTokens(messages[i]);
+            perMessageTokens.Add((i, estimate));
+            totalTokens += estimate;
+        }
+
+        // Find the split point where the accumulated token count reaches the requested percentage
+        long targetTokens = totalTokens * percent / 100;
+        long accumulated = 0;
+        int splitPoint = startIndex;
+        for (int i = 0; i < perMessageTokens.Count; i++)
+        {
+            accumulated += perMessageTokens[i].tokens;
+            if (accumulated >= targetTokens)
+            {
+                splitPoint = perMessageTokens[i].index + 1;
+                break;
+            }
+        }
+
+        // Guard (NOT a clamp): if the percent-derived old portion is too small to be
+        // worth compacting, return false. We do NOT expand the old portion to satisfy
+        // a recent-message minimum — the split point stays purely percent-derived.
+        var oldCount = splitPoint - startIndex;
+        if (oldCount <= 0 || oldCount < options.CompactionRetainRecent + 1)
+            return false;
+
+        _logger.LogInformation(
+            "Compacting oldest {Percent}% of context: ~{Tokens} tokens, {Messages} messages, split at index {Split}",
+            percent, tokensBefore, messagesBefore, splitPoint);
+
+        try
+        {
+            var (compacted, compactedMessages, summaryOldCount) = await CompactMessageSliceAsync(
+                messages, startIndex, messages.Count - splitPoint, options,
+                substituteNullSummary: false, ct);
+
+            if (!compacted) return false;
+
+            var systemPrefix = messages.Take(startIndex).ToList();
+            session.MessageHistory = new List<ChatMessage>(systemPrefix.Concat(compactedMessages));
+
+            _logger.LogInformation(
+                "Compacted oldest {OldCount} messages into summary. {NewCount} messages remaining (~{Tokens} tokens)",
+                summaryOldCount, session.MessageHistory.Count - startIndex, session.EstimatedContextTokens);
+
+            options.OnCompacted?.Invoke(new CompactionResult(
+                tokensBefore, session.EstimatedContextTokens,
+                messagesBefore, session.MessageHistory.Count - startIndex));
+
+            session.LastKnownContextTokens = 0;
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            _logger.LogWarning(ex, "Oldest-percent context compaction failed, returning false");
+            return false;
+        }
+    }
+
+    private static long EstimateMessageTokens(ChatMessage message)
+    {
+        long chars = 0;
+        foreach (var content in message.Contents)
+        {
+            if (content is TextContent tc)
+                chars += tc.Text?.Length ?? 0;
+            else if (content is FunctionCallContent fc)
+                chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
+            else if (content is FunctionResultContent fr)
+                chars += EstimateResultLength(fr);
+        }
+        return chars / 4;
+    }
+
+    /// <summary>
     /// Compacts the session unconditionally, regardless of whether the token threshold
     /// has been reached. Useful when the API has already rejected the request due to
     /// context overflow. Respects <see cref="AgentOptions.CompactionRetainRecent"/>.
