@@ -1357,6 +1357,259 @@ public class ContextCompactorTests
         Assert.Equal(15, session.MessageHistory.Count);
     }
 
+    [Fact]
+    public async Task CompactOldestPercent_50Percent_CompactsOldestHalf()
+    {
+        var mockClient = new MockSummarizingClient("Summary of oldest half.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 20 messages of varying sizes (some larger than others) to create a token-weighted split
+        for (int i = 0; i < 20; i++)
+        {
+            var size = i % 2 == 0 ? 200 : 100;
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', size)));
+        }
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            CompactionMaxTokens = 10_000, // Large budget so single-call path is used
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        Assert.True(session.MessageHistory.Count < 20, "Session should have fewer messages after compaction");
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_TooFewMessages_ReturnsFalse()
+    {
+        var client = new ThrowingClient();
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+
+        // Only 3 non-system messages
+        for (int i = 0; i < 3; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        Assert.Equal(3, session.MessageHistory.Count);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(96)]
+    [InlineData(100)]
+    public async Task CompactOldestPercent_InvalidPercent_Throws(int percent)
+    {
+        var client = new ThrowingClient();
+        var compactor = new ContextCompactor(client);
+        var session = CreateLargeSession(20);
+
+        var options = new AgentOptions { CompactionRetainRecent = 3 };
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => compactor.CompactOldestPercentAsync(session, options, percent, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_PreservesRecentMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary of oldest messages.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 20 messages with unique identifiable content
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"UniqueMsg-{i}"));
+
+        var options = new AgentOptions { CompactionRetainRecent = 3 };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // The most recent messages should appear unchanged in the compacted session
+        Assert.Contains("UniqueMsg-17", session.MessageHistory[^3].Text!);
+        Assert.Contains("UniqueMsg-18", session.MessageHistory[^2].Text!);
+        Assert.Contains("UniqueMsg-19", session.MessageHistory[^1].Text!);
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_InvokesOnCompactedCallback()
+    {
+        var mockClient = new MockSummarizingClient("Summary text.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = CreateLargeSession(20);
+
+        CompactionResult? callbackResult = null;
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            OnCompacted = r => callbackResult = r,
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.NotNull(callbackResult);
+        Assert.True(callbackResult!.MessagesBefore > callbackResult.MessagesAfter);
+        Assert.True(callbackResult.TokensBefore > 0);
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_ResultingSessionIsSmaller()
+    {
+        var mockClient = new MockSummarizingClient("Compacted summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 20 large messages of equal size
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var messagesBefore = session.MessageHistory.Count;
+        var tokensBefore = session.EstimatedContextTokens;
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            CompactionMaxTokens = 10_000,
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.True(session.MessageHistory.Count < messagesBefore, "Message count should decrease");
+        Assert.True(session.EstimatedContextTokens < tokensBefore, "Estimated tokens should decrease");
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_PreservesLeadingSystemMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary of oldest messages with system prefix.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // Add 2 leading system messages
+        const string systemPrompt1 = "You are a helpful coding assistant.";
+        const string systemPrompt2 = "Always respond in markdown.";
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt1));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.System, systemPrompt2));
+
+        // Add 20 non-system messages large enough to compact
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            CompactionMaxTokens = 10_000, // Large budget so single-call path is used
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        // System messages preserved at indices 0 and 1
+        Assert.Equal(ChatRole.System, session.MessageHistory[0].Role);
+        Assert.Equal(systemPrompt1, session.MessageHistory[0].Text);
+        Assert.Equal(ChatRole.System, session.MessageHistory[1].Role);
+        Assert.Equal(systemPrompt2, session.MessageHistory[1].Text);
+        // Summary at index 2 (right after the system prefix)
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[2].Text!);
+        // The compacted session should have fewer total messages than the original 22
+        Assert.True(session.MessageHistory.Count < 22, "Session should have fewer messages after compaction");
+        // The last message should be preserved verbatim (not summarized)
+        Assert.Contains("Message-19", session.MessageHistory[^1].Text!);
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_Percent1_TinySliver_ReturnsFalseWhenTooFewOldMessages()
+    {
+        var mockClient = new MockSummarizingClient("Tiny summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 20 messages of equal size — 1% means ~0.2 of one message worth of tokens, so the
+        // percent-derived split lands after the first message (oldCount = 1). With
+        // CompactionRetainRecent = 10, the guard requires oldCount >= 11, so 1 < 11 → returns false.
+        // No clamp is applied; the method simply declines to compact such a tiny sliver.
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 10, // Set high so oldCount is too small
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 1, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        // Session unchanged
+        Assert.Equal(20, session.MessageHistory.Count);
+        Assert.Equal(0, mockClient.CallCount);
+    }
+
+    [Fact]
+    public async Task CompactOldestPercent_Percent95_CompactsAlmostEverything()
+    {
+        var mockClient = new MockSummarizingClient("Summary of nearly all messages.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        // 20 messages of equal size
+        for (int i = 0; i < 20; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            CompactionMaxTokens = 10_000, // Large budget so single-call path is used
+        };
+
+        var result = await compactor.CompactOldestPercentAsync(session, options, 95, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        // At 95%, the split point is purely percent-derived (no recent-message clamp).
+        // Accumulating per-message tokens until reaching 95% of the total lands the split
+        // at a message boundary near the end, compacting almost everything and retaining
+        // only the final message(s) verbatim.
+        Assert.Contains("[CONTEXT SUMMARY", session.MessageHistory[0].Text!);
+        // Most messages are summarized: the header reports ~18-19 messages compacted
+        Assert.Matches(@"\[CONTEXT SUMMARY — (18|19) messages compacted\]", session.MessageHistory[0].Text!);
+        // The most recent message must be preserved verbatim
+        Assert.Contains("Message-19", session.MessageHistory[^1].Text!);
+        // Session should be much smaller than the original 20 messages
+        Assert.True(session.MessageHistory.Count <= 3,
+            $"Expected almost everything compacted, but session has {session.MessageHistory.Count} messages");
+    }
+
     private sealed class RecordingMockClient : IChatClient
     {
         private readonly string _summary;

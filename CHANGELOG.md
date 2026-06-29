@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.11.0] - 2026-06-27
+
+### Added
+
+- **`ContextCompactor.CompactOldestPercentAsync`** — New partial compaction method that summarizes only the oldest X% of the session's token budget, leaving the newest portion verbatim. This is gentler than `ForceCompactAsync` (which compacts everything except the last `CompactionRetainRecent` messages) and produces a smaller compaction prompt. Accepts a `percent` parameter (1–95) controlling how much of the oldest content to summarize. Useful for long-running sessions where full compaction would lose too much detail.
+
 ## [0.10.0] - 2026-06-18
 
 ### Added
