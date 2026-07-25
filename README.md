@@ -202,7 +202,7 @@ result.Diagnostics   // Snapshot of everything sent to the LLM (system prompt, t
 Long-running sessions can exceed model context limits. SharpCoder automatically compacts conversation history by summarizing older messages while preserving recent context:
 
 - Triggered when tokens exceed `CompactionThreshold × MaxContextTokens`
-- Uses exact token counts from API responses (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call
+- Uses exact token counts from the most recent API round-trip (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call. When tools are invoked, the token count reflects the final round's context size — not the sum across all internal tool-call round-trips.
 - Older messages are summarized into a single `[CONTEXT SUMMARY]` message
 - Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
 - **Leading system messages are preserved** — all consecutive `ChatRole.System` messages at the start of the history are kept intact and are never included in the summary. Callers do not need to re-add the system prompt after compaction.

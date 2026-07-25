@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.11.1] - 2026-07-25
+
+### Fixed
+
+- **Inflated `LastKnownContextTokens` from `FunctionInvokingChatClient` aggregate usage** — `CodingAgent` now uses a `UsageCapturingChatClient` wrapper to capture the final round-trip's `Usage.InputTokenCount` instead of the aggregate sum across all internal tool-call round-trips returned by `FunctionInvokingChatClient`. Previously, `session.LastKnownContextTokens` was set to the sum of all internal round-trip input tokens (e.g., 1.1M recorded vs ~186K actual context with 8 tool calls), causing `ContextCompactor` to trigger premature compaction at low real utilization (e.g., 19%), destroying conversation history that was still well within budget. The fix introduces a per-execution `UsageCapturingChatClient : DelegatingChatClient` that records the most recent round's input token count; `ExecuteAsync`, the default `ExecuteStreamingAsync` path, and `UpdateSession` all prefer this per-round value. The `ShowToolCallsInStream` path was already correct and is unchanged. Cumulative counters (`InputTokensUsed`/`OutputTokensUsed`) continue accumulating aggregate values.
+
 ## [0.11.0] - 2026-06-27
 
 ### Added
