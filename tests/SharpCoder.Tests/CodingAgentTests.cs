@@ -881,4 +881,206 @@ public class CodingAgentTests
 
         Assert.Same(mainClient, actualClient);
     }
+
+    /// <summary>
+    /// Fake client that simulates a two-round tool-call loop with different
+    /// per-round input token counts. Supports both the non-streaming and the
+    /// streaming code paths.
+    /// </summary>
+    private sealed class MultiRoundUsageClient : IChatClient
+    {
+        private readonly string _toolName;
+        private readonly Dictionary<string, object?> _toolArgs;
+        private readonly long _firstRoundInput;
+        private readonly long _finalRoundInput;
+        private int _callCount;
+
+        public int CallCount => _callCount;
+
+        public MultiRoundUsageClient(string toolName, Dictionary<string, object?> toolArgs,
+            long firstRoundInput, long finalRoundInput)
+        {
+            _toolName = toolName;
+            _toolArgs = toolArgs;
+            _firstRoundInput = firstRoundInput;
+            _finalRoundInput = finalRoundInput;
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            _callCount++;
+            if (_callCount == 1)
+            {
+                var msg = new ChatMessage(ChatRole.Assistant,
+                    [new FunctionCallContent("call_1", _toolName, _toolArgs)]);
+                return Task.FromResult(new ChatResponse(msg)
+                {
+                    FinishReason = ChatFinishReason.ToolCalls,
+                    Usage = new UsageDetails
+                    {
+                        InputTokenCount = _firstRoundInput,
+                        OutputTokenCount = 10,
+                        TotalTokenCount = _firstRoundInput + 10,
+                    },
+                });
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "All done."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+                Usage = new UsageDetails
+                {
+                    InputTokenCount = _finalRoundInput,
+                    OutputTokenCount = 20,
+                    TotalTokenCount = _finalRoundInput + 20,
+                },
+            });
+        }
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            _callCount++;
+            var round = _callCount;
+            await Task.Yield();
+
+            if (round == 1)
+            {
+                yield return new ChatResponseUpdate
+                {
+                    Role = ChatRole.Assistant,
+                    Contents = [new FunctionCallContent("call_1", _toolName, _toolArgs)],
+                };
+                yield return new ChatResponseUpdate
+                {
+                    Contents = [new UsageContent(new UsageDetails
+                    {
+                        InputTokenCount = _firstRoundInput,
+                        OutputTokenCount = 10,
+                        TotalTokenCount = _firstRoundInput + 10,
+                    })],
+                };
+                yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.ToolCalls };
+            }
+            else
+            {
+                yield return new ChatResponseUpdate
+                {
+                    Role = ChatRole.Assistant,
+                    Contents = [new TextContent("All done.")],
+                };
+                yield return new ChatResponseUpdate
+                {
+                    Contents = [new UsageContent(new UsageDetails
+                    {
+                        InputTokenCount = _finalRoundInput,
+                        OutputTokenCount = 20,
+                        TotalTokenCount = _finalRoundInput + 20,
+                    })],
+                };
+                yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.Stop };
+            }
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    private static AgentOptions MultiRoundOptions()
+    {
+        var opts = MinimalOptions();
+        opts.CustomTools = [AIFunctionFactory.Create((string id) => $"tool-result:{id}", "do_thing")];
+        return opts;
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_MultiRoundToolLoop_LastKnownContextTokensIsFinalRoundNotSum()
+    {
+        var client = new MultiRoundUsageClient(
+            "do_thing", new Dictionary<string, object?> { ["id"] = "x" },
+            firstRoundInput: 10_000, finalRoundInput: 15_000);
+
+        var agent = new CodingAgent(client, MultiRoundOptions());
+        var session = AgentSession.Create("multi-round");
+
+        await agent.ExecuteAsync(session, "Do the thing", TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, client.CallCount);
+        Assert.Equal(15_000, session.LastKnownContextTokens);
+        Assert.NotEqual(25_000, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task ExecuteStreamingAsync_MultiRoundToolLoop_LastKnownContextTokensIsFinalRoundNotSum()
+    {
+        var client = new MultiRoundUsageClient(
+            "do_thing", new Dictionary<string, object?> { ["id"] = "x" },
+            firstRoundInput: 10_000, finalRoundInput: 15_000);
+
+        var opts = MultiRoundOptions();
+        opts.ShowToolCallsInStream = false;
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("multi-round-stream");
+
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Do the thing",
+            TestContext.Current.CancellationToken)) { }
+
+        Assert.Equal(2, client.CallCount);
+        Assert.Equal(15_000, session.LastKnownContextTokens);
+        Assert.NotEqual(25_000, session.LastKnownContextTokens);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_MultiRoundToolLoop_DoesNotTriggerPrematureCompaction()
+    {
+        // Aggregate across rounds (90k) would exceed the 80k threshold, but the
+        // real context after the final round is only 40k — no compaction expected.
+        var client = new MultiRoundUsageClient(
+            "do_thing", new Dictionary<string, object?> { ["id"] = "x" },
+            firstRoundInput: 50_000, finalRoundInput: 40_000);
+
+        var opts = MultiRoundOptions();
+        opts.MaxContextTokens = 100_000;
+        opts.CompactionThreshold = 0.8;
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("no-premature-compaction");
+
+        await agent.ExecuteAsync(session, "Do the thing", TestContext.Current.CancellationToken);
+        Assert.Equal(40_000, session.LastKnownContextTokens);
+
+        var countAfterFirst = session.MessageHistory.Count;
+
+        // A second turn would compact first if LastKnownContextTokens were inflated.
+        await agent.ExecuteAsync(session, "Do it again", TestContext.Current.CancellationToken);
+
+        Assert.Equal(40_000, session.LastKnownContextTokens);
+        Assert.True(session.MessageHistory.Count > countAfterFirst);
+        Assert.DoesNotContain(session.MessageHistory,
+            m => m.Text?.Contains("CONTEXT SUMMARY", StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    [Fact]
+    public async Task ShowToolCallsInStream_RecordsFinalRoundInputTokens()
+    {
+        var client = new MultiRoundUsageClient(
+            "do_thing", new Dictionary<string, object?> { ["id"] = "x" },
+            firstRoundInput: 10_000, finalRoundInput: 15_000);
+
+        var opts = MultiRoundOptions();
+        opts.ShowToolCallsInStream = true;
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("show-tool-calls-usage");
+
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "Do the thing",
+            TestContext.Current.CancellationToken)) { }
+
+        Assert.Equal(2, client.CallCount);
+        Assert.Equal(15_000, session.LastKnownContextTokens);
+    }
 }

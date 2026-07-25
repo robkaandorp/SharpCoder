@@ -52,7 +52,7 @@ public sealed class CodingAgent
         }
 
         var chatOptions = BuildChatOptions();
-        var wrappedClient = BuildWrappedClient();
+        var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
 
         var messages = BuildMessages(session, userMessage);
 
@@ -73,13 +73,14 @@ public sealed class CodingAgent
                     response.Usage.InputTokenCount, response.Usage.OutputTokenCount, response.Usage.TotalTokenCount);
             }
 
-            if (session != null && response.Usage?.InputTokenCount != null)
-                session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
+            if (session != null)
+                session.LastKnownContextTokens = captureClient.LastRoundInputTokens
+                    ?? response.Usage?.InputTokenCount ?? session.LastKnownContextTokens;
 
             // Update session with new messages and usage
             if (session != null)
             {
-                UpdateSession(session, userMessage, response);
+                UpdateSession(session, userMessage, response, captureClient);
             }
 
             if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -139,7 +140,7 @@ public sealed class CodingAgent
         }
 
         var chatOptions = BuildChatOptions();
-        var wrappedClient = BuildWrappedClient();
+        var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
         var messages = BuildMessages(session, userMessage);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
@@ -216,7 +217,7 @@ public sealed class CodingAgent
 
         if (session != null)
         {
-            UpdateSession(session, userMessage, response);
+            UpdateSession(session, userMessage, response, captureClient);
         }
 
         if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -516,15 +517,19 @@ public sealed class CodingAgent
         return chatOptions;
     }
 
-    private IChatClient BuildWrappedClient()
+    private IChatClient BuildWrappedClient() => BuildWrappedClientWithCapture().Wrapped;
+
+    private (IChatClient Wrapped, UsageCapturingChatClient Capture) BuildWrappedClientWithCapture()
     {
-        return new ChatClientBuilder(_client)
+        var capture = new UsageCapturingChatClient(_client);
+        var wrapped = new ChatClientBuilder(capture)
             .UseFunctionInvocation(configure: fic =>
             {
                 fic.MaximumIterationsPerRequest = _options.MaxSteps;
                 fic.IncludeDetailedErrors = true;
             })
             .Build();
+        return (wrapped, capture);
     }
 
     private List<ChatMessage> BuildMessages(AgentSession? session, string userMessage)
@@ -544,7 +549,8 @@ public sealed class CodingAgent
         return messages;
     }
 
-    private void UpdateSession(AgentSession session, string userMessage, ChatResponse response)
+    private void UpdateSession(AgentSession session, string userMessage, ChatResponse response,
+        UsageCapturingChatClient? captureClient = null)
     {
         // Append the user message and all response messages to the existing history.
         // response.Messages contains assistant responses (and tool call/result messages
@@ -566,7 +572,9 @@ public sealed class CodingAgent
             session.OutputTokensUsed += response.Usage.OutputTokenCount ?? 0;
         }
 
-        if (response.Usage?.InputTokenCount != null)
+        if (captureClient?.LastRoundInputTokens != null)
+            session.LastKnownContextTokens = captureClient.LastRoundInputTokens.Value;
+        else if (response.Usage?.InputTokenCount != null)
             session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
 
         _logger.LogDebug(
@@ -780,5 +788,37 @@ public sealed class CodingAgent
         }
 
         return sb.ToString();
+    }
+
+    private sealed class UsageCapturingChatClient : DelegatingChatClient
+    {
+        public long? LastRoundInputTokens { get; private set; }
+
+        public UsageCapturingChatClient(IChatClient inner) : base(inner) { }
+
+        public override async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, CancellationToken ct = default)
+        {
+            var response = await InnerClient.GetResponseAsync(messages, chatOptions, ct);
+            LastRoundInputTokens = response.Usage?.InputTokenCount;
+            return response;
+        }
+
+        public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions,
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            long? captured = null;
+            await foreach (var update in InnerClient.GetStreamingResponseAsync(messages, chatOptions, ct)
+                .WithCancellation(ct))
+            {
+                if (update.Contents.OfType<UsageContent>().FirstOrDefault()?.Details is { } details)
+                {
+                    captured = details.InputTokenCount;
+                }
+                yield return update;
+            }
+            LastRoundInputTokens = captured;
+        }
     }
 }
