@@ -4,11 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.11.1] - 2026-07-25
+## [0.12.1] - 2026-07-28
 
 ### Fixed
 
+- **Tool calls lost from streaming results and session history** — The default `ExecuteStreamingAsync` path (`ShowToolCallsInStream = false`) rebuilt the `ChatResponse` from accumulated text only, discarding `FunctionCallContent`, `FunctionResultContent` and `TextReasoningContent`. Tools were still executed by `FunctionInvokingChatClient`, but `AgentResult.ToolCallCount` and `AgentSession.TotalToolCalls` always reported `0`, `AgentResult.Messages` contained no tool calls, and — most seriously — `session.MessageHistory` was left with only the user message and the final assistant text. Multi-turn sessions therefore had no memory of the tools the agent had invoked or their results. `BuildResponseFromUpdates` now uses `ToChatResponse()` to preserve the full message structure, with the round-separating display text moved to a dedicated `BuildDisplayText` helper so the final message formatting is unchanged. As a side effect, `AgentResult.Usage` now reflects usage aggregated across all tool rounds instead of only the last round. The `ShowToolCallsInStream = true` path was already correct and is unchanged.
 - **Inflated `LastKnownContextTokens` from `FunctionInvokingChatClient` aggregate usage** — `CodingAgent` now uses a `UsageCapturingChatClient` wrapper to capture the final round-trip's `Usage.InputTokenCount` instead of the aggregate sum across all internal tool-call round-trips returned by `FunctionInvokingChatClient`. Previously, `session.LastKnownContextTokens` was set to the sum of all internal round-trip input tokens (e.g., 1.1M recorded vs ~186K actual context with 8 tool calls), causing `ContextCompactor` to trigger premature compaction at low real utilization (e.g., 19%), destroying conversation history that was still well within budget. The fix introduces a per-execution `UsageCapturingChatClient : DelegatingChatClient` that records the most recent round's input token count; `ExecuteAsync`, the default `ExecuteStreamingAsync` path, and `UpdateSession` all prefer this per-round value. The `ShowToolCallsInStream` path was already correct and is unchanged. Cumulative counters (`InputTokensUsed`/`OutputTokensUsed`) continue accumulating aggregate values.
+
+## [0.12.0] - 2026-07-25
+
+### Changed
+
+- Version bump. Includes the `UsageCapturingChatClient` fix and NuGet package updates. Not formally released — superseded by v0.12.1.
 
 ## [0.11.0] - 2026-06-27
 

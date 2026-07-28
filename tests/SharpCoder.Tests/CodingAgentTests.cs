@@ -514,6 +514,53 @@ public class CodingAgentTests
         Assert.DoesNotContain("🔧", allText.ToString());
     }
 
+    [Fact]
+    public async Task DefaultStreaming_WithToolCalls_PreservesToolCallsInSessionAndResult()
+    {
+        // Regression: the default streaming path rebuilt the response from text only,
+        // discarding FunctionCallContent/FunctionResultContent. Tools still executed,
+        // but ToolCallCount reported 0 and the session lost all tool call/result
+        // messages — so the next turn had no memory of what the agent had done.
+        var client = new ToolCallingClient(
+            "get_goal",
+            new Dictionary<string, object?> { ["id"] = "test" },
+            "Here are the details.");
+
+        var opts = ToolCallOptions();
+        opts.ShowToolCallsInStream = false;
+        opts.CustomTools = [AIFunctionFactory.Create(
+            (string id) => $"Goal {id}: Draft", "get_goal")];
+
+        var agent = new CodingAgent(client, opts);
+        var session = AgentSession.Create("default-stream-session");
+        var ct = TestContext.Current.CancellationToken;
+
+        AgentResult? result = null;
+        await foreach (var update in agent.ExecuteStreamingAsync(session, "Show goal", ct))
+        {
+            if (update.Kind == StreamingUpdateKind.Completed)
+                result = update.Result;
+        }
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result!.ToolCallCount);
+        Assert.Equal(1, session.TotalToolCalls);
+
+        var toolCall = session.MessageHistory
+            .SelectMany(m => m.Contents)
+            .OfType<FunctionCallContent>()
+            .Single();
+        Assert.Equal("get_goal", toolCall.Name);
+
+        Assert.Single(session.MessageHistory
+            .SelectMany(m => m.Contents)
+            .OfType<FunctionResultContent>());
+
+        // Text from both rounds is still surfaced in the final message.
+        Assert.Contains("I'll create that for you.", result.Message);
+        Assert.Contains("Here are the details.", result.Message);
+    }
+
     // ── FormatToolCallArgs / TruncateFirstLine unit tests ──
 
     [Fact]

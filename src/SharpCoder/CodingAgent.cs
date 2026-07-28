@@ -206,7 +206,8 @@ public sealed class CodingAgent
         // Build a ChatResponse from the accumulated stream updates for session tracking
         var response = BuildResponseFromUpdates(updates);
         var toolCalls = AgentResult.CountToolCalls(response.Messages);
-        var finalText = response.Text ?? "No text response.";
+        var finalText = BuildDisplayText(updates);
+        if (string.IsNullOrEmpty(finalText)) finalText = "No text response.";
 
         if (response.Usage != null)
         {
@@ -672,21 +673,30 @@ public sealed class CodingAgent
         };
     }
 
+    /// <summary>
+    /// Aggregates streaming updates into a <see cref="ChatResponse"/>, preserving the
+    /// full message structure — assistant text, reasoning content, tool calls and tool
+    /// results produced by the function invocation loop. This is what gets appended to
+    /// the session history, so dropping any of it would erase the agent's memory of the
+    /// tools it invoked (and zero out <see cref="AgentResult.ToolCallCount"/>).
+    /// </summary>
     private static ChatResponse BuildResponseFromUpdates(List<ChatResponseUpdate> updates)
+        => updates.ToChatResponse();
+
+    /// <summary>
+    /// Builds the human-readable text for the final result from the raw stream updates.
+    /// Rounds are separated by a blank line: when <see cref="FunctionInvokingChatClient"/>
+    /// handles tool calls, each round ends with a FinishReason, so text arriving after one
+    /// belongs to a new round and must not be glued onto the previous round's text.
+    /// </summary>
+    private static string BuildDisplayText(List<ChatResponseUpdate> updates)
     {
         var textBuilder = new StringBuilder();
-        ChatFinishReason? finishReason = null;
-        string? modelId = null;
-        UsageDetails? usage = null;
         bool hasText = false;
         bool needsSeparator = false;
 
         foreach (var update in updates)
         {
-            // Detect new round boundary. When FunctionInvokingChatClient
-            // handles tool calls, the previous round ends with a FinishReason.
-            // If text follows after that, it's a new round — insert a paragraph
-            // break so rounds don't merge into a single wall of text.
             if (update.FinishReason is not null && hasText)
             {
                 needsSeparator = true;
@@ -702,29 +712,9 @@ public sealed class CodingAgent
                 textBuilder.Append(update.Text);
                 hasText = true;
             }
-
-            // Keep last FinishReason (the final round's reason)
-            if (update.FinishReason != null)
-                finishReason = update.FinishReason;
-
-            if (update.ModelId != null)
-                modelId = update.ModelId;
-
-            // Usage details may appear as UsageContent in the final update
-            foreach (var content in update.Contents)
-            {
-                if (content is UsageContent uc)
-                    usage = uc.Details;
-            }
         }
 
-        var message = new ChatMessage(ChatRole.Assistant, textBuilder.ToString());
-        return new ChatResponse(message)
-        {
-            FinishReason = finishReason,
-            ModelId = modelId,
-            Usage = usage,
-        };
+        return textBuilder.ToString();
     }
 
     private string GetWorkspaceInstructions()
