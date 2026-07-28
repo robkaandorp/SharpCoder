@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.12.0] - Unreleased
+
+### Fixed
+
+- **Tool calls lost from streaming results and session history** — The default `ExecuteStreamingAsync` path (`ShowToolCallsInStream = false`) rebuilt the `ChatResponse` from accumulated text only, discarding `FunctionCallContent`, `FunctionResultContent` and `TextReasoningContent`. Tools were still executed by `FunctionInvokingChatClient`, but `AgentResult.ToolCallCount` and `AgentSession.TotalToolCalls` always reported `0`, `AgentResult.Messages` contained no tool calls, and — most seriously — `session.MessageHistory` was left with only the user message and the final assistant text. Multi-turn sessions therefore had no memory of the tools the agent had invoked or their results. `BuildResponseFromUpdates` now uses `ToChatResponse()` to preserve the full message structure, with the round-separating display text moved to a dedicated `BuildDisplayText` helper so the final message formatting is unchanged. As a side effect, `AgentResult.Usage` now reflects usage aggregated across all tool rounds instead of only the last round. The `ShowToolCallsInStream = true` path was already correct and is unchanged.
+
 ## [0.11.1] - 2026-07-25
 
 ### Fixed
