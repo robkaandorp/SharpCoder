@@ -154,6 +154,8 @@ public sealed class AgentOptions
     /// object have no effect on an already-established manager.
     /// Mutating this property concurrently with running executions is not supported
     /// (safe windows: before the first execution, or between executions).
+    /// Hosts shut down sub-agents exclusively through <see cref="CodingAgent.DisposeAsync"/>;
+    /// never dispose the manager obtained from <see cref="CodingAgent.ActiveSubAgentManager"/> directly.
     /// </summary>
     public SubAgentOptions? SubAgents { get; set; }
 }

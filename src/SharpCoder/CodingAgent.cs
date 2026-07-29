@@ -14,8 +14,10 @@ using SharpCoder.Tools;
 
 namespace SharpCoder;
 
-public sealed class CodingAgent
+public sealed class CodingAgent : IAsyncDisposable
 {
+    private int _disposed;
+
     private readonly IChatClient _client;
     private readonly AgentOptions _options;
     private readonly ILogger _logger;
@@ -61,6 +63,7 @@ public sealed class CodingAgent
         lock (_subAgentLock)
         {
             if (IsSubAgentManagerCreated) return _subAgentManager;
+            if (Volatile.Read(ref _disposed) != 0) return null;
             var source = _options.SubAgents;
             if (source is null) return null;
 
@@ -88,6 +91,34 @@ public sealed class CodingAgent
         }
     }
 
+    /// <summary>
+    /// The shared sub-agent manager, when one has been created; otherwise null.
+    /// Read-only, for host inspection only — hosts must shut down sub-agents via
+    /// <see cref="DisposeAsync"/>, never by disposing this manager directly.
+    /// Once created, the manager remains exposed here for the agent's lifetime,
+    /// regardless of later mutations to AgentOptions.SubAgents (configuration is
+    /// snapshotted at first creation).
+    /// </summary>
+    public SubAgentManager? ActiveSubAgentManager => IsSubAgentManagerCreated ? _subAgentManager : null;
+
+    /// <summary>
+    /// Shuts down the agent, cancelling and awaiting any running sub-agents. Idempotent.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        SubAgentManager? managerToDispose = null;
+        lock (_subAgentLock)
+        {
+            if (IsSubAgentManagerCreated)
+                managerToDispose = _subAgentManager;
+        }
+
+        if (managerToDispose is not null)
+            await managerToDispose.DisposeAsync().ConfigureAwait(false);
+    }
+
     public CodingAgent(IChatClient client, AgentOptions options)
     {
         _client = client;
@@ -105,6 +136,8 @@ public sealed class CodingAgent
     /// </summary>
     public Task<AgentResult> ExecuteAsync(string taskDescription, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         return ExecuteAsync(null, taskDescription, ct);
     }
 
@@ -114,6 +147,8 @@ public sealed class CodingAgent
     /// </summary>
     public async Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         _logger.LogInformation("Starting coding agent task in {Dir}", _options.WorkDirectory);
 
         // Auto-compact before building messages if session is large
@@ -123,6 +158,8 @@ public sealed class CodingAgent
         }
 
         var chatOptions = BuildChatOptions(ct);
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
 
         var messages = BuildMessages(session, userMessage);
@@ -194,6 +231,8 @@ public sealed class CodingAgent
         string userMessage,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         _logger.LogInformation("Starting streaming coding agent task in {Dir}", _options.WorkDirectory);
 
         if (session != null)
@@ -211,6 +250,8 @@ public sealed class CodingAgent
         }
 
         var chatOptions = BuildChatOptions(ct);
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
         var messages = BuildMessages(session, userMessage);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
@@ -318,6 +359,8 @@ public sealed class CodingAgent
         [EnumeratorCancellation] CancellationToken ct)
     {
         var chatOptions = BuildChatOptions(ct);
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
         var messages = BuildMessages(session, userMessage);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
@@ -597,6 +640,8 @@ public sealed class CodingAgent
         if (SubAgentsEffectivelyEnabled)
         {
             var manager = GetOrCreateSubAgentManager();
+            if (manager is null && Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException(nameof(CodingAgent));
             if (manager != null && _subAgentSnapshot != null)
             {
                 foreach (var tool in SubAgentTools.BuildTools(manager, _subAgentSnapshot, ct))

@@ -99,6 +99,12 @@ public sealed class SubAgentManager : IAsyncDisposable
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private int _counter;
     private int _disposed;
+
+    /// <summary>
+    /// Test seam: whether this manager has been disposed.
+    /// Tests use this to verify that CodingAgent.DisposeAsync disposed the manager.
+    /// </summary>
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
     private int _pendingStarts;
 
     // Capability ceiling: snapshotted from the parent options at construction time.
