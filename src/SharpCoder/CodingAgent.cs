@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
+using SharpCoder.SubAgents;
 using SharpCoder.Tools;
 
 namespace SharpCoder;
@@ -19,6 +20,73 @@ public sealed class CodingAgent
     private readonly AgentOptions _options;
     private readonly ILogger _logger;
     private readonly ContextCompactor _compactor;
+    private SubAgentManager? _subAgentManager;
+    private SubAgentOptions? _subAgentSnapshot;
+    private readonly object _subAgentLock = new();
+    private int _subAgentManagerCreateCount;
+
+    /// <summary>Test seam: how many times a sub-agent manager was created for this instance.</summary>
+    internal int SubAgentManagerCreateCount => Volatile.Read(ref _subAgentManagerCreateCount);
+
+    private bool IsSubAgentManagerCreated => Volatile.Read(ref _subAgentManagerCreateCount) > 0;
+
+    private bool SubAgentsEffectivelyEnabled => _options.SubAgents != null || IsSubAgentManagerCreated;
+
+    /// <summary>Tool names reserved by the sub-agent tool namespace.</summary>
+    private static readonly HashSet<string> ReservedSubAgentToolNames =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "start_sub_agent", "await_sub_agents", "get_sub_agent_status", "list_sub_agent_models"
+        };
+
+    private static void ThrowOnReservedToolNames(IEnumerable<AITool> tools)
+    {
+        foreach (var tool in tools)
+        {
+            // Check AITool.Name on EVERY tool, not just invokable AIFunction instances:
+            // non-invokable subtypes (e.g. AIFunctionDeclaration) also carry a Name.
+            if (tool != null && ReservedSubAgentToolNames.Contains(tool.Name))
+                throw new ArgumentException(
+                    $"CustomTools contains a reserved name '{tool.Name}' that conflicts with the sub-agent tool namespace. Remove it or rename it.");
+        }
+    }
+
+    /// <summary>
+    /// Returns the shared sub-agent manager, creating it once (thread-safe) from a defensive
+    /// snapshot of <see cref="AgentOptions.SubAgents"/>.
+    /// </summary>
+    private SubAgentManager? GetOrCreateSubAgentManager()
+    {
+        if (IsSubAgentManagerCreated) return _subAgentManager;
+        lock (_subAgentLock)
+        {
+            if (IsSubAgentManagerCreated) return _subAgentManager;
+            var source = _options.SubAgents;
+            if (source is null) return null;
+
+            var snapshot = new SubAgentOptions
+            {
+                MaxConcurrentSubAgents = source.MaxConcurrentSubAgents,
+                DefaultTimeout = source.DefaultTimeout,
+                MaxTimeout = source.MaxTimeout,
+                MaxSummaryChars = source.MaxSummaryChars,
+                ClientFactory = source.ClientFactory,
+                DefaultClient = source.DefaultClient,
+                DefaultEnableBash = source.DefaultEnableBash,
+                DefaultEnableFileOps = source.DefaultEnableFileOps,
+                DefaultEnableFileWrites = source.DefaultEnableFileWrites,
+                DefaultEnableSkills = source.DefaultEnableSkills,
+                MaxSteps = source.MaxSteps
+            };
+            foreach (var model in source.AvailableModels)
+                snapshot.AvailableModels.Add(model);
+
+            _subAgentSnapshot = snapshot;
+            _subAgentManager = new SubAgentManager(snapshot, _client, _options, _logger);
+            Interlocked.Increment(ref _subAgentManagerCreateCount);
+            return _subAgentManager;
+        }
+    }
 
     public CodingAgent(IChatClient client, AgentOptions options)
     {
@@ -26,6 +94,9 @@ public sealed class CodingAgent
         _options = options;
         _logger = options.Logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         _compactor = new ContextCompactor(options.CompactionClient ?? client, _logger);
+
+        if (SubAgentsEffectivelyEnabled)
+            ThrowOnReservedToolNames(options.CustomTools);
     }
 
     /// <summary>
@@ -51,7 +122,7 @@ public sealed class CodingAgent
             await _compactor.CompactIfNeededAsync(session, _options, ct);
         }
 
-        var chatOptions = BuildChatOptions();
+        var chatOptions = BuildChatOptions(ct);
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
 
         var messages = BuildMessages(session, userMessage);
@@ -139,7 +210,7 @@ public sealed class CodingAgent
             yield break;
         }
 
-        var chatOptions = BuildChatOptions();
+        var chatOptions = BuildChatOptions(ct);
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
         var messages = BuildMessages(session, userMessage);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
@@ -246,7 +317,7 @@ public sealed class CodingAgent
         string userMessage,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        var chatOptions = BuildChatOptions();
+        var chatOptions = BuildChatOptions(ct);
         var messages = BuildMessages(session, userMessage);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
@@ -361,6 +432,10 @@ public sealed class CodingAgent
                         result = await tool.InvokeAsync(
                             new AIFunctionArguments(fc.Arguments ?? new Dictionary<string, object?>()), ct);
                     }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Tool {ToolName} failed", fc.Name);
@@ -470,13 +545,17 @@ public sealed class CodingAgent
         return line;
     }
 
-    private ChatOptions BuildChatOptions()
+    private ChatOptions BuildChatOptions(CancellationToken ct)
     {
         var chatOptions = new ChatOptions
         {
             Tools = new List<AITool>(_options.CustomTools),
             ToolMode = ChatToolMode.Auto
         };
+
+        // Catches post-construction mutation of CustomTools too.
+        if (SubAgentsEffectivelyEnabled)
+            ThrowOnReservedToolNames(chatOptions.Tools);
 
         if (_options.ReasoningEffort.HasValue)
         {
@@ -513,6 +592,16 @@ public sealed class CodingAgent
             var skillTools = new SkillTools(_options.WorkDirectory);
             chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.load_skill));
             chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.list_skills));
+        }
+
+        if (SubAgentsEffectivelyEnabled)
+        {
+            var manager = GetOrCreateSubAgentManager();
+            if (manager != null && _subAgentSnapshot != null)
+            {
+                foreach (var tool in SubAgentTools.BuildTools(manager, _subAgentSnapshot, ct))
+                    chatOptions.Tools.Add(tool);
+            }
         }
 
         return chatOptions;
@@ -640,6 +729,12 @@ public sealed class CodingAgent
                 sb.AppendLine(skillSummary);
                 sb.AppendLine("IMPORTANT: Before building or testing, load the relevant skill first with load_skill.");
             }
+        }
+
+        if (SubAgentsEffectivelyEnabled)
+        {
+            sb.AppendLine();
+            sb.AppendLine("You can delegate self-contained subtasks (codebase analysis, large text summarization, parallel research) to background sub-sessions using start_sub_agent. Their full output never enters this conversation — only a summary returns when you call await_sub_agents. Sub-sessions run read-only by default and cannot exceed your own tool capabilities.");
         }
 
         return sb.ToString();

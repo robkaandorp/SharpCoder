@@ -101,6 +101,12 @@ public sealed class SubAgentManager : IAsyncDisposable
     private int _disposed;
     private int _pendingStarts;
 
+    // Capability ceiling: snapshotted from the parent options at construction time.
+    private readonly bool _parentEnableBashSnapshot;
+    private readonly bool _parentEnableFileOpsSnapshot;
+    private readonly bool _parentEnableFileWritesSnapshot;
+    private readonly bool _parentEnableSkillsSnapshot;
+
     /// <summary>
     /// Test seam: invoked with the freshly built <see cref="AgentOptions"/> for each sub-agent,
     /// immediately before the sub-agent's <see cref="CodingAgent"/> is constructed.
@@ -127,6 +133,11 @@ public sealed class SubAgentManager : IAsyncDisposable
         _defaultClient = defaultClient ?? throw new ArgumentNullException(nameof(defaultClient));
         _parentOptions = parentOptions ?? throw new ArgumentNullException(nameof(parentOptions));
         _logger = logger ?? parentOptions.Logger ?? NullLogger.Instance;
+
+        _parentEnableBashSnapshot = parentOptions.EnableBash;
+        _parentEnableFileOpsSnapshot = parentOptions.EnableFileOps;
+        _parentEnableFileWritesSnapshot = parentOptions.EnableFileWrites;
+        _parentEnableSkillsSnapshot = parentOptions.EnableSkills;
 
         if (options.MaxConcurrentSubAgents < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxConcurrentSubAgents must be at least 1.");
@@ -207,10 +218,10 @@ public sealed class SubAgentManager : IAsyncDisposable
             Task = taskText,
             Timeout = timeout,
             SystemPrompt = request.SystemPrompt,
-            EnableBash = request.EnableBash ?? _options.DefaultEnableBash,
-            EnableFileOps = request.EnableFileOps ?? _options.DefaultEnableFileOps,
-            EnableFileWrites = request.EnableFileWrites ?? _options.DefaultEnableFileWrites,
-            EnableSkills = request.EnableSkills ?? _options.DefaultEnableSkills,
+            EnableBash = (request.EnableBash ?? _options.DefaultEnableBash) && _parentEnableBashSnapshot,
+            EnableFileOps = (request.EnableFileOps ?? _options.DefaultEnableFileOps) && _parentEnableFileOpsSnapshot,
+            EnableFileWrites = (request.EnableFileWrites ?? _options.DefaultEnableFileWrites) && _parentEnableFileWritesSnapshot,
+            EnableSkills = (request.EnableSkills ?? _options.DefaultEnableSkills) && _parentEnableSkillsSnapshot,
             Model = modelId,
             Client = client,
             MaxSteps = _options.MaxSteps,

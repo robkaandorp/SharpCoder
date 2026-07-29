@@ -4,6 +4,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.IO;
+using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
@@ -139,4 +140,20 @@ public sealed class AgentOptions
     /// summarized in chunks that each fit within this limit.
     /// </summary>
     public int? CompactionMaxTokens { get; set; }
+
+    /// <summary>
+    /// Optional sub-agent configuration. When set, the agent gains start_sub_agent,
+    /// await_sub_agents, get_sub_agent_status, and list_sub_agent_models tools that
+    /// spawn background sub-sessions and return only their summaries.
+    /// Sub-agents can never receive capabilities that are disabled on this parent
+    /// options instance (bash, file ops, file writes, skills) — LLM-supplied
+    /// overrides are clamped by the parent's enabled capabilities, snapshotted at
+    /// manager creation.
+    /// The configuration is defensively snapshotted the first time a sub-agent
+    /// manager is created; later mutations of this property or the SubAgentOptions
+    /// object have no effect on an already-established manager.
+    /// Mutating this property concurrently with running executions is not supported
+    /// (safe windows: before the first execution, or between executions).
+    /// </summary>
+    public SubAgentOptions? SubAgents { get; set; }
 }

@@ -207,6 +207,9 @@ public class SubAgentManagerTests
     private static AgentOptions ParentOptions() => new()
     {
         WorkDirectory = Path.GetTempPath(),
+        // The parent capability ceiling clamps sub-agent capabilities, so the
+        // default test parent is fully capable unless a test says otherwise.
+        EnableBash = true,
     };
 
     private static SubAgentOptions DefaultOptions() => new();
@@ -1547,5 +1550,117 @@ public class SubAgentManagerTests
         Assert.Single(all);
         Assert.Equal(first.Id, all[0].Id);
         Assert.All(all, e => Assert.NotEqual(SubAgentStatus.Running, e.Status));
+    }
+
+    // ========================================================================
+    // 21. Parent capability ceiling (clamp)
+    // ========================================================================
+
+    private static async Task<AgentOptions> CaptureSubAgentOptionsAsync(
+        AgentOptions parent, SubAgentOptions options, SubAgentRequest request)
+    {
+        var manager = new SubAgentManager(options, new CapturingClient(), parent, logger: null);
+        await using var _ = manager;
+
+        AgentOptions? captured = null;
+        manager.OnSubAgentOptionsCreated = o => captured = o;
+        var info = await manager.StartAsync(request, TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        return captured!;
+    }
+
+    [Fact]
+    public async Task Ceiling_Clamps_Bash_When_Parent_Disables_It()
+    {
+        var parent = ParentOptions();
+        parent.EnableBash = false;
+        var options = DefaultOptions();
+        options.DefaultEnableBash = true;
+
+        var captured = await CaptureSubAgentOptionsAsync(
+            parent, options, new SubAgentRequest { Task = "work", EnableBash = true });
+
+        Assert.False(captured.EnableBash);
+    }
+
+    [Fact]
+    public async Task Ceiling_Clamps_FileWrites_When_Parent_Disables_It()
+    {
+        var parent = ParentOptions();
+        parent.EnableFileWrites = false;
+        var options = DefaultOptions();
+        options.DefaultEnableFileWrites = true;
+
+        var captured = await CaptureSubAgentOptionsAsync(
+            parent, options, new SubAgentRequest { Task = "work", EnableFileWrites = true });
+
+        Assert.False(captured.EnableFileWrites);
+    }
+
+    [Fact]
+    public async Task Ceiling_Clamps_FileOps_When_Parent_Disables_It()
+    {
+        var parent = ParentOptions();
+        parent.EnableFileOps = false;
+        var options = DefaultOptions();
+        options.DefaultEnableFileOps = true;
+
+        var captured = await CaptureSubAgentOptionsAsync(
+            parent, options, new SubAgentRequest { Task = "work", EnableFileOps = true });
+
+        Assert.False(captured.EnableFileOps);
+    }
+
+    [Fact]
+    public async Task Ceiling_Clamps_Skills_When_Parent_Disables_It()
+    {
+        var parent = ParentOptions();
+        parent.EnableSkills = false;
+        var options = DefaultOptions();
+        options.DefaultEnableSkills = true;
+
+        var captured = await CaptureSubAgentOptionsAsync(
+            parent, options, new SubAgentRequest { Task = "work", EnableSkills = true });
+
+        Assert.False(captured.EnableSkills);
+    }
+
+    [Fact]
+    public async Task Ceiling_Uses_Creation_Time_Snapshot_Not_Later_Mutation()
+    {
+        var parent = ParentOptions();
+        parent.EnableBash = true;
+
+        var manager = new SubAgentManager(DefaultOptions(), new CapturingClient(), parent, logger: null);
+        await using var _ = manager;
+
+        // Mutating the parent after construction must not affect the ceiling.
+        parent.EnableBash = false;
+
+        AgentOptions? captured = null;
+        manager.OnSubAgentOptionsCreated = o => captured = o;
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", EnableBash = true },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        Assert.True(captured!.EnableBash);
+    }
+
+    [Fact]
+    public async Task Ceiling_Allows_Capability_When_Parent_Enabled_And_Request_Overrides()
+    {
+        var parent = ParentOptions();
+        parent.EnableBash = true;
+        var options = DefaultOptions();
+        options.DefaultEnableBash = false;
+
+        var captured = await CaptureSubAgentOptionsAsync(
+            parent, options, new SubAgentRequest { Task = "work", EnableBash = true });
+
+        Assert.True(captured.EnableBash);
     }
 }
