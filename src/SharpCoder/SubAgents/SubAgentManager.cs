@@ -34,6 +34,9 @@ public sealed class SubAgentManager : IAsyncDisposable
         public bool EnableSkills;
         public string? Model;
         public IChatClient Client = null!;
+
+        /// <summary>Client created by the manager's ClientFactory and owned by the manager, if any.</summary>
+        public IChatClient? OwnedClientForDisposal;
         public int MaxSteps;
         public int MaxSummaryChars;
 
@@ -126,6 +129,12 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// </summary>
     internal Action? OnSubAgentRunStarting { get; set; }
 
+    /// <summary>
+    /// Test seam: invoked after a concurrency slot has been acquired but before the entry is
+    /// tracked and the runner scheduled. Used to exercise post-slot startup rollback.
+    /// </summary>
+    internal Action? OnSlotAcquiredBeforeStart { get; set; }
+
     /// <summary>The logger resolved by the constructor (explicit logger, else parent options logger).</summary>
     internal ILogger ResolvedLogger => _logger;
 
@@ -188,6 +197,7 @@ public sealed class SubAgentManager : IAsyncDisposable
         var taskText = request.Task;
 
         IChatClient client;
+        IChatClient? ownedClient = null;
         string? modelId = null;
         var requestedModel = request.Model;
         if (string.IsNullOrWhiteSpace(requestedModel))
@@ -206,75 +216,135 @@ public sealed class SubAgentManager : IAsyncDisposable
             if (_options.ClientFactory is null)
                 return ValidationFailure($"ClientFactory is required to resolve model '{model.Id}'");
             modelId = model.Id;
+            // A throwing factory is a pre-slot failure: nothing was created, nothing to clean up.
             client = _options.ClientFactory(model.Id);
+            ownedClient = client;
         }
 
-        var timeout = _options.DefaultTimeout;
-        var requestedTimeout = request.Timeout;
-        if (requestedTimeout.HasValue)
-        {
-            if (requestedTimeout.Value <= TimeSpan.Zero)
-                return ValidationFailure("Timeout must be positive.");
-            timeout = requestedTimeout.Value > _options.MaxTimeout ? _options.MaxTimeout : requestedTimeout.Value;
-        }
-
-        // Fully immutable snapshot of everything the run needs.
-        var spec = new RunSpec
-        {
-            Task = taskText,
-            Timeout = timeout,
-            SystemPrompt = request.SystemPrompt,
-            EnableBash = (request.EnableBash ?? _options.DefaultEnableBash) && _parentEnableBashSnapshot,
-            EnableFileOps = (request.EnableFileOps ?? _options.DefaultEnableFileOps) && _parentEnableFileOpsSnapshot,
-            EnableFileWrites = (request.EnableFileWrites ?? _options.DefaultEnableFileWrites) && _parentEnableFileWritesSnapshot,
-            EnableSkills = (request.EnableSkills ?? _options.DefaultEnableSkills) && _parentEnableSkillsSnapshot,
-            Model = modelId,
-            Client = client,
-            MaxSteps = _options.MaxSteps,
-            MaxSummaryChars = _options.MaxSummaryChars,
-            WorkDirectory = _parentOptions.WorkDirectory,
-            MaxContextTokens = _parentOptions.MaxContextTokens,
-            CompactionClient = _parentOptions.CompactionClient,
-            CompactionMaxTokens = _parentOptions.CompactionMaxTokens,
-            ReasoningEffort = _parentOptions.ReasoningEffort
-        };
-
-        Interlocked.Increment(ref _pendingStarts);
         try
         {
-            if (Volatile.Read(ref _disposed) != 0)
-                throw new ObjectDisposedException(nameof(SubAgentManager));
-
-            await _slots.WaitAsync(ct).ConfigureAwait(false);
-
-            if (Volatile.Read(ref _disposed) != 0)
+            var timeout = _options.DefaultTimeout;
+            var requestedTimeout = request.Timeout;
+            if (requestedTimeout.HasValue)
             {
-                _slots.Release();
-                throw new ObjectDisposedException(nameof(SubAgentManager));
+                if (requestedTimeout.Value <= TimeSpan.Zero)
+                    return ValidationFailure("Timeout must be positive.");
+                timeout = requestedTimeout.Value > _options.MaxTimeout ? _options.MaxTimeout : requestedTimeout.Value;
             }
 
-            var id = "sub-" + Interlocked.Increment(ref _counter).ToString(System.Globalization.CultureInfo.InvariantCulture);
-            var entry = new Entry
+            // Fully immutable snapshot of everything the run needs.
+            var spec = new RunSpec
             {
-                Id = id,
-                Task = SubAgentInfo.Truncate(spec.Task, 200),
+                Task = taskText,
+                Timeout = timeout,
+                SystemPrompt = request.SystemPrompt,
+                EnableBash = (request.EnableBash ?? _options.DefaultEnableBash) && _parentEnableBashSnapshot,
+                EnableFileOps = (request.EnableFileOps ?? _options.DefaultEnableFileOps) && _parentEnableFileOpsSnapshot,
+                EnableFileWrites = (request.EnableFileWrites ?? _options.DefaultEnableFileWrites) && _parentEnableFileWritesSnapshot,
+                EnableSkills = (request.EnableSkills ?? _options.DefaultEnableSkills) && _parentEnableSkillsSnapshot,
                 Model = modelId,
-                StartedAt = DateTimeOffset.UtcNow,
-                Status = (int)SubAgentStatus.Running,
-                TimeoutCts = new CancellationTokenSource(),
-                CancelCts = new CancellationTokenSource()
+                Client = client,
+                OwnedClientForDisposal = ownedClient,
+                MaxSteps = _options.MaxSteps,
+                MaxSummaryChars = _options.MaxSummaryChars,
+                WorkDirectory = _parentOptions.WorkDirectory,
+                MaxContextTokens = _parentOptions.MaxContextTokens,
+                CompactionClient = _parentOptions.CompactionClient,
+                CompactionMaxTokens = _parentOptions.CompactionMaxTokens,
+                ReasoningEffort = _parentOptions.ReasoningEffort
             };
-            _entries[id] = entry;
 
-            // Capture the Running snapshot BEFORE the background task can transition it.
-            var initial = entry.Snapshot();
+            Interlocked.Increment(ref _pendingStarts);
+            try
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                    throw new ObjectDisposedException(nameof(SubAgentManager));
 
-            entry.Runner = Task.Run(() => RunAsync(entry, spec));
-            return initial;
+                await _slots.WaitAsync(ct).ConfigureAwait(false);
+
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    _slots.Release();
+                    throw new ObjectDisposedException(nameof(SubAgentManager));
+                }
+
+                // Post-slot startup transaction: on any failure release the slot, dispose any
+                // created CTSs and leave no orphaned entry behind.
+                CancellationTokenSource? timeoutCts = null;
+                CancellationTokenSource? cancelCts = null;
+                Entry? entry = null;
+                try
+                {
+                    timeoutCts = new CancellationTokenSource();
+                    cancelCts = new CancellationTokenSource();
+
+                    OnSlotAcquiredBeforeStart?.Invoke();
+
+                    var id = "sub-" + Interlocked.Increment(ref _counter).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    entry = new Entry
+                    {
+                        Id = id,
+                        Task = SubAgentInfo.Truncate(spec.Task, 200),
+                        Model = modelId,
+                        StartedAt = DateTimeOffset.UtcNow,
+                        Status = (int)SubAgentStatus.Running
+                    };
+                    entry.TimeoutCts = timeoutCts;
+                    entry.CancelCts = cancelCts;
+                    _entries[id] = entry;
+
+                    // Capture the Running snapshot BEFORE the background task can transition it.
+                    var initial = entry.Snapshot();
+
+                    var capturedEntry = entry;
+                    entry.Runner = Task.Run(() => RunAsync(capturedEntry, spec));
+
+                    // Ownership handed to the runner.
+                    timeoutCts = null;
+                    cancelCts = null;
+                    ownedClient = null;
+                    return initial;
+                }
+                catch
+                {
+                    try { timeoutCts?.Dispose(); } catch (ObjectDisposedException) { }
+                    try { cancelCts?.Dispose(); } catch (ObjectDisposedException) { }
+                    if (entry != null)
+                        _entries.TryRemove(entry.Id, out _);
+                    try { _slots.Release(); } catch (ObjectDisposedException) { } catch (SemaphoreFullException) { }
+                    throw;
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _pendingStarts);
+            }
         }
         finally
         {
-            Interlocked.Decrement(ref _pendingStarts);
+            if (ownedClient != null)
+                await DisposeOwnedClientAsync(ownedClient).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Disposes a manager-owned client, never throwing and never blocking synchronously.</summary>
+    private async ValueTask DisposeOwnedClientAsync(IChatClient? client)
+    {
+        if (client is null) return;
+        try
+        {
+            if (client is IAsyncDisposable asyncDisposable)
+            {
+                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+            }
+            else if (client is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to dispose sub-agent client");
         }
     }
 
@@ -298,6 +368,10 @@ public sealed class SubAgentManager : IAsyncDisposable
         var timeoutCts = entry.TimeoutCts!;
         var cancelCts = entry.CancelCts!;
         CancellationTokenSource? linked = null;
+        var status = SubAgentStatus.Failed;
+        string? summary = null;
+        string? error = null;
+        UsageDetails? usage = null;
         try
         {
             // Test seam: lets a test suspend the runner before it reads anything.
@@ -334,13 +408,17 @@ public sealed class SubAgentManager : IAsyncDisposable
 
             if (!string.Equals(result.Status, "Success", StringComparison.Ordinal))
             {
-                Complete(entry, SubAgentStatus.Failed, null, result.Message, result.Usage);
+                status = SubAgentStatus.Failed;
+                summary = null;
+                error = result.Message;
+                usage = result.Usage;
             }
             else
             {
-                Complete(entry, SubAgentStatus.Completed,
-                    SubAgentInfo.Truncate(result.Message ?? string.Empty, spec.MaxSummaryChars),
-                    null, result.Usage);
+                status = SubAgentStatus.Completed;
+                summary = SubAgentInfo.Truncate(result.Message ?? string.Empty, spec.MaxSummaryChars);
+                error = null;
+                usage = result.Usage;
             }
         }
         catch (OperationCanceledException)
@@ -349,19 +427,33 @@ public sealed class SubAgentManager : IAsyncDisposable
             // only if the timeout source is the one that is cancelled; otherwise it is a
             // manager-initiated cancellation.
             if (timeoutCts.IsCancellationRequested)
-                Complete(entry, SubAgentStatus.TimedOut, null, "Sub-agent timed out.", null);
-            else if (cancelCts.IsCancellationRequested)
-                Complete(entry, SubAgentStatus.Cancelled, null, "Sub-agent was cancelled.", null);
+            {
+                status = SubAgentStatus.TimedOut;
+                error = "Sub-agent timed out.";
+            }
             else
-                Complete(entry, SubAgentStatus.Cancelled, null, "Sub-agent was cancelled.", null);
+            {
+                status = SubAgentStatus.Cancelled;
+                error = "Sub-agent was cancelled.";
+            }
+            summary = null;
+            usage = null;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Sub-agent {Id} failed", entry.Id);
-            Complete(entry, SubAgentStatus.Failed, null, ex.Message, null);
+            status = SubAgentStatus.Failed;
+            summary = null;
+            error = ex.Message;
+            usage = null;
         }
         finally
         {
+            // Dispose the owned client BEFORE signalling completion so awaiters can rely on
+            // "await returned ⇒ owned client already disposed".
+            await DisposeOwnedClientAsync(spec.OwnedClientForDisposal).ConfigureAwait(false);
+            Complete(entry, status, summary, error, usage);
+
             try { linked?.Dispose(); } catch (ObjectDisposedException) { }
             try { timeoutCts.Dispose(); } catch (ObjectDisposedException) { }
             try { cancelCts.Dispose(); } catch (ObjectDisposedException) { }

@@ -23,6 +23,13 @@ public sealed class SubAgentOptions
     public IList<SubAgentModelInfo> AvailableModels { get; } = new List<SubAgentModelInfo>();
 
     /// <summary>Maps a model ID to an <see cref="IChatClient"/>.</summary>
+    /// <remarks>
+    /// Clients returned by this factory are OWNED by the SubAgentManager and disposed
+    /// after the sub-agent's run completes (before awaiters are signalled), or immediately
+    /// if the run never starts. Do not share a returned client across factory calls or
+    /// reuse it elsewhere. The manager does NOT dispose <see cref="DefaultClient"/> or
+    /// the parent agent's client.
+    /// </remarks>
     public Func<string, IChatClient>? ClientFactory { get; set; }
 
     /// <summary>Fallback client when no model is specified. When null the parent agent's client is used.</summary>

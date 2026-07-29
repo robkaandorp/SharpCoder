@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.13.1]
+
+### Fixed
+
+- **Sub-agent client leak** — `SubAgentManager` now owns and disposes `IChatClient` instances created via `SubAgentOptions.ClientFactory`, exactly once, on all code paths: after a run completes (disposal is ordered before awaiters are signalled via `Complete()`), and on every pre-run exit (validation failure, cancelled slot wait, manager disposal during slot wait, post-slot startup failure). Previously these factory-created clients were never disposed, leaking one `IChatClient` per model-selected sub-agent.
+- Caller-owned clients (`DefaultClient`, or the parent agent's client when no model is specified) are NOT disposed by the manager.
+- `SubAgentOptions.ClientFactory` XML doc now documents the ownership contract: clients returned by the factory are owned by `SubAgentManager` and disposed after the run; they should not be shared or reused.
+
 ## [0.13.0]
 
 ### Added
