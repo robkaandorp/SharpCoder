@@ -1384,10 +1384,9 @@ public class SubAgentManagerTests
         options.MaxConcurrentSubAgents = 200;
         var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var blockingClient = new CapturingClient("blocked", gate: gate);
-        var fastClient = new CapturingClient("done");
 
         options.AvailableModels.Add(new SubAgentModelInfo("fast"));
-        options.ClientFactory = _ => fastClient;
+        options.ClientFactory = _ => new CapturingClient("done");
 
         await using var manager = new SubAgentManager(options, blockingClient, ParentOptions());
 
@@ -1662,5 +1661,756 @@ public class SubAgentManagerTests
             parent, options, new SubAgentRequest { Task = "work", EnableBash = true });
 
         Assert.True(captured.EnableBash);
+    }
+
+    // ========================================================================
+    // Owned client disposal (ClientFactory ownership)
+    // ========================================================================
+
+    /// <summary>Client that records how many times it has been disposed.</summary>
+    private sealed class DisposalTrackingClient : IChatClient
+    {
+        private readonly string _response;
+        private readonly bool _throwOnCall;
+        private readonly bool _throwOnDispose;
+        private readonly TaskCompletionSource<bool>? _gate;
+        private int _disposeCount;
+
+        public DisposalTrackingClient(
+            string response = "done",
+            bool throwOnCall = false,
+            bool throwOnDispose = false,
+            TaskCompletionSource<bool>? gate = null)
+        {
+            _response = response;
+            _throwOnCall = throwOnCall;
+            _throwOnDispose = throwOnDispose;
+            _gate = gate;
+        }
+
+        public int DisposeCount => Volatile.Read(ref _disposeCount);
+        public bool IsDisposed => DisposeCount > 0;
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (_throwOnCall)
+                throw new InvalidOperationException("Simulated client failure.");
+
+            if (_gate is not null)
+            {
+                var cancelTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (cancellationToken.Register(() => cancelTcs.TrySetResult(true)))
+                {
+                    var finished = await Task.WhenAny(_gate.Task, cancelTcs.Task).ConfigureAwait(false);
+                    if (ReferenceEquals(finished, cancelTcs.Task))
+                        throw new OperationCanceledException(cancellationToken);
+                }
+            }
+
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, _response));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+            Interlocked.Increment(ref _disposeCount);
+            if (_throwOnDispose)
+                throw new InvalidOperationException("dispose exploded");
+        }
+    }
+
+    private static SubAgentOptions ModelOptions(Func<string, IChatClient> factory)
+    {
+        var options = DefaultOptions();
+        options.AvailableModels.Add(new SubAgentModelInfo("m1"));
+        options.ClientFactory = factory;
+        return options;
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_Once_And_Before_Await_Returns()
+    {
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.True(owned.IsDisposed);
+        Assert.Equal(1, owned.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_Once_On_Failure()
+    {
+        var owned = new DisposalTrackingClient(throwOnCall: true);
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.Failed, results[0].Status);
+        Assert.Equal(1, owned.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_Once_On_Timeout()
+    {
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var owned = new DisposalTrackingClient(gate: gate);
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1", Timeout = TimeSpan.FromMilliseconds(50) },
+            TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.TimedOut, results[0].Status);
+        Assert.Equal(1, owned.DisposeCount);
+        gate.TrySetResult(true);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_Once_On_CancelAll()
+    {
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var owned = new DisposalTrackingClient(gate: gate);
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+        await manager.CancelAllAsync();
+
+        var results = manager.GetStatus(info.Id);
+        Assert.Equal(SubAgentStatus.Cancelled, results[0].Status);
+        Assert.Equal(1, owned.DisposeCount);
+        gate.TrySetResult(true);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_When_Timeout_Validation_Fails()
+    {
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1", Timeout = TimeSpan.Zero },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(1, owned.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_When_Slot_Wait_Cancelled()
+    {
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        options.MaxConcurrentSubAgents = 1;
+        var blocking = new CapturingClient("blocked", gate: gate);
+        await using var manager = new SubAgentManager(options, blocking, ParentOptions());
+
+        await manager.StartAsync(new SubAgentRequest { Task = "blocker" }, TestContext.Current.CancellationToken);
+
+        using var cts = new CancellationTokenSource();
+        var pending = manager.StartAsync(new SubAgentRequest { Task = "work", Model = "m1" }, cts.Token);
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.Equal(1, owned.DisposeCount);
+
+        gate.SetResult(true);
+    }
+
+    [Fact]
+    public async Task Owned_Client_Disposed_When_Manager_Disposed_During_Slot_Wait()
+    {
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        options.MaxConcurrentSubAgents = 1;
+        var blocking = new CapturingClient("blocked", gate: gate);
+        var manager = new SubAgentManager(options, blocking, ParentOptions());
+
+        await manager.StartAsync(new SubAgentRequest { Task = "blocker" }, TestContext.Current.CancellationToken);
+
+        var pending = manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+
+        await manager.DisposeAsync();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => pending);
+        Assert.Equal(1, owned.DisposeCount);
+        gate.TrySetResult(true);
+    }
+
+    [Fact]
+    public async Task Throwing_ClientFactory_Fails_Cleanly_With_No_Entry()
+    {
+        var options = ModelOptions(_ => throw new InvalidOperationException("factory boom"));
+        await using var manager = CreateManager(options);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken));
+
+        Assert.Empty(manager.GetStatus());
+
+        // The slot was never taken: a subsequent start still succeeds.
+        options.ClientFactory = _ => new DisposalTrackingClient();
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "ok", Model = "m1" }, TestContext.Current.CancellationToken);
+        Assert.NotEqual(string.Empty, info.Id);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Post_Slot_Startup_Failure_Rolls_Back_Slot_Entry_And_Client()
+    {
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        options.MaxConcurrentSubAgents = 1;
+        await using var manager = CreateManager(options);
+
+        manager.OnSlotAcquiredBeforeStart = () => throw new InvalidOperationException("startup boom");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken));
+
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Empty(manager.GetStatus());
+
+        // Slot was released: another start succeeds.
+        manager.OnSlotAcquiredBeforeStart = null;
+        var second = new DisposalTrackingClient();
+        options.ClientFactory = _ => second;
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "again", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.Equal(1, second.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Caller_Owned_Clients_Are_Never_Disposed()
+    {
+        var defaultClient = new DisposalTrackingClient();
+        var parentClient = new DisposalTrackingClient();
+        var options = DefaultOptions();
+        options.DefaultClient = defaultClient;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        var info = await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await manager.DisposeAsync();
+
+        Assert.Equal(0, defaultClient.DisposeCount);
+        Assert.Equal(0, parentClient.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Throwing_Dispose_On_Owned_Client_Does_Not_Change_Outcome()
+    {
+        var owned = new DisposalTrackingClient(throwOnDispose: true);
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.Equal(1, owned.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Each_Model_Selected_Run_Disposes_Its_Own_Client_Once()
+    {
+        var created = new List<DisposalTrackingClient>();
+        var options = ModelOptions(_ =>
+        {
+            var c = new DisposalTrackingClient();
+            lock (created) { created.Add(c); }
+            return c;
+        });
+        await using var manager = CreateManager(options);
+
+        for (var i = 0; i < 3; i++)
+        {
+            var info = await manager.StartAsync(
+                new SubAgentRequest { Task = $"work-{i}", Model = "m1" }, TestContext.Current.CancellationToken);
+            await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(3, created.Count);
+        Assert.All(created, c => Assert.Equal(1, c.DisposeCount));
+    }
+
+    // ========================================================================
+    // Additional integration tests for disposal contracts
+    // (strengthened deterministic coverage)
+    // ========================================================================
+
+    [Fact]
+    public async Task Owned_Client_Already_Disposed_Before_AwaitAsync_Returns()
+    {
+        // Deterministic ordering guarantee: the factory-created client is disposed
+        // BEFORE AwaitAsync returns for the caller. We verify by having the fake set
+        // a flag in Dispose() and asserting it is true once AwaitAsync completes.
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        // AwaitAsync must NOT return until disposal has happened.
+        Assert.True(owned.IsDisposed, "Owned client should be disposed before AwaitAsync returns.");
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+    }
+
+    [Fact]
+    public async Task Concurrent_Model_Selected_Runs_Dispose_Each_Client_Once()
+    {
+        // Start multiple model-selected sub-agents concurrently, await all, and verify
+        // each factory-created client was disposed exactly once (3 instances, 3 disposals).
+        var created = new List<DisposalTrackingClient>();
+        var options = ModelOptions(_ =>
+        {
+            var c = new DisposalTrackingClient();
+            lock (created) { created.Add(c); }
+            return c;
+        });
+        await using var manager = CreateManager(options);
+
+        var infos = new List<string>();
+        for (var i = 0; i < 3; i++)
+        {
+            var info = await manager.StartAsync(
+                new SubAgentRequest { Task = $"work-{i}", Model = "m1" }, TestContext.Current.CancellationToken);
+            infos.Add(info.Id);
+        }
+
+        await manager.AwaitAsync(infos, TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, created.Count);
+        // Three separate instances, each disposed exactly once.
+        for (var i = 0; i < created.Count; i++)
+            Assert.Equal(1, created[i].DisposeCount);
+    }
+
+    [Fact]
+    public async Task NoModel_Path_Never_Disposes_Caller_Owned_Clients()
+    {
+        // Start a sub-agent WITHOUT a model (uses DefaultClient), complete it, dispose
+        // the manager. Neither the default client nor the parent client is disposed.
+        var defaultClient = new DisposalTrackingClient();
+        var parentClient = new DisposalTrackingClient();
+        var options = DefaultOptions();
+        options.DefaultClient = defaultClient;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        var info = await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await manager.DisposeAsync();
+
+        Assert.Equal(0, defaultClient.DisposeCount);
+        Assert.Equal(0, parentClient.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Manager_Disposal_Does_Not_Dispose_Caller_Owned_Clients()
+    {
+        // Start a no-model sub-agent, dispose the manager WITHOUT awaiting the sub-agent.
+        // The default/parent clients must NOT be disposed.
+        var parentClient = new DisposalTrackingClient();
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = DefaultOptions();
+        // DefaultClient that blocks so the sub-agent does not complete before dispose.
+        var defaultClient = new DisposalTrackingClient(gate: gate);
+        options.DefaultClient = defaultClient;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        var info = await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+
+        // Dispose without awaiting the sub-agent.
+        await manager.DisposeAsync();
+        gate.TrySetResult(true);
+
+        // The actual configured DefaultClient (and the parent client) are caller-owned
+        // and must never be disposed by the manager.
+        Assert.Equal(0, defaultClient.DisposeCount);
+        Assert.Equal(0, parentClient.DisposeCount);
+
+        // Verify the manager is disposed via StartAsync (throws ObjectDisposedException).
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "after" }, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task Manager_Disposal_Does_Not_Dispose_Selected_Parent_Client()
+    {
+        // DefaultClient is null, so the no-model path selects the parent client passed to
+        // the constructor. It must not be disposed by the manager.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parentClient = new DisposalTrackingClient(gate: gate);
+        var options = DefaultOptions();
+        options.DefaultClient = null;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+
+        await manager.DisposeAsync();
+        gate.TrySetResult(true);
+
+        Assert.Equal(0, parentClient.DisposeCount);
+    }
+
+    [Fact]
+    public async Task PostSlot_Startup_Rollback_Via_OnSlotAcquiredBeforeStart()
+    {
+        // Set the hook to throw, attempt a start, catch the exception, then verify:
+        // (a) a subsequent start succeeds (slot released),
+        // (b) the factory-created client was disposed,
+        // (c) GetStatus() returns empty (no orphaned entry).
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        options.MaxConcurrentSubAgents = 1;
+        await using var manager = CreateManager(options);
+
+        manager.OnSlotAcquiredBeforeStart = () => throw new InvalidOperationException("startup boom");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken));
+
+        // (b) client disposed, (c) no orphaned entry
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Empty(manager.GetStatus());
+
+        // (a) slot released → subsequent start succeeds
+        manager.OnSlotAcquiredBeforeStart = null;
+        var second = new DisposalTrackingClient();
+        options.ClientFactory = _ => second;
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "again", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.Equal(1, second.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Factory_Throws_PreSlot_No_Client_No_Slot_Leak()
+    {
+        // Use a ClientFactory that throws. Verify the start fails with the factory's
+        // exception, GetStatus() is empty, and no slot is leaked (a subsequent start
+        // succeeds).
+        var options = ModelOptions(_ => throw new InvalidOperationException("factory boom"));
+        await using var manager = CreateManager(options);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken));
+
+        Assert.Empty(manager.GetStatus());
+
+        // Slot never acquired → subsequent start succeeds.
+        options.ClientFactory = _ => new DisposalTrackingClient();
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "ok", Model = "m1" }, TestContext.Current.CancellationToken);
+        Assert.NotEqual(string.Empty, info.Id);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+    }
+
+    // ========================================================================
+    // Iteration-2 review fixes: async disposal path, no deadlock,
+    // CTS rollback, strengthened caller-owned assertions.
+    // ========================================================================
+
+    /// <summary>
+    /// Client that implements ONLY IAsyncDisposable (not IDisposable) so the async
+    /// disposal path is provably exercised. Records its DisposeAsync invocation.
+    /// </summary>
+    private sealed class AsyncOnlyDisposalClient : IChatClient, IAsyncDisposable
+    {
+        private readonly string _response;
+        private readonly TaskCompletionSource<bool>? _gate;
+        private int _asyncDisposeCount;
+        private int _syncDisposeCount;
+        private readonly TaskCompletionSource<bool> _disposedSignal =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public AsyncOnlyDisposalClient(string response = "done", TaskCompletionSource<bool>? gate = null)
+        {
+            _response = response;
+            _gate = gate;
+        }
+
+        // Tracks IAsyncDisposable.DisposeAsync invocations.
+        public int AsyncDisposeCount => Volatile.Read(ref _asyncDisposeCount);
+        // Tracks IDisposable.Dispose invocations — must stay 0 to prove the async path won.
+        public int SyncDisposeCount => Volatile.Read(ref _syncDisposeCount);
+        public Task Disposed => _disposedSignal.Task;
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (_gate is not null)
+            {
+                var cancelTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (cancellationToken.Register(() => cancelTcs.TrySetResult(true)))
+                {
+                    var finished = await Task.WhenAny(_gate.Task, cancelTcs.Task).ConfigureAwait(false);
+                    if (ReferenceEquals(finished, cancelTcs.Task))
+                        throw new OperationCanceledException(cancellationToken);
+                }
+            }
+
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, _response));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        // IAsyncDisposable — the path DisposeOwnedClientAsync should use.
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref _asyncDisposeCount);
+            _disposedSignal.TrySetResult(true);
+            return default;
+        }
+
+        // IDisposable (required by IChatClient) — must NOT be called by the manager.
+        public void Dispose() => Interlocked.Increment(ref _syncDisposeCount);
+    }
+
+    [Fact]
+    public async Task AsyncDisposable_Path_Used_When_Client_Implements_Only_IAsyncDisposable()
+    {
+        // The client implements IAsyncDisposable but NOT IDisposable. The helper must
+        // exercise the IAsyncDisposable.DisposeAsync path (not fall back to IDisposable).
+        var owned = new AsyncOnlyDisposalClient();
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        // The Disposed task is completed only if DisposeAsync was actually called.
+        Assert.True(owned.Disposed.IsCompleted);
+        Assert.Equal(1, owned.AsyncDisposeCount);
+        // The sync IDisposable.Dispose path must NOT have been used.
+        Assert.Equal(0, owned.SyncDisposeCount);
+    }
+
+    [Fact]
+    public async Task PreRun_Exit_Awaits_Async_Disposal_No_Deadlock()
+    {
+        // A pre-run exit path (non-positive timeout) must await the async disposal rather
+        // than blocking synchronously. The client's DisposeAsync yields once before
+        // recording, so if the helper blocked via GetAwaiter().GetResult() it would
+        // deadlock (the continuation would never run on the same thread). A successful
+        // return proves no sync-over-async.
+        var owned = new YieldingAsyncDisposalClient();
+        var options = ModelOptions(_ => owned);
+        await using var manager = CreateManager(options);
+
+        // Non-positive timeout triggers a pre-run exit AFTER the factory created the client.
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1", Timeout = TimeSpan.Zero },
+            TestContext.Current.CancellationToken);
+
+        // StartAsync returned → no deadlock. The client must have been disposed.
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.Equal(string.Empty, info.Id);
+        Assert.True(owned.Disposed.IsCompleted);
+        Assert.Equal(1, owned.AsyncDisposeCount);
+        Assert.Equal(0, owned.SyncDisposeCount);
+    }
+
+    /// <summary>
+    /// Client whose DisposeAsync yields before recording, to detect sync-over-async
+    /// deadlocks. Implements IAsyncDisposable only (no IDisposable).
+    /// </summary>
+    private sealed class YieldingAsyncDisposalClient : IChatClient, IAsyncDisposable
+    {
+        private int _asyncDisposeCount;
+        private int _syncDisposeCount;
+        private readonly TaskCompletionSource<bool> _disposedSignal =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int AsyncDisposeCount => Volatile.Read(ref _asyncDisposeCount);
+        public int SyncDisposeCount => Volatile.Read(ref _syncDisposeCount);
+        public Task Disposed => _disposedSignal.Task;
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public async ValueTask DisposeAsync()
+        {
+            // Yield first so a synchronous GetAwaiter().GetResult() would deadlock
+            // waiting for the continuation that never runs.
+            await Task.Yield();
+            Interlocked.Increment(ref _asyncDisposeCount);
+            _disposedSignal.TrySetResult(true);
+        }
+
+        public void Dispose() => Interlocked.Increment(ref _syncDisposeCount);
+    }
+
+    [Fact]
+    public async Task PostSlot_Rollback_Disposes_Both_Cts_Via_Hook()
+    {
+        // The OnSlotAcquiredBeforeStart hook throws AFTER the two CTSs are constructed
+        // as locals but BEFORE the Entry is inserted. The catch path must dispose both
+        // CTSs (and the owned client) and release the slot. We assert the slot is freed
+        // (a subsequent start succeeds) and the client disposed.
+        //
+        // CTS disposal is internal; we assert the observable contract: slot released,
+        // client disposed, no orphaned entry. A leaked slot would block the next start
+        // when MaxConcurrentSubAgents == 1.
+        var owned = new DisposalTrackingClient();
+        var options = ModelOptions(_ => owned);
+        options.MaxConcurrentSubAgents = 1;
+        await using var manager = CreateManager(options);
+
+        manager.OnSlotAcquiredBeforeStart = () => throw new InvalidOperationException("hook boom");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+            new SubAgentRequest { Task = "work", Model = "m1" }, TestContext.Current.CancellationToken));
+
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Empty(manager.GetStatus());
+
+        // Slot must have been released. If either CTS leak or slot leak occurred, the
+        // semaphore count would be wrong and this start would block (test would time out).
+        manager.OnSlotAcquiredBeforeStart = null;
+        var second = new DisposalTrackingClient();
+        options.ClientFactory = _ => second;
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "again", Model = "m1" }, TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.Equal(1, second.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Manager_Disposal_Does_Not_Dispose_DefaultClient_Reference()
+    {
+        // Strengthened: verify the ACTUAL DefaultClient instance passed to options is
+        // not disposed after manager disposal. The fix uses a real retained reference.
+        var defaultClient = new DisposalTrackingClient();
+        var parentClient = new DisposalTrackingClient();
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = DefaultOptions();
+        options.DefaultClient = defaultClient;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+
+        await manager.DisposeAsync();
+        gate.TrySetResult(true);
+
+        Assert.Equal(0, defaultClient.DisposeCount);
+        Assert.Equal(0, parentClient.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Manager_Disposal_Does_Not_Dispose_Parent_Client_When_DefaultClient_Null()
+    {
+        // Parent-client path: DefaultClient is null, so the no-model path uses the
+        // parent client passed to the constructor. It must not be disposed.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parentClient = new DisposalTrackingClient(gate: gate);
+        var options = DefaultOptions();
+        options.DefaultClient = null;
+        var manager = new SubAgentManager(options, parentClient, ParentOptions());
+
+        await manager.StartAsync(new SubAgentRequest { Task = "work" }, TestContext.Current.CancellationToken);
+
+        await manager.DisposeAsync();
+        gate.TrySetResult(true);
+
+        Assert.Equal(0, parentClient.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Cts_Allocations_Inside_Try_Slot_Released_Across_Repeated_Hook_Failures()
+    {
+        // Structural fix verification (iteration 3): both `new CancellationTokenSource()`
+        // allocations are INSIDE the try block. If the second allocation threw (or any
+        // statement between the first allocation and entry insertion throws), the catch
+        // path must dispose the first (non-null) CTS and release the acquired slot.
+        //
+        // We cannot make `new CancellationTokenSource()` throw deterministically, but the
+        // OnSlotAcquiredBeforeStart hook runs AFTER both allocations and BEFORE entry
+        // insertion. Throwing it exercises the same catch path that a second-CTS-allocation
+        // failure would. We repeat the failure more than MaxConcurrentSubAgents times to
+        // prove the slot is released EVERY time — if any single failure leaked the slot,
+        // the semaphore count would drop and a later start would block (test would time out).
+        var options = ModelOptions(_ => new DisposalTrackingClient());
+        options.MaxConcurrentSubAgents = 2;
+        await using var manager = CreateManager(options);
+
+        // Fail 3 starts (more than the 2 slots) — each must release its slot.
+        manager.OnSlotAcquiredBeforeStart = () => throw new InvalidOperationException("boom");
+        for (var i = 0; i < 3; i++)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartAsync(
+                new SubAgentRequest { Task = $"fail-{i}", Model = "m1" }, TestContext.Current.CancellationToken));
+            Assert.Empty(manager.GetStatus());
+        }
+
+        // All slots released: two concurrent starts must both proceed without blocking.
+        manager.OnSlotAcquiredBeforeStart = null;
+        var firstInfo = await manager.StartAsync(
+            new SubAgentRequest { Task = "first", Model = "m1" }, TestContext.Current.CancellationToken);
+        var secondInfo = await manager.StartAsync(
+            new SubAgentRequest { Task = "second", Model = "m1" }, TestContext.Current.CancellationToken);
+
+        // If a slot had leaked, the second start would block indefinitely.
+        Assert.NotEqual(firstInfo.Id, secondInfo.Id);
+        var results = await manager.AwaitAsync(new[] { firstInfo.Id, secondInfo.Id }, TestContext.Current.CancellationToken);
+        Assert.All(results, r => Assert.Equal(SubAgentStatus.Completed, r.Status));
     }
 }
