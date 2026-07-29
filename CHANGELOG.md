@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.13.0]
+
+### Added
+
+- **Sub-agents (sub-sessions)** — The main session can launch background sub-sessions via the `start_sub_agent` tool, each with an optional model, capability flags, and a specialized system prompt. The sub-agent's execution is backgrounded once a concurrency slot is acquired — the tool returns without awaiting completion, so the main session continues working or starts more sub-sessions up to `MaxConcurrentSubAgents` (default 4). When the limit is reached, the call waits for a slot to free (it never waits for sub-agent completion).
+- **`await_sub_agents`** — Blocks until all (or listed) sub-sessions finish or time out, then returns their summaries plus status metadata (id, status, error, token counts) — never full sub-agent transcripts. Summaries are truncated to `MaxSummaryChars` (default 8000), keeping the main session's context clean — ideal for codebase analysis and large-text summarization.
+- **`get_sub_agent_status`** — Polls progress (always returns a JSON array). **`list_sub_agent_models`** — Lets the agent discover which models the host has made available via `SubAgentOptions.AvailableModels` + `ClientFactory`.
+- **Capability ceiling** — Sub-agents never exceed the parent agent's enabled capabilities: LLM-supplied `enable_bash`/`enable_file_writes` overrides are clamped by the parent's flags, snapshotted at manager creation; file operations and skills follow the manager defaults clamped the same way. Sub-agents run read-only by default (bash off, file writes off).
+- **Lifecycle** — `CodingAgent` implements `IAsyncDisposable`; `DisposeAsync` cancels all running sub-agents (idempotent, safe under concurrent first use). New `CodingAgent.ActiveSubAgentManager` read-only inspection property. Cancelling an execution's `CancellationToken` does NOT cancel running sub-agents (they are owned by the manager, not the turn) — it only unblocks that turn's in-flight await/slot-wait.
+- **Configuration snapshot** — The `SubAgentOptions` are defensively copied at first manager creation; later mutations have no effect.
+- New `SharpCoder.SubAgents` namespace with public types: `SubAgentManager`, `SubAgentOptions`, `SubAgentRequest`, `SubAgentInfo`, `SubAgentStatus`, `SubAgentModelInfo`. New `AgentOptions.SubAgents` property to enable the feature. (`SubAgentTools` is an internal implementation detail — do NOT list it as public API.)
+
+### Fixed
+
+- `StreamWithToolCallsAsync` no longer swallows `OperationCanceledException` from tool calls into an error result — cancellation now propagates correctly when `ShowToolCallsInStream` is enabled.
+
+### Note
+
+Flat design — sub-agents cannot spawn their own sub-agents (planned for a future release).
+
 ## [0.12.1] - 2026-07-28
 
 ### Fixed

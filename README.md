@@ -87,6 +87,64 @@ Forked sessions get a new session ID, zeroed token counters, and fresh timestamp
 
 Sessions track cumulative token usage, tool call counts, and exact context size from the most recent API response.
 
+## Sub-agents
+
+Delegate self-contained subtasks — codebase analysis, large-text summarization, and parallel research — to background sub-sessions. Only their summaries and status metadata return to the main session, never full transcripts.
+
+```csharp
+using Microsoft.Extensions.AI;
+using SharpCoder;
+using SharpCoder.SubAgents;
+
+IChatClient mainClient = new OllamaChatClient("http://localhost:11434", "qwen2.5-coder");
+
+var agent = new CodingAgent(mainClient, new AgentOptions
+{
+    WorkDirectory = "/path/to/project",
+    MaxSteps = 25,
+    SubAgents = new SubAgentOptions
+    {
+        MaxConcurrentSubAgents = 4,
+        DefaultTimeout = TimeSpan.FromMinutes(10),
+        MaxTimeout = TimeSpan.FromMinutes(30),
+        MaxSummaryChars = 8_000,
+        AvailableModels =
+        {
+            new SubAgentModelInfo("llama3.2", "Fast summarizer", 128_000),
+            new SubAgentModelInfo("qwen2.5-coder", "Coding specialist", 131_072)
+        },
+        ClientFactory = modelId => new OllamaChatClient("http://localhost:11434", modelId)
+    }
+});
+
+// The agent gains four tools: start_sub_agent, await_sub_agents,
+// get_sub_agent_status, list_sub_agent_models.
+// Sub-agents run read-only by default and cannot exceed the parent's capabilities.
+
+var result = await agent.ExecuteAsync("Analyze the codebase and summarize the architecture");
+
+// Always dispose to cancel any running sub-agents
+await agent.DisposeAsync();
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `MaxConcurrentSubAgents` | 4 | Maximum concurrently running sub-agents |
+| `DefaultTimeout` | 10 min | Per-sub-agent timeout if not overridden |
+| `MaxTimeout` | 30 min | Upper bound for per-request timeouts; larger values clamped |
+| `MaxSummaryChars` | 8,000 | Maximum characters retained from a sub-agent summary |
+| `DefaultEnableBash` | false | Default bash tool flag for sub-agents |
+| `DefaultEnableFileOps` | true | Default file-ops tool flag for sub-agents |
+| `DefaultEnableFileWrites` | false | Default file-writes tool flag for sub-agents |
+| `DefaultEnableSkills` | true | Default skills tool flag for sub-agents |
+| `MaxSteps` | 25 | Maximum agent-loop steps per sub-agent |
+| `ClientFactory` | null | Maps a model ID to an `IChatClient`; required when a sub-agent requests a model from `AvailableModels` |
+| `DefaultClient` | null | Fallback client when no model is specified; when null the parent agent's client is used |
+
+Sub-agents can never exceed the parent agent's enabled capabilities (bash, file ops, file writes, skills). LLM-supplied overrides are clamped by the parent's flags, snapshotted at manager creation. Sub-agents run read-only by default.
+
+Sub-agents cannot spawn their own sub-agents. This flat-design limitation is planned for a future release.
+
 ## Streaming
 
 Stream text tokens as they arrive instead of waiting for the full response:
