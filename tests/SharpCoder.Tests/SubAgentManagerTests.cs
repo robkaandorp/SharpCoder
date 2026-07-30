@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 using SharpCoder.SubAgents;
@@ -2412,5 +2414,427 @@ public class SubAgentManagerTests
         Assert.NotEqual(firstInfo.Id, secondInfo.Id);
         var results = await manager.AwaitAsync(new[] { firstInfo.Id, secondInfo.Id }, TestContext.Current.CancellationToken);
         Assert.All(results, r => Assert.Equal(SubAgentStatus.Completed, r.Status));
+    }
+
+    // ========================================================================
+    // SubAgentChanged lifecycle event tests
+    // ========================================================================
+
+    /// <summary>
+    /// Thread-safe, deterministically awaitable collector for <see cref="SubAgentManager.SubAgentChanged"/>.
+    /// The manager fires the terminal event AFTER signalling <c>AwaitAsync</c> waiters, so tests must
+    /// NOT assume an event has been delivered just because AwaitAsync/StartAsync returned. Every test
+    /// awaits <see cref="WaitForCountAsync"/> before asserting, making assertions independent of
+    /// scheduler timing. Events are stored in a <see cref="ConcurrentQueue{T}"/> because the runner
+    /// thread writes while the test thread reads.
+    /// </summary>
+    private sealed class SubAgentEventCollector
+    {
+        private readonly ConcurrentQueue<SubAgentInfo> _events = new();
+        private readonly object _sync = new();
+        private readonly List<(int Count, TaskCompletionSource<bool> Signal)> _waiters = new();
+        private int _count;
+
+        /// <summary>The handler to subscribe to the event under test.</summary>
+        public void Handle(SubAgentInfo info)
+        {
+            _events.Enqueue(info);
+            var reached = Interlocked.Increment(ref _count);
+
+            List<TaskCompletionSource<bool>>? toSignal = null;
+            lock (_sync)
+            {
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    if (_waiters[i].Count <= reached)
+                    {
+                        (toSignal ??= new List<TaskCompletionSource<bool>>()).Add(_waiters[i].Signal);
+                        _waiters.RemoveAt(i);
+                    }
+                }
+            }
+
+            if (toSignal is null) return;
+            foreach (var signal in toSignal)
+                signal.TrySetResult(true);
+        }
+
+        /// <summary>Number of events delivered so far.</summary>
+        public int Count => Volatile.Read(ref _count);
+
+        /// <summary>Snapshot of the delivered events, in delivery order.</summary>
+        public IReadOnlyList<SubAgentInfo> Events => _events.ToArray();
+
+        /// <summary>
+        /// Waits until at least <paramref name="count"/> events have been delivered.
+        /// Fails the test rather than hanging if delivery never happens.
+        /// </summary>
+        public async Task WaitForCountAsync(int count)
+        {
+            TaskCompletionSource<bool> signal;
+            lock (_sync)
+            {
+                if (Volatile.Read(ref _count) >= count) return;
+                signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waiters.Add((count, signal));
+            }
+
+            var finished = await Task.WhenAny(signal.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+            Assert.True(ReferenceEquals(finished, signal.Task),
+                $"Timed out waiting for {count} SubAgentChanged event(s); only {Count} arrived.");
+        }
+
+        /// <summary>
+        /// Asserts no further events arrive beyond <paramref name="expected"/>. Uses a short settle
+        /// delay: a spurious extra event would have to be produced by an already-completed run, so
+        /// any additional delivery lands well within this window.
+        /// </summary>
+        public async Task AssertNoMoreThanAsync(int expected)
+        {
+            await Task.Delay(250);
+            Assert.Equal(expected, Count);
+        }
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Fires_Running_At_Start()
+    {
+        // A real model is configured so the emitted Model field is actually covered:
+        // the default (null-model) path would make a Model assertion vacuous.
+        var options = DefaultOptions();
+        options.AvailableModels.Add(new SubAgentModelInfo("gpt-4"));
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        options.ClientFactory = _ => new CapturingClient("done", gate: gate);
+
+        await using var manager = CreateManager(options);
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "do work", Model = "gpt-4" },
+            TestContext.Current.CancellationToken);
+
+        // Do NOT assume StartAsync returning implies the handler ran.
+        await collector.WaitForCountAsync(1);
+
+        var running = collector.Events[0];
+        Assert.Equal(info.Id, running.Id);
+        Assert.Equal("do work", running.Task);
+        Assert.Equal("gpt-4", running.Model);
+        Assert.Equal(SubAgentStatus.Running, running.Status);
+        Assert.Null(running.CompletedAt);
+        Assert.Null(running.Summary);
+
+        // The sub-agent is still gated, so the terminal event cannot have raced ahead
+        // and overwritten the Running payload asserted above.
+        Assert.Equal(1, collector.Count);
+
+        gate.SetResult(true);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Fires_Terminal_Completed()
+    {
+        var client = new CapturingClient("summary", inputTokens: 7, outputTokens: 3);
+        await using var manager = CreateManager(parentClient: client);
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        // Complete() signals AwaitAsync waiters BEFORE raising the terminal event,
+        // so the event must be awaited explicitly.
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+
+        var terminal = events[1];
+        Assert.Equal(info.Id, terminal.Id);
+        Assert.Equal(SubAgentStatus.Completed, terminal.Status);
+        Assert.Equal("summary", terminal.Summary);
+        Assert.Equal(7, terminal.InputTokens);
+        Assert.Equal(3, terminal.OutputTokens);
+        Assert.NotNull(terminal.CompletedAt);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Fires_Terminal_Failed()
+    {
+        await using var manager = CreateManager(DefaultOptions(), new ThrowingClient());
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+        Assert.Equal(SubAgentStatus.Failed, events[1].Status);
+        Assert.Equal(info.Id, events[1].Id);
+        Assert.NotNull(events[1].Error);
+        Assert.Null(events[1].Summary);
+        Assert.NotNull(events[1].CompletedAt);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Fires_Terminal_TimedOut()
+    {
+        var options = DefaultOptions();
+        options.DefaultTimeout = TimeSpan.FromMilliseconds(100);
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new CapturingClient("never", gate: gate);
+        await using var manager = CreateManager(options, client);
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "slow" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+        Assert.Equal(SubAgentStatus.TimedOut, events[1].Status);
+        Assert.Equal(info.Id, events[1].Id);
+        Assert.NotNull(events[1].Error);
+        Assert.Null(events[1].Summary);
+        Assert.NotNull(events[1].CompletedAt);
+
+        gate.SetResult(true);
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Fires_Terminal_Cancelled()
+    {
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new CapturingClient("blocked", gate: gate);
+        await using var manager = CreateManager(DefaultOptions(), client);
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "blocked" },
+            TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(1);
+        Assert.Equal(SubAgentStatus.Running, collector.Events[0].Status);
+
+        await manager.CancelAllAsync();
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Cancelled, events[1].Status);
+        Assert.Equal(info.Id, events[1].Id);
+        Assert.NotNull(events[1].CompletedAt);
+
+        gate.SetResult(true);
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Per_Handler_Payload_Is_Isolated()
+    {
+        // Gate the run so the Running event is the only event in flight while the
+        // payloads captured below are compared and mutated.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new CapturingClient("done", gate: gate);
+        await using var manager = CreateManager(DefaultOptions(), client);
+
+        var collectorA = new SubAgentEventCollector();
+        var collectorB = new SubAgentEventCollector();
+        manager.SubAgentChanged += collectorA.Handle;
+        manager.SubAgentChanged += collectorB.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+
+        await collectorA.WaitForCountAsync(1);
+        await collectorB.WaitForCountAsync(1);
+
+        var a = collectorA.Events[0];
+        var b = collectorB.Events[0];
+        Assert.NotSame(a, b);
+        Assert.Equal(a.Id, b.Id);
+        Assert.Null(b.Summary);
+
+        // Mutate one handler's payload; the other's must remain unchanged.
+        a.Summary = "mutated-by-a";
+        Assert.Null(b.Summary);
+        Assert.NotEqual("mutated-by-a", b.Summary);
+
+        gate.SetResult(true);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collectorA.WaitForCountAsync(2);
+        await collectorB.WaitForCountAsync(2);
+
+        // Terminal payloads are distinct instances too.
+        Assert.NotSame(collectorA.Events[1], collectorB.Events[1]);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Throwing_Handler_Does_Not_Break_Others()
+    {
+        await using var manager = CreateManager();
+        var throwCount = 0;
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += _ =>
+        {
+            Interlocked.Increment(ref throwCount);
+            throw new InvalidOperationException("handler boom");
+        };
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        // The throwing branch actually ran for both transitions...
+        Assert.Equal(2, Volatile.Read(ref throwCount));
+        // ...and the healthy subscriber still received both.
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+        Assert.Equal(SubAgentStatus.Completed, events[1].Status);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Validation_Failure_Fires_Nothing()
+    {
+        await using var manager = CreateManager();
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "   " },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+
+        // Nothing was started, so nothing can arrive later either.
+        await collector.AssertNoMoreThanAsync(0);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Running_Fires_Before_Terminal()
+    {
+        // Gating the client guarantees the Running event is observed while the run is
+        // still in flight — proving the ordering rather than inferring it after the fact.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new CapturingClient("done", gate: gate);
+        await using var manager = CreateManager(DefaultOptions(), client);
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+
+        await collector.WaitForCountAsync(1);
+        Assert.Equal(SubAgentStatus.Running, collector.Events[0].Status);
+        // Still gated: the terminal event provably has not fired yet.
+        Assert.Equal(1, collector.Count);
+
+        gate.SetResult(true);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+        Assert.Equal(SubAgentStatus.Completed, events[1].Status);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_SingleSubscriber_Exactly_Two_Events()
+    {
+        await using var manager = CreateManager();
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        // Settle, then assert nothing extra arrived.
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task SubAgentChanged_Second_Complete_Is_Ignored_No_Extra_Event()
+    {
+        // Deterministically invokes the private Complete(...) a SECOND time on the same
+        // entry with a DIFFERENT terminal status. The `if (entry.Terminal != 0) return;`
+        // guard must make the second call a no-op: no extra event, and the recorded
+        // snapshot must still reflect the FIRST transition.
+        //
+        // Removing that guard makes this test fail three ways: a third event is raised,
+        // the event payload reports Failed, and GetStatus reports the overwritten status.
+        await using var manager = CreateManager(DefaultOptions(), new CapturingClient("first-wins"));
+        var collector = new SubAgentEventCollector();
+        manager.SubAgentChanged += collector.Handle;
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        Assert.Equal(SubAgentStatus.Completed, collector.Events[1].Status);
+        Assert.Equal("first-wins", collector.Events[1].Summary);
+        var firstCompletedAt = collector.Events[1].CompletedAt;
+        Assert.NotNull(firstCompletedAt);
+
+        // Reach the live Entry the manager is tracking and re-invoke Complete on it.
+        var entriesField = typeof(SubAgentManager)
+            .GetField("_entries", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var entries = entriesField.GetValue(manager)!;
+        var tryGet = entries.GetType().GetMethod("TryGetValue")!;
+        var args = new object?[] { info.Id, null };
+        Assert.True((bool)tryGet.Invoke(entries, args)!);
+        var entry = args[1]!;
+
+        var completeMethod = typeof(SubAgentManager)
+            .GetMethod("Complete", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        // Second Complete with a DIFFERENT status and payload — must be swallowed entirely.
+        completeMethod.Invoke(manager, new object?[]
+        {
+            entry, SubAgentStatus.Failed, "second-summary", "second-error", null
+        });
+
+        // No third event, and the terminal payload already delivered is untouched.
+        await collector.AssertNoMoreThanAsync(2);
+        Assert.Equal(SubAgentStatus.Completed, collector.Events[1].Status);
+        Assert.Equal("first-wins", collector.Events[1].Summary);
+        Assert.Null(collector.Events[1].Error);
+        Assert.Equal(firstCompletedAt, collector.Events[1].CompletedAt);
+
+        // The manager's own state also still reflects the FIRST transition.
+        var status = manager.GetStatus(info.Id);
+        Assert.Single(status);
+        Assert.Equal(SubAgentStatus.Completed, status[0].Status);
+        Assert.Equal("first-wins", status[0].Summary);
+        Assert.Null(status[0].Error);
     }
 }

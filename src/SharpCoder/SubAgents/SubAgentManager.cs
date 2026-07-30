@@ -138,6 +138,21 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// <summary>The logger resolved by the constructor (explicit logger, else parent options logger).</summary>
     internal ILogger ResolvedLogger => _logger;
 
+    /// <summary>
+    /// Raised when a sub-agent transitions state — once when it starts (<see cref="SubAgentStatus.Running"/>)
+    /// and once when it reaches a terminal status. The argument is a <strong>detached snapshot</strong>
+    /// the manager will NOT mutate further, safe to read from any thread; a FRESH instance is passed
+    /// to EACH handler, so a handler mutating its copy does not affect other handlers. Handlers are
+    /// invoked synchronously in registration order; a throwing handler is caught and logged without
+    /// affecting other handlers or the manager. No event fires for validation failures.
+    /// <para>
+    /// Handlers must NOT synchronously block on manager lifecycle methods
+    /// (<see cref="AwaitAsync"/>, <see cref="CancelAllAsync"/>, <see cref="DisposeAsync"/>) —
+    /// doing so from a start/terminal notification can deadlock.
+    /// </para>
+    /// </summary>
+    public event Action<SubAgentInfo>? SubAgentChanged;
+
     /// <summary>Creates a new sub-agent manager.</summary>
     /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
     /// <exception cref="ArgumentException">Thrown when the model catalog is invalid.</exception>
@@ -295,6 +310,11 @@ public sealed class SubAgentManager : IAsyncDisposable
 
                     // Capture the Running snapshot BEFORE the background task can transition it.
                     var initial = entry.Snapshot();
+
+                    // Fire the start event BEFORE launching the runner. A handler synchronously
+                    // blocking on manager lifecycle methods (AwaitAsync, CancelAllAsync, DisposeAsync)
+                    // from this notification will deadlock — the runner has not started yet.
+                    RaiseSubAgentChanged(initial);
 
                     var capturedEntry = entry;
                     entry.Runner = Task.Run(() => RunAsync(capturedEntry, spec));
@@ -490,6 +510,12 @@ public sealed class SubAgentManager : IAsyncDisposable
 
         // 4. Signal AwaitAsync waiters.
         entry.Completion.TrySetResult(true);
+
+        // 5. Fire the terminal event outside the lock, after waiters are signalled.
+        // Only reaches here when the transition actually happened (early-return above
+        // guards against double-Complete).
+        var terminalSnapshot = entry.Snapshot();
+        RaiseSubAgentChanged(terminalSnapshot);
     }
 
     private void EvictHistory()
@@ -602,6 +628,36 @@ public sealed class SubAgentManager : IAsyncDisposable
 
             try { await entry.Completion.Task.ConfigureAwait(false); }
             catch (Exception ex) { _logger.LogDebug(ex, "Sub-agent {Id} completion faulted", entry.Id); }
+        }
+    }
+
+    private void RaiseSubAgentChanged(SubAgentInfo info)
+    {
+        var handlers = SubAgentChanged?.GetInvocationList();
+        if (handlers is null || handlers.Length == 0) return;
+        foreach (var handler in handlers)
+        {
+            var fresh = new SubAgentInfo
+            {
+                Id = info.Id,
+                Task = info.Task,
+                Status = info.Status,
+                StartedAt = info.StartedAt,
+                CompletedAt = info.CompletedAt,
+                Model = info.Model,
+                Summary = info.Summary,
+                Error = info.Error,
+                InputTokens = info.InputTokens,
+                OutputTokens = info.OutputTokens
+            };
+            try
+            {
+                ((Action<SubAgentInfo>)handler)(fresh);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "SubAgentChanged handler threw an exception.");
+            }
         }
     }
 
