@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using SharpCoder.Tools;
 
 namespace SharpCoder.SubAgents;
 
@@ -47,6 +48,7 @@ public sealed class SubAgentManager : IAsyncDisposable
         public IChatClient? CompactionClient;
         public int? CompactionMaxTokens;
         public ReasoningEffort? ReasoningEffort;
+        public IReadOnlyList<ImageAttachment>? Images;
     }
 
     private sealed class Entry
@@ -115,6 +117,7 @@ public sealed class SubAgentManager : IAsyncDisposable
     private readonly bool _parentEnableFileOpsSnapshot;
     private readonly bool _parentEnableFileWritesSnapshot;
     private readonly bool _parentEnableSkillsSnapshot;
+    private readonly string _workDirectorySnapshot;
 
     /// <summary>
     /// Test seam: invoked with the freshly built <see cref="AgentOptions"/> for each sub-agent,
@@ -137,6 +140,9 @@ public sealed class SubAgentManager : IAsyncDisposable
 
     /// <summary>The logger resolved by the constructor (explicit logger, else parent options logger).</summary>
     internal ILogger ResolvedLogger => _logger;
+
+    /// <summary>The working directory snapshotted at construction time, used for RunSpec creation and ImageLoader resolution.</summary>
+    internal string WorkDirectory => _workDirectorySnapshot;
 
     /// <summary>
     /// Raised when a sub-agent transitions state — once when it starts (<see cref="SubAgentStatus.Running"/>)
@@ -168,6 +174,7 @@ public sealed class SubAgentManager : IAsyncDisposable
         _parentEnableFileOpsSnapshot = parentOptions.EnableFileOps;
         _parentEnableFileWritesSnapshot = parentOptions.EnableFileWrites;
         _parentEnableSkillsSnapshot = parentOptions.EnableSkills;
+        _workDirectorySnapshot = parentOptions.WorkDirectory;
 
         if (options.MaxConcurrentSubAgents < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxConcurrentSubAgents must be at least 1.");
@@ -247,6 +254,25 @@ public sealed class SubAgentManager : IAsyncDisposable
                 timeout = requestedTimeout.Value > _options.MaxTimeout ? _options.MaxTimeout : requestedTimeout.Value;
             }
 
+            if (request.Images is { Count: > 0 } images)
+            {
+                if (images.Count > ImageLoader.MaxImageCount)
+                    return ValidationFailure($"Too many images: {images.Count} exceeds the limit of {ImageLoader.MaxImageCount}.");
+                long totalBytes = 0;
+                foreach (var img in images)
+                {
+                    if (img is null)
+                        return ValidationFailure("Images collection contains a null entry.");
+                    if (img.Data is null || img.Data.Length == 0)
+                        return ValidationFailure("An image attachment has empty Data.");
+                    if (string.IsNullOrWhiteSpace(img.MediaType))
+                        return ValidationFailure("An image attachment has a blank MediaType.");
+                    totalBytes += img.Data.Length;
+                }
+                if (totalBytes > ImageLoader.MaxTotalBytes)
+                    return ValidationFailure($"Total image size {totalBytes} bytes exceeds the limit of {ImageLoader.MaxTotalBytes} bytes.");
+            }
+
             // Fully immutable snapshot of everything the run needs.
             var spec = new RunSpec
             {
@@ -262,11 +288,12 @@ public sealed class SubAgentManager : IAsyncDisposable
                 OwnedClientForDisposal = ownedClient,
                 MaxSteps = _options.MaxSteps,
                 MaxSummaryChars = _options.MaxSummaryChars,
-                WorkDirectory = _parentOptions.WorkDirectory,
+                WorkDirectory = _workDirectorySnapshot,
                 MaxContextTokens = _parentOptions.MaxContextTokens,
                 CompactionClient = _parentOptions.CompactionClient,
                 CompactionMaxTokens = _parentOptions.CompactionMaxTokens,
-                ReasoningEffort = _parentOptions.ReasoningEffort
+                ReasoningEffort = _parentOptions.ReasoningEffort,
+                Images = SnapshotImages(request.Images)
             };
 
             Interlocked.Increment(ref _pendingStarts);
@@ -383,6 +410,24 @@ public sealed class SubAgentManager : IAsyncDisposable
         };
     }
 
+    private static IReadOnlyList<ImageAttachment>? SnapshotImages(IReadOnlyList<ImageAttachment>? source)
+    {
+        if (source is null) return null;
+        var result = new List<ImageAttachment>(source.Count);
+        foreach (var img in source)
+        {
+            var clonedData = new byte[img.Data.Length];
+            Array.Copy(img.Data, clonedData, img.Data.Length);
+            result.Add(new ImageAttachment
+            {
+                Data = clonedData,
+                MediaType = img.MediaType,
+                Name = img.Name
+            });
+        }
+        return result;
+    }
+
     private async Task RunAsync(Entry entry, RunSpec spec)
     {
         var timeoutCts = entry.TimeoutCts!;
@@ -424,7 +469,7 @@ public sealed class SubAgentManager : IAsyncDisposable
             OnSubAgentOptionsCreated?.Invoke(subOptions);
 
             var agent = new CodingAgent(spec.Client, subOptions);
-            var result = await agent.ExecuteAsync(spec.Task, linked.Token).ConfigureAwait(false);
+            var result = await agent.ExecuteAsync(spec.Task, spec.Images, linked.Token).ConfigureAwait(false);
 
             if (!string.Equals(result.Status, "Success", StringComparison.Ordinal))
             {

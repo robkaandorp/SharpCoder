@@ -3,7 +3,9 @@ using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
+using SharpCoder;
 using SharpCoder.SubAgents;
+using SharpCoder.Tools;
 
 namespace SharpCoder.Tests;
 
@@ -963,5 +965,421 @@ public class SubAgentToolsTests
         Assert.DoesNotContain("sneaky-model", listing);
         Assert.DoesNotContain("replacement-model", listing);
         Assert.Equal(1, agent.SubAgentManagerCreateCount);
+    }
+
+    // ========================================================================
+    // image_paths parameter tests
+    //
+    // These tests either set ImageLoader.FileProbe (a process-global test seam)
+    // or rely on it being null so real files on disk are read. They therefore
+    // join the "ImageLoader" xUnit collection defined in VisionInfrastructureTests,
+    // which serializes every test that touches the seam.
+    // ========================================================================
+
+    private static readonly byte[] TinyPng =
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    private static readonly byte[] TinyPdf =
+        [(byte)'%', (byte)'P', (byte)'D', (byte)'F', (byte)'-', (byte)'1', (byte)'.', (byte)'0'];
+
+    /// <summary>
+    /// Creates a temp directory, writes a file, and returns a tuple of
+    /// (directoryPath, cleanupAction). The cleanup deletes the directory.
+    /// </summary>
+    private static (string dir, Action cleanup) TempDirWithFile(string fileName, byte[] content)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "subagent-img-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllBytes(Path.Combine(dir, fileName), content);
+        return (dir, () =>
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        });
+    }
+
+    /// <summary>
+    /// Finds the last user-role message and returns its DataContent items.
+    /// </summary>
+    private static List<DataContent> UserDataContents(IList<ChatMessage> messages)
+    {
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role == ChatRole.User)
+                return messages[i].Contents.OfType<DataContent>().ToList();
+        }
+        return new List<DataContent>();
+    }
+
+    /// <summary>
+    /// Sub-agent <c>image_paths</c> tests. Serialized with every other ImageLoader
+    /// test because <see cref="ImageLoader.FileProbe"/> is process-global: a parallel
+    /// test could otherwise substitute a probe for a real-file test here, or clear the
+    /// probe one of these tests installed.
+    /// </summary>
+    [Collection("ImageLoader")]
+    public class ImagePathsTests
+    {
+        [Fact]
+        public async Task ImagePaths_Valid_Png_Runs_SubAgent_With_Image_Content()
+        {
+            var (dir, cleanup) = TempDirWithFile("test.png", TinyPng);
+            try
+            {
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = dir,
+                    EnableBash = false,
+                    EnableFileOps = true,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions { DefaultClient = subClient };
+                subOptions.AvailableModels.Add(new SubAgentModelInfo("vision"));
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe the image",
+                        ["image_paths"] = new[] { "test.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Equal("Running", doc.RootElement.GetProperty("status").GetString());
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                // The sub-agent's LLM request must include the PNG bytes.
+                Assert.NotEmpty(subClient.ReceivedMessages);
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal("image/png", dataContents[0].MediaType);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_Valid_Pdf_Runs_SubAgent_With_Pdf_Content()
+        {
+            var (dir, cleanup) = TempDirWithFile("doc.pdf", TinyPdf);
+            try
+            {
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = dir,
+                    EnableBash = false,
+                    EnableFileOps = true,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions { DefaultClient = subClient };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe the pdf",
+                        ["image_paths"] = new[] { "doc.pdf" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Equal("Running", doc.RootElement.GetProperty("status").GetString());
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                Assert.NotEmpty(subClient.ReceivedMessages);
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal("application/pdf", dataContents[0].MediaType);
+                Assert.Equal(TinyPdf, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_Nonexistent_Returns_Error_No_SubAgent_Tracked()
+        {
+            var subClient = new OptionsCapturingClient("sub done");
+            var parent = new AgentOptions
+            {
+                WorkDirectory = Path.GetTempPath(),
+                EnableBash = false,
+                EnableSkills = false,
+                AutoLoadWorkspaceInstructions = false,
+            };
+            var subOptions = new SubAgentOptions { DefaultClient = subClient };
+            parent.SubAgents = subOptions;
+
+            await using var manager = CreateManager(subOptions, parent, subClient);
+            var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+            var json = await InvokeAsync(tools, "start_sub_agent",
+                new Dictionary<string, object?>
+                {
+                    ["task"] = "describe",
+                    ["image_paths"] = new[] { "doesnotexist.png" }
+                });
+
+            using var doc = JsonDocument.Parse(json);
+            Assert.False(doc.RootElement.TryGetProperty("id", out _));
+            Assert.True(doc.RootElement.TryGetProperty("error", out _));
+            Assert.Empty(manager.GetStatus());
+            Assert.Equal(0, subClient.CallCount);
+        }
+
+        [Fact]
+        public async Task ImagePaths_Escaping_Root_Returns_Error_No_SubAgent_Tracked()
+        {
+            var subClient = new OptionsCapturingClient("sub done");
+            var parent = new AgentOptions
+            {
+                WorkDirectory = Path.GetTempPath(),
+                EnableBash = false,
+                EnableSkills = false,
+                AutoLoadWorkspaceInstructions = false,
+            };
+            var subOptions = new SubAgentOptions { DefaultClient = subClient };
+            parent.SubAgents = subOptions;
+
+            await using var manager = CreateManager(subOptions, parent, subClient);
+            var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+            var json = await InvokeAsync(tools, "start_sub_agent",
+                new Dictionary<string, object?>
+                {
+                    ["task"] = "describe",
+                    ["image_paths"] = new[] { "../../../etc/passwd" }
+                });
+
+            using var doc = JsonDocument.Parse(json);
+            Assert.False(doc.RootElement.TryGetProperty("id", out _));
+            Assert.True(doc.RootElement.TryGetProperty("error", out _));
+            Assert.Empty(manager.GetStatus());
+            Assert.Equal(0, subClient.CallCount);
+        }
+
+        [Fact]
+        public async Task ImagePaths_Over_Limit_Returns_Error_No_SubAgent_Tracked()
+        {
+            // Use the FileProbe test seam to simulate files whose total exceeds 20 MiB
+            // without writing that much to disk. Two "files" each just under 20 MiB
+            // but together over the limit. The loader checks cumulative bytes.
+            try
+            {
+                var probeData = new byte[11 * 1024 * 1024]; // 11 MiB each, 22 MiB total
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = Path.GetTempPath(),
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subClient = new OptionsCapturingClient("sub done");
+                var subOptions = new SubAgentOptions { DefaultClient = subClient };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                ImageLoader.FileProbe = path =>
+                {
+                    return (probeData.Length, () => new MemoryStream(probeData));
+                };
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { "big1.png", "big2.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.False(doc.RootElement.TryGetProperty("id", out _));
+                Assert.True(doc.RootElement.TryGetProperty("error", out _));
+                Assert.Empty(manager.GetStatus());
+                Assert.Equal(0, subClient.CallCount);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+            }
+        }
+
+        // ========================================================================
+        // Working-directory snapshot test
+        // ========================================================================
+
+        [Fact]
+        public async Task ImagePaths_Resolves_Against_Construction_Time_WorkDir_Snapshot()
+        {
+            var (dirA, cleanupA) = TempDirWithFile("test.png", TinyPng);
+            var dirB = Path.Combine(Path.GetTempPath(), "subagent-img-b-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dirB);
+            try
+            {
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = dirA, // construction-time workdir
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions { DefaultClient = subClient };
+                parent.SubAgents = subOptions;
+
+                // Construct the manager with dirA as the workdir.
+                await using var manager = CreateManager(subOptions, parent, subClient);
+
+                // Capture the AgentOptions the manager builds for the spawned sub-agent so we
+                // can prove RunSpec.WorkDirectory came from the construction-time snapshot.
+                AgentOptions? capturedOptions = null;
+                manager.OnSubAgentOptionsCreated = o => capturedOptions = o;
+
+                // After construction, change the parent workdir to dirB (no PNG there).
+                parent.WorkDirectory = dirB;
+
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { "test.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Equal("Running", doc.RootElement.GetProperty("status").GetString());
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                // The loader resolved against dirA (construction snapshot), so the image content is present.
+                Assert.NotEmpty(subClient.ReceivedMessages);
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal("image/png", dataContents[0].MediaType);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+
+                // And RunSpec used the SAME construction-time snapshot: the sub-agent's own
+                // working directory is dirA, not the mutated live value dirB.
+                Assert.NotNull(capturedOptions);
+                Assert.Equal(dirA, capturedOptions!.WorkDirectory);
+                Assert.NotEqual(dirB, capturedOptions.WorkDirectory);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanupA();
+                try { Directory.Delete(dirB, recursive: true); } catch (IOException) { }
+            }
+        }
+
+        // ========================================================================
+        // Regression: image_paths omitted
+        // ========================================================================
+
+        [Fact]
+        public async Task ImagePaths_Omitted_Runs_SubAgent_Without_Image_Content()
+        {
+            var subClient = new OptionsCapturingClient("sub done");
+            var parent = new AgentOptions
+            {
+                WorkDirectory = Path.GetTempPath(),
+                EnableBash = false,
+                EnableSkills = false,
+                AutoLoadWorkspaceInstructions = false,
+            };
+            var subOptions = new SubAgentOptions { DefaultClient = subClient };
+            parent.SubAgents = subOptions;
+
+            await using var manager = CreateManager(subOptions, parent, subClient);
+            var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+            var json = await InvokeAsync(tools, "start_sub_agent",
+                new Dictionary<string, object?>
+                {
+                    ["task"] = "no images here"
+                });
+
+            using var doc = JsonDocument.Parse(json);
+            Assert.True(doc.RootElement.TryGetProperty("id", out _));
+            Assert.Equal("Running", doc.RootElement.GetProperty("status").GetString());
+
+            await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+            Assert.NotEmpty(subClient.ReceivedMessages);
+            var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+            Assert.Empty(dataContents);
+        }
+
+        [Fact]
+        public async Task ImagePaths_Null_Runs_SubAgent_Without_Image_Content()
+        {
+            var subClient = new OptionsCapturingClient("sub done");
+            var parent = new AgentOptions
+            {
+                WorkDirectory = Path.GetTempPath(),
+                EnableBash = false,
+                EnableSkills = false,
+                AutoLoadWorkspaceInstructions = false,
+            };
+            var subOptions = new SubAgentOptions { DefaultClient = subClient };
+            parent.SubAgents = subOptions;
+
+            await using var manager = CreateManager(subOptions, parent, subClient);
+            var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+            var json = await InvokeAsync(tools, "start_sub_agent",
+                new Dictionary<string, object?>
+                {
+                    ["task"] = "no images here",
+                    ["image_paths"] = null
+                });
+
+            using var doc = JsonDocument.Parse(json);
+            Assert.True(doc.RootElement.TryGetProperty("id", out _));
+            Assert.Equal("Running", doc.RootElement.GetProperty("status").GetString());
+
+            await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+            Assert.NotEmpty(subClient.ReceivedMessages);
+            var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+            Assert.Empty(dataContents);
+        }
+
+        // ========================================================================
+        // Tool description test
+        // ========================================================================
+
+        [Fact]
+        public async Task StartSubAgent_Tool_Description_Mentions_ImagePaths()
+        {
+            var subOptions = new SubAgentOptions { DefaultClient = new OptionsCapturingClient() };
+            await using var manager = CreateManager(subOptions);
+            var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+            var startTool = tools.OfType<AIFunction>().Single(f => f.Name == "start_sub_agent");
+            Assert.Contains("image_paths", startTool.Description);
+        }
     }
 }

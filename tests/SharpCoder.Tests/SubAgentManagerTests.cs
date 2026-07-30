@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
+using SharpCoder;
 using SharpCoder.SubAgents;
 
 namespace SharpCoder.Tests;
@@ -2836,5 +2837,237 @@ public class SubAgentManagerTests
         Assert.Equal(SubAgentStatus.Completed, status[0].Status);
         Assert.Equal("first-wins", status[0].Summary);
         Assert.Null(status[0].Error);
+    }
+
+    // ========================================================================
+    // 24. Sub-agent image validation tests
+    // ========================================================================
+
+    private static readonly byte[] TinyPngBytes =
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    private static ImageAttachment ValidImage(byte[]? data = null, string mediaType = "image/png") =>
+        new() { Data = data ?? TinyPngBytes, MediaType = mediaType, Name = "img.png" };
+
+    [Fact]
+    public async Task StartAsync_Images_Null_Entry_Returns_Failed_NotTracked()
+    {
+        await using var manager = CreateManager();
+        var info = await manager.StartAsync(
+            new SubAgentRequest
+            {
+                Task = "work",
+                Images = new List<ImageAttachment> { null! }
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.NotNull(info.Error);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Fact]
+    public async Task StartAsync_Images_Empty_Data_Returns_Failed_NotTracked()
+    {
+        await using var manager = CreateManager();
+        var info = await manager.StartAsync(
+            new SubAgentRequest
+            {
+                Task = "work",
+                Images = new List<ImageAttachment> { ValidImage(Array.Empty<byte>()) }
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.NotNull(info.Error);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task StartAsync_Images_Blank_MediaType_Returns_Failed_NotTracked(string mediaType)
+    {
+        await using var manager = CreateManager();
+        var info = await manager.StartAsync(
+            new SubAgentRequest
+            {
+                Task = "work",
+                Images = new List<ImageAttachment> { ValidImage(TinyPngBytes, mediaType) }
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.NotNull(info.Error);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Fact]
+    public async Task StartAsync_Images_Nine_Images_Returns_Failed_NotTracked()
+    {
+        var images = Enumerable.Range(0, 9)
+            .Select(_ => ValidImage())
+            .ToList();
+        await using var manager = CreateManager();
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Images = images },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.NotNull(info.Error);
+        Assert.Contains("8", info.Error);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Fact]
+    public async Task StartAsync_Images_Cumulative_Over_Limit_Returns_Failed_NotTracked()
+    {
+        // 10.5 MiB each, 2 entries = 21 MiB total, exceeds 20 MiB limit.
+        const int halfMiB = 1024 * 1024;
+        var big = new byte[10 * halfMiB + halfMiB / 2];
+        var images = new List<ImageAttachment>
+        {
+            ValidImage(big, "image/png"),
+            ValidImage(big, "image/png")
+        };
+        await using var manager = CreateManager();
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Images = images },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Failed, info.Status);
+        Assert.NotNull(info.Error);
+        Assert.Empty(manager.GetStatus());
+    }
+
+    [Fact]
+    public async Task StartAsync_Images_At_Limit_Eight_Images_Succeeds()
+    {
+        // Exactly 8 valid images — boundary acceptance.
+        var images = Enumerable.Range(0, 8)
+            .Select(_ => ValidImage())
+            .ToList();
+        var client = new CapturingClient("done");
+        await using var manager = CreateManager(parentClient: client);
+        var info = await manager.StartAsync(
+            new SubAgentRequest { Task = "work", Images = images },
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(string.Empty, info.Id);
+        Assert.Equal(SubAgentStatus.Running, info.Status);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+    }
+
+    // ========================================================================
+    // 25. Deep-snapshot tests for image data
+    // ========================================================================
+
+    [Fact]
+    public async Task StartAsync_Images_DeepSnapshot_Mutation_After_Start_Does_Not_Affect_Run()
+    {
+        // The runner is suspended at the very FIRST instruction of its background task —
+        // before any per-run image consumption (CodingAgent.BuildUserMessage enumerates
+        // the images and creates DataContent later). Mutating the caller's collection,
+        // its entries and their byte arrays while the runner is parked here therefore
+        // proves the snapshot was taken at StartAsync acceptance time, not lazily by the
+        // runner.
+        var runnerGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runnerEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var clientGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new GateFirstCapturingClient(clientGate, "done");
+        await using var manager = CreateManager(parentClient: client);
+        manager.OnSubAgentRunStarting = () =>
+        {
+            runnerEntered.TrySetResult(true);
+            runnerGate.Task.GetAwaiter().GetResult();
+        };
+
+        var originalBytes = (byte[])TinyPngBytes.Clone();
+        var attachment = ValidImage(originalBytes);
+        var images = new List<ImageAttachment> { attachment };
+
+        var request = new SubAgentRequest { Task = "describe image", Images = images };
+        var info = await manager.StartAsync(request, TestContext.Current.CancellationToken);
+
+        try
+        {
+            // Wait until the runner is definitely suspended before mutating anything.
+            await runnerEntered.Task;
+
+            // Mutate every object the caller still holds a reference to:
+            // the list, its entries, the attachment's fields and the source bytes.
+            // Adding grows a shared list; mutating the attachment corrupts a shallow
+            // element copy; mutating originalBytes corrupts a missing byte[] clone.
+            images.Add(ValidImage([0x01, 0x02], "image/mutated"));
+            attachment.Data = [0xAA, 0xBB, 0xCC];
+            attachment.MediaType = "image/mutated";
+            attachment.Name = "mutated.png";
+            originalBytes[0] = 0xFF;
+            originalBytes[1] = 0xEE;
+
+            // Replace the request's collection outright too.
+            request.Images = new List<ImageAttachment>
+            {
+                ValidImage([0x01, 0x02], "image/mutated"),
+                ValidImage([0x03, 0x04], "image/mutated")
+            };
+        }
+        finally
+        {
+            // Always release both gates so a failed assertion cannot hang disposal.
+            runnerGate.TrySetResult(true);
+            clientGate.TrySetResult(true);
+        }
+
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(client.ReceivedMessages);
+        var userMsg = client.ReceivedMessages[0]
+            .First(m => m.Role == ChatRole.User);
+        var dataContents = userMsg.Contents.OfType<DataContent>().ToList();
+        // Only the single original image should be present — list mutation ignored.
+        Assert.Single(dataContents);
+        Assert.Equal("image/png", dataContents[0].MediaType);
+        var capturedBytes = dataContents[0].Data.ToArray();
+        Assert.Equal(TinyPngBytes, capturedBytes);
+    }
+
+    // ========================================================================
+    // 26. Agent-execution test: ExecuteAsync receives images
+    // ========================================================================
+
+    [Fact]
+    public async Task StartAsync_Images_Passed_To_ExecuteAsync_As_DataContent()
+    {
+        var client = new CapturingClient("done");
+        await using var manager = CreateManager(parentClient: client);
+
+        var imgA = new ImageAttachment { Data = [1, 2, 3], MediaType = "image/png", Name = "a.png" };
+        var imgB = new ImageAttachment { Data = [4, 5, 6], MediaType = "image/jpeg", Name = "b.jpg" };
+
+        var info = await manager.StartAsync(
+            new SubAgentRequest
+            {
+                Task = "describe these",
+                Images = new List<ImageAttachment> { imgA, imgB }
+            },
+            TestContext.Current.CancellationToken);
+        await manager.AwaitAsync(new[] { info.Id }, TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(client.ReceivedMessages);
+        var userMsg = client.ReceivedMessages[0]
+            .First(m => m.Role == ChatRole.User);
+        var dataContents = userMsg.Contents.OfType<DataContent>().ToList();
+        Assert.Equal(2, dataContents.Count);
+        Assert.Equal([1, 2, 3], dataContents[0].Data.ToArray());
+        Assert.Equal("image/png", dataContents[0].MediaType);
+        Assert.Equal([4, 5, 6], dataContents[1].Data.ToArray());
+        Assert.Equal("image/jpeg", dataContents[1].MediaType);
     }
 }

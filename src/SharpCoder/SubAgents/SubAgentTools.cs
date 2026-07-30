@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
+using SharpCoder.Tools;
 
 namespace SharpCoder.SubAgents;
 
@@ -21,7 +22,8 @@ internal static class SubAgentTools
         "default and can never exceed your own tool capabilities (bash, file writes). If the concurrency limit is " +
         "reached, this call blocks until a slot frees. Cancelling the current execution aborts the slot wait. Only a " +
         "summary returns later via await_sub_agents. Use list_sub_agent_models to see valid model IDs. File ops and " +
-        "skills are governed by manager defaults, not LLM-controllable arguments.";
+        "skills are governed by manager defaults, not LLM-controllable arguments. Optionally pass image_paths (array " +
+        "of repo-relative file paths to image/PDF files) to hand visual content to a vision-capable sub-agent model.";
 
     private const string AwaitDescription =
         "Block until all (or the specified) sub-agents finish, then return their results as a JSON array. Each item " +
@@ -48,7 +50,8 @@ internal static class SubAgentTools
             string? system_prompt = null,
             bool? enable_bash = null,
             bool? enable_file_writes = null,
-            int? timeout_seconds = null)
+            int? timeout_seconds = null,
+            string[]? image_paths = null)
         {
             SubAgentInfo info;
             try
@@ -62,6 +65,22 @@ internal static class SubAgentTools
                     EnableFileWrites = enable_file_writes,
                     Timeout = timeout_seconds.HasValue ? TimeSpan.FromSeconds(timeout_seconds.Value) : null
                 };
+
+                if (image_paths is { Length: > 0 } paths)
+                {
+                    var loadResult = await ImageLoader.LoadAsync(manager.WorkDirectory, paths, executionCt).ConfigureAwait(false);
+                    if (!loadResult.Success)
+                    {
+                        return WriteJson(w =>
+                        {
+                            w.WriteStartObject();
+                            w.WriteString("error", loadResult.Error ?? "Failed to load image paths.");
+                            w.WriteEndObject();
+                        });
+                    }
+                    request.Images = loadResult.Attachments;
+                }
+
                 info = await manager.StartAsync(request, executionCt).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -177,7 +196,7 @@ internal static class SubAgentTools
         return new List<AITool>
         {
             AIFunctionFactory.Create(
-                (Func<string, string?, string?, bool?, bool?, int?, Task<string>>)StartSubAgentAsync,
+                (Func<string, string?, string?, bool?, bool?, int?, string[]?, Task<string>>)StartSubAgentAsync,
                 "start_sub_agent",
                 StartDescription),
             AIFunctionFactory.Create(
