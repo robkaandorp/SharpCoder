@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.15.0]
+
+### Added
+
+- **Vision/image support** — `CodingAgent` gains image-capable `ExecuteAsync` and `ExecuteStreamingAsync` overloads accepting `IReadOnlyList<ImageAttachment>?`. The user message is sent as `TextContent` plus one `DataContent` per image. New public `ImageAttachment` type with `Data byte[]`, `MediaType string`, and `Name string?`. Existing string-only entry points delegate to the new overload with `images: null`, so this is non-breaking.
+- **Sub-agent image hand-off** — `start_sub_agent` gains an optional `image_paths` parameter (`string[]?` array of repo-relative paths). Files are resolved within the working directory via the shared `PathSafety` resolver, loaded by `ImageLoader`, and validated against count/size limits (max 8 images / 20 MiB cumulative). Media types are inferred from extension: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.pdf`. This lets a text-only parent agent delegate image or PDF analysis to a vision-capable sub-agent model. New `SubAgentRequest.Images` property carries the attachments; `SubAgentManager` deep-copies them into the immutable per-run `RunSpec` snapshot.
+- **Internal infrastructure** — Shared `PathSafety` lexical path resolver (boundary-safe, platform-correct) now also used by `FileTools.glob`. New bounded `ImageLoader` with race-safe reads and work-directory containment.
+- **Token accounting** — `AgentSession.EstimatedContextTokens` now adds a flat per-image estimate (`ImageTokenEstimate = 1500`) for every `DataContent` whose `MediaType` starts with `image/` or equals `application/pdf`, after the existing `chars / 4` text heuristic.
+
+### Note
+
+- Image attachments are NOT persisted across `AgentSession.Fork()` or `AgentSession.SaveAsync/LoadAsync`. Only text-based `ChatMessage` history is preserved; visual content must be re-supplied on each turn that needs it.
+
 ## [0.14.0]
 
 ### Added
