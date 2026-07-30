@@ -143,6 +143,18 @@ await agent.DisposeAsync();
 
 Sub-agents can never exceed the parent agent's enabled capabilities (bash, file ops, file writes, skills). LLM-supplied overrides are clamped by the parent's flags, snapshotted at manager creation. Sub-agents run read-only by default.
 
+### Observing sub-agent progress
+
+Subscribe to `agent.SubAgentChanged` before calling `ExecuteAsync` to catch all events — the sub-agent manager is created lazily inside `BuildChatOptions` at the start of each execution call (before any sub-agent is started), and the agent-level event forwards to the manager's event at creation time. Two notifications fire per accepted run (start + terminal). The payload is a detached `SubAgentInfo` snapshot safe to read from any thread; a fresh instance is passed to each handler. Handlers are invoked synchronously in registration order; a throwing handler is caught and logged without affecting other handlers.
+
+```csharp
+agent.SubAgentChanged += info =>
+{
+    Console.WriteLine($"Sub-agent {info.Id}: {info.Status}");
+    // info.Status is Running, Completed, Failed, TimedOut, or Cancelled
+};
+```
+
 Sub-agents cannot spawn their own sub-agents. This flat-design limitation is planned for a future release.
 
 ## Streaming

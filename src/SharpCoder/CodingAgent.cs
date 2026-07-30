@@ -86,10 +86,19 @@ public sealed class CodingAgent : IAsyncDisposable
 
             _subAgentSnapshot = snapshot;
             _subAgentManager = new SubAgentManager(snapshot, _client, _options, _logger);
+            _subAgentManager.SubAgentChanged += OnSubAgentChanged;
             Interlocked.Increment(ref _subAgentManagerCreateCount);
             return _subAgentManager;
         }
     }
+
+    /// <summary>
+    /// Raised for every sub-agent lifecycle transition on this agent's sub-session manager,
+    /// equivalent to <see cref="SubAgentManager.SubAgentChanged"/>. Subscribe here to observe
+    /// sub-agents from the very first Running event without accessing the manager (created lazily;
+    /// <see cref="ActiveSubAgentManager"/> may still be null).
+    /// </summary>
+    public event Action<SubAgentInfo>? SubAgentChanged;
 
     /// <summary>
     /// The shared sub-agent manager, when one has been created; otherwise null.
@@ -116,7 +125,12 @@ public sealed class CodingAgent : IAsyncDisposable
         }
 
         if (managerToDispose is not null)
+        {
             await managerToDispose.DisposeAsync().ConfigureAwait(false);
+            // Unsubscribe only AFTER disposal completes so disposal-triggered
+            // Cancelled terminal events are still forwarded to agent-level subscribers.
+            managerToDispose.SubAgentChanged -= OnSubAgentChanged;
+        }
     }
 
     public CodingAgent(IChatClient client, AgentOptions options)
@@ -128,6 +142,36 @@ public sealed class CodingAgent : IAsyncDisposable
 
         if (SubAgentsEffectivelyEnabled)
             ThrowOnReservedToolNames(options.CustomTools);
+    }
+
+    private void OnSubAgentChanged(SubAgentInfo info)
+    {
+        var handlers = SubAgentChanged?.GetInvocationList();
+        if (handlers is null || handlers.Length == 0) return;
+        foreach (var handler in handlers)
+        {
+            var fresh = new SubAgentInfo
+            {
+                Id = info.Id,
+                Task = info.Task,
+                Status = info.Status,
+                StartedAt = info.StartedAt,
+                CompletedAt = info.CompletedAt,
+                Model = info.Model,
+                Summary = info.Summary,
+                Error = info.Error,
+                InputTokens = info.InputTokens,
+                OutputTokens = info.OutputTokens
+            };
+            try
+            {
+                ((Action<SubAgentInfo>)handler)(fresh);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "CodingAgent.SubAgentChanged handler threw an exception.");
+            }
+        }
     }
 
     /// <summary>

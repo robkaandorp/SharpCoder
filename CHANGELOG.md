@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.14.0]
+
+### Added
+
+- **Sub-agent lifecycle events** — `SubAgentManager.SubAgentChanged` and agent-level `CodingAgent.SubAgentChanged`. Fire once when a sub-agent starts (`SubAgentStatus.Running`) and once when it reaches a terminal status (`Completed`, `Failed`, `TimedOut`, or `Cancelled`). The payload is a detached `SubAgentInfo` snapshot — the manager does NOT mutate it after emission, and a FRESH instance is passed to EACH handler, so handlers can safely read it from any thread and their mutations are isolated. Handlers are invoked synchronously in registration order; a throwing handler is caught and logged without affecting other handlers or the manager. No event fires for validation failures. The agent-level event lets hosts subscribe before the first `Running` event — the manager is created lazily inside `BuildChatOptions` (invoked at the start of each `ExecuteAsync`/`ExecuteStreamingAsync` call), and `CodingAgent.SubAgentChanged` forwards to the manager's event via method-group subscription at manager creation time (`ActiveSubAgentManager` may still be null when subscribing).
+
 ## [0.13.1]
 
 ### Fixed

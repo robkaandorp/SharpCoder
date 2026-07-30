@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 using SharpCoder;
+using SharpCoder.SubAgents;
 
 namespace SharpCoder.Tests;
 
@@ -1129,5 +1131,380 @@ public class CodingAgentTests
 
         Assert.Equal(2, client.CallCount);
         Assert.Equal(15_000, session.LastKnownContextTokens);
+    }
+
+    // ── SubAgentChanged agent-level forwarding tests ──
+
+    /// <summary>
+    /// Parent options with sub-agents enabled and a real model catalog, so the
+    /// sub-agent runs on a dedicated factory client and the emitted Model is meaningful.
+    /// </summary>
+    private static AgentOptions SubAgentEnabledOptions(Func<string, IChatClient> clientFactory)
+    {
+        var subOptions = new SubAgentOptions();
+        subOptions.AvailableModels.Add(new SubAgentModelInfo("sub-model"));
+        subOptions.ClientFactory = clientFactory;
+        return new AgentOptions
+        {
+            WorkDirectory = Path.GetTempPath(),
+            EnableBash = false,
+            EnableFileOps = false,
+            EnableSkills = false,
+            AutoLoadWorkspaceInstructions = false,
+            SystemPrompt = "You are a test agent.",
+            SubAgents = subOptions
+        };
+    }
+
+    /// <summary>
+    /// Thread-safe, deterministically awaitable collector for agent-level
+    /// <c>SubAgentChanged</c> notifications. The forwarding handler runs on the sub-agent
+    /// runner thread while the test thread asserts, and terminal events are raised AFTER
+    /// awaiters are signalled — so tests must await delivery rather than assume it.
+    /// </summary>
+    private sealed class AgentEventCollector
+    {
+        private readonly ConcurrentQueue<SubAgentInfo> _events = new();
+        private readonly object _sync = new();
+        private readonly List<(int Count, TaskCompletionSource<bool> Signal)> _waiters = new();
+        private int _count;
+
+        public void Handle(SubAgentInfo info)
+        {
+            _events.Enqueue(info);
+            var reached = Interlocked.Increment(ref _count);
+
+            List<TaskCompletionSource<bool>>? toSignal = null;
+            lock (_sync)
+            {
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    if (_waiters[i].Count <= reached)
+                    {
+                        (toSignal ??= new List<TaskCompletionSource<bool>>()).Add(_waiters[i].Signal);
+                        _waiters.RemoveAt(i);
+                    }
+                }
+            }
+
+            if (toSignal is null) return;
+            foreach (var signal in toSignal)
+                signal.TrySetResult(true);
+        }
+
+        public int Count => Volatile.Read(ref _count);
+
+        public IReadOnlyList<SubAgentInfo> Events => _events.ToArray();
+
+        public async Task WaitForCountAsync(int count)
+        {
+            TaskCompletionSource<bool> signal;
+            lock (_sync)
+            {
+                if (Volatile.Read(ref _count) >= count) return;
+                signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waiters.Add((count, signal));
+            }
+
+            var finished = await Task.WhenAny(signal.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+            Assert.True(ReferenceEquals(finished, signal.Task),
+                $"Timed out waiting for {count} agent-level SubAgentChanged event(s); only {Count} arrived.");
+        }
+
+        public async Task AssertNoMoreThanAsync(int expected)
+        {
+            await Task.Delay(250);
+            Assert.Equal(expected, Count);
+        }
+    }
+
+    /// <summary>
+    /// Parent chat client that drives the agent through the REAL sub-agent tool path:
+    /// round 1 issues a <c>start_sub_agent</c> call, round 2 issues <c>await_sub_agents</c>,
+    /// round 3 returns final text. This exercises lazy manager creation plus tool
+    /// construction/invocation instead of poking at internals via reflection.
+    /// </summary>
+    private sealed class SubAgentToolDrivingClient : IChatClient
+    {
+        private readonly string[] _toolSequence;
+        private readonly string _finalText;
+        private readonly Dictionary<string, object?> _startArgs;
+        private int _round;
+
+        /// <summary>Signalled once the parent has issued the start_sub_agent call.</summary>
+        public TaskCompletionSource<bool> StartCallIssued { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public SubAgentToolDrivingClient(
+            Dictionary<string, object?> startArgs,
+            string[]? toolSequence = null,
+            string finalText = "parent done")
+        {
+            _startArgs = startArgs;
+            _toolSequence = toolSequence ?? ["start_sub_agent", "await_sub_agents"];
+            _finalText = finalText;
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            _ = messages.ToList();
+            var index = _round++;
+
+            if (index < _toolSequence.Length)
+            {
+                var name = _toolSequence[index];
+                var args = name == "start_sub_agent"
+                    ? _startArgs
+                    : new Dictionary<string, object?>();
+
+                if (name == "start_sub_agent")
+                    StartCallIssued.TrySetResult(true);
+
+                var msg = new ChatMessage(ChatRole.Assistant,
+                    new AIContent[] { new FunctionCallContent("call_" + index, name, args) });
+                return Task.FromResult(new ChatResponse(msg) { FinishReason = ChatFinishReason.ToolCalls });
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, _finalText))
+            {
+                FinishReason = ChatFinishReason.Stop
+            });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Sub-agent chat client that never completes until a gate is set, so a sub-agent
+    /// stays Running while the parent agent is disposed.
+    /// </summary>
+    private sealed class GatedResponseClient : IChatClient
+    {
+        private readonly TaskCompletionSource<bool> _gate;
+
+        /// <summary>Signalled once the sub-agent has actually entered the client call.</summary>
+        public TaskCompletionSource<bool> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public GatedResponseClient(TaskCompletionSource<bool> gate) => _gate = gate;
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            Entered.TrySetResult(true);
+            var cancelTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (cancellationToken.Register(() => cancelTcs.TrySetResult(true)))
+            {
+                var finished = await Task.WhenAny(_gate.Task, cancelTcs.Task).ConfigureAwait(false);
+                if (ReferenceEquals(finished, cancelTcs.Task))
+                    throw new OperationCanceledException(cancellationToken);
+            }
+
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, "Done."));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public async Task Agent_SubAgentChanged_Receives_First_Running_Event_Via_Tool_Path()
+    {
+        // Drives the sub-agent through the agent's registered start_sub_agent tool so the
+        // real lazy-creation + tool-construction path must wire forwarding BEFORE the first
+        // Running event. A regression there would leave the collector empty.
+        var subClient = new FixedResponseClient("sub summary");
+        var options = SubAgentEnabledOptions(_ => subClient);
+        var parentClient = new SubAgentToolDrivingClient(
+            new Dictionary<string, object?> { ["task"] = "analyze the repo", ["model"] = "sub-model" });
+
+        await using var agent = new CodingAgent(parentClient, options);
+
+        // Subscribed BEFORE any execution — the manager does not exist yet.
+        var collector = new AgentEventCollector();
+        agent.SubAgentChanged += collector.Handle;
+        Assert.Null(agent.ActiveSubAgentManager);
+
+        var result = await agent.ExecuteAsync("delegate the work", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Success", result.Status);
+        Assert.True(parentClient.StartCallIssued.Task.IsCompleted,
+            "The parent client must have issued the start_sub_agent tool call.");
+
+        // Running + terminal, both forwarded through the agent-level event.
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        var running = events[0];
+        Assert.Equal(SubAgentStatus.Running, running.Status);
+        Assert.Equal("analyze the repo", running.Task);
+        Assert.Equal("sub-model", running.Model);
+        Assert.False(string.IsNullOrEmpty(running.Id));
+        Assert.Null(running.CompletedAt);
+
+        // The manager was created lazily by the tool path, not up front.
+        Assert.NotNull(agent.ActiveSubAgentManager);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task Agent_SubAgentChanged_Forwards_Terminal_Event_Via_Tool_Path()
+    {
+        var subClient = new FixedResponseClient("all done");
+        var options = SubAgentEnabledOptions(_ => subClient);
+        var parentClient = new SubAgentToolDrivingClient(
+            new Dictionary<string, object?> { ["task"] = "work", ["model"] = "sub-model" });
+
+        await using var agent = new CodingAgent(parentClient, options);
+        var collector = new AgentEventCollector();
+        agent.SubAgentChanged += collector.Handle;
+
+        await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+
+        var terminal = events[1];
+        Assert.Equal(SubAgentStatus.Completed, terminal.Status);
+        Assert.Equal("all done", terminal.Summary);
+        Assert.Equal(events[0].Id, terminal.Id);
+        Assert.Equal("sub-model", terminal.Model);
+        Assert.NotNull(terminal.CompletedAt);
+        Assert.Null(terminal.Error);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task Agent_SubAgentChanged_Per_Handler_Payload_Is_Isolated()
+    {
+        var subClient = new FixedResponseClient("sub summary");
+        var options = SubAgentEnabledOptions(_ => subClient);
+        var parentClient = new SubAgentToolDrivingClient(
+            new Dictionary<string, object?> { ["task"] = "work", ["model"] = "sub-model" });
+
+        await using var agent = new CodingAgent(parentClient, options);
+
+        var collectorA = new AgentEventCollector();
+        var collectorB = new AgentEventCollector();
+        agent.SubAgentChanged += collectorA.Handle;
+        agent.SubAgentChanged += collectorB.Handle;
+
+        await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+        await collectorA.WaitForCountAsync(2);
+        await collectorB.WaitForCountAsync(2);
+
+        var a = collectorA.Events[0];
+        var b = collectorB.Events[0];
+        Assert.NotSame(a, b);
+        Assert.Equal(a.Id, b.Id);
+        Assert.Null(b.Summary);
+
+        // Mutating one agent-level subscriber's copy must not affect the other's.
+        a.Summary = "mutated";
+        Assert.Null(b.Summary);
+        Assert.NotEqual("mutated", b.Summary);
+
+        // Terminal payloads are distinct instances as well.
+        Assert.NotSame(collectorA.Events[1], collectorB.Events[1]);
+        collectorA.Events[1].Error = "mutated-error";
+        Assert.Null(collectorB.Events[1].Error);
+    }
+
+    [Fact]
+    public async Task Agent_SubAgentChanged_Throwing_Handler_Does_Not_Break_Others()
+    {
+        var subClient = new FixedResponseClient("sub summary");
+        var options = SubAgentEnabledOptions(_ => subClient);
+        var parentClient = new SubAgentToolDrivingClient(
+            new Dictionary<string, object?> { ["task"] = "work", ["model"] = "sub-model" });
+
+        await using var agent = new CodingAgent(parentClient, options);
+
+        var throwCount = 0;
+        var collector = new AgentEventCollector();
+        agent.SubAgentChanged += _ =>
+        {
+            Interlocked.Increment(ref throwCount);
+            throw new InvalidOperationException("agent handler boom");
+        };
+        agent.SubAgentChanged += collector.Handle;
+
+        await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+        await collector.WaitForCountAsync(2);
+
+        // The throwing branch ran for both transitions...
+        Assert.Equal(2, Volatile.Read(ref throwCount));
+        // ...and the healthy subscriber still received both.
+        var events = collector.Events;
+        Assert.Equal(SubAgentStatus.Running, events[0].Status);
+        Assert.Equal(SubAgentStatus.Completed, events[1].Status);
+
+        await collector.AssertNoMoreThanAsync(2);
+    }
+
+    [Fact]
+    public async Task Agent_SubAgentChanged_Disposal_Delivers_Cancelled()
+    {
+        // The sub-agent is gated so it is provably still Running when the agent is disposed.
+        // CodingAgent.DisposeAsync unsubscribes only AFTER the manager's disposal completes,
+        // so the disposal-triggered Cancelled event must still reach agent-level subscribers.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subClient = new GatedResponseClient(gate);
+        var options = SubAgentEnabledOptions(_ => subClient);
+        // Only start the sub-agent — never await it, so it is still running at disposal.
+        var parentClient = new SubAgentToolDrivingClient(
+            new Dictionary<string, object?> { ["task"] = "long work", ["model"] = "sub-model" },
+            toolSequence: ["start_sub_agent"]);
+
+        var agent = new CodingAgent(parentClient, options);
+        var collector = new AgentEventCollector();
+        agent.SubAgentChanged += collector.Handle;
+
+        try
+        {
+            await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+
+            // Running has been forwarded and the sub-agent is genuinely in flight.
+            await collector.WaitForCountAsync(1);
+            Assert.Equal(SubAgentStatus.Running, collector.Events[0].Status);
+            await subClient.Entered.Task;
+            Assert.Equal(1, collector.Count);
+        }
+        finally
+        {
+            // Disposing the agent disposes the manager it owns; never dispose the
+            // manager directly (ActiveSubAgentManager is inspection-only).
+            await agent.DisposeAsync();
+            gate.TrySetResult(true);
+        }
+
+        await collector.WaitForCountAsync(2);
+        var terminal = collector.Events[1];
+        Assert.Equal(SubAgentStatus.Cancelled, terminal.Status);
+        Assert.Equal(collector.Events[0].Id, terminal.Id);
+        Assert.NotNull(terminal.CompletedAt);
+
+        await collector.AssertNoMoreThanAsync(2);
     }
 }
