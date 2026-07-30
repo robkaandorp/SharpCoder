@@ -607,4 +607,92 @@ public class AgentSessionTests
             if (File.Exists(path)) File.Delete(path);
         }
     }
+
+    // ── EstimatedContextTokens image/PDF token estimate tests ──
+
+    /// <summary>
+    /// The per-image flat token estimate constant used by <see cref="AgentSession"/>.
+    /// </summary>
+    private const long ImageTokenEstimate = 1500;
+
+    [Fact]
+    public void EstimatedContextTokens_WithImage_AddsFlatPerImageTokenEstimate()
+    {
+        var session = AgentSession.Create();
+
+        // 400-char text message → 100 text tokens.
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, new string('x', 400)));
+
+        // A message with TextContent("hello") + one image DataContent.
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        [
+            new TextContent("hello"),
+            new DataContent(new byte[] { 1, 2, 3 }, "image/png"),
+        ]));
+
+        // Total chars = 400 + 5 ("hello") = 405 → 405 / 4 = 101 (integer division).
+        // Plus 1 image × 1500 = 1500.
+        Assert.Equal(101 + ImageTokenEstimate, session.EstimatedContextTokens);
+    }
+
+    [Fact]
+    public void EstimatedContextTokens_WithPdf_AddsFlatPerImageTokenEstimate()
+    {
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, new string('x', 400)));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        [
+            new TextContent("hello"),
+            new DataContent(new byte[] { 1, 2, 3 }, "application/pdf"),
+        ]));
+
+        // PDF counts as an image for the flat token estimate.
+        Assert.Equal(101 + ImageTokenEstimate, session.EstimatedContextTokens);
+    }
+
+    [Fact]
+    public void EstimatedContextTokens_WithNonImageDataContent_DoesNotAddImageTokens()
+    {
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, new string('x', 400)));
+        // audio/wav is NOT image/* or application/pdf — must not add image tokens.
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        [
+            new TextContent("hello"),
+            new DataContent(new byte[] { 1, 2, 3 }, "audio/wav"),
+        ]));
+
+        // Only text tokens: 405 / 4 = 101, no image cost.
+        Assert.Equal(101, session.EstimatedContextTokens);
+    }
+
+    [Fact]
+    public void EstimatedContextTokens_TextOnly_UnchangedByImageEstimate()
+    {
+        var session = AgentSession.Create();
+
+        // 400 chars → 100 tokens, no images.
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, new string('x', 400)));
+
+        Assert.Equal(100, session.EstimatedContextTokens);
+    }
+
+    [Fact]
+    public void EstimatedContextTokens_MultipleImages_AddsPerImageFlatCost()
+    {
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        [
+            new TextContent("hi"), // 2 chars
+            new DataContent(new byte[] { 1 }, "image/png"),
+            new DataContent(new byte[] { 2 }, "image/jpeg"),
+            new DataContent(new byte[] { 3 }, "application/pdf"),
+        ]));
+
+        // 2 chars / 4 = 0 (integer division) + 3 images × 1500 = 4500.
+        Assert.Equal(3 * ImageTokenEstimate, session.EstimatedContextTokens);
+    }
 }
