@@ -23,16 +23,8 @@ public sealed class FileTools
 
     private string GetFullPath(string path)
     {
-        var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(_workingDirectory, path));
-        var root = Path.GetFullPath(_workingDirectory) + Path.DirectorySeparatorChar;
-
-        if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(fullPath, Path.GetFullPath(_workingDirectory), StringComparison.OrdinalIgnoreCase))
-        {
-            throw new UnauthorizedAccessException($"Path '{path}' escapes the work directory.");
-        }
-
-        return fullPath;
+        return PathSafety.ResolveWithinRoot(_workingDirectory, path)
+            ?? throw new UnauthorizedAccessException($"Path '{path}' escapes the work directory.");
     }
 
     [Description("Read a file from the local filesystem. Returns contents with each line prefixed by its line number. Use offset to read specific sections.")]
@@ -213,10 +205,8 @@ public sealed class FileTools
                 }
             }
 
-            // Security: ensure search root is within working directory
-            var rootFull = Path.GetFullPath(searchRoot);
-            var wdFull = Path.GetFullPath(_workingDirectory);
-            if (!rootFull.StartsWith(wdFull, StringComparison.OrdinalIgnoreCase))
+            // Security: ensure search root is within working directory (boundary-safe, platform-correct)
+            if (PathSafety.ResolveWithinRoot(_workingDirectory, searchRoot) is null)
             {
                 return $"Error: Pattern '{pattern}' resolves outside the work directory.";
             }

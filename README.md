@@ -87,6 +87,40 @@ Forked sessions get a new session ID, zeroed token counters, and fresh timestamp
 
 Sessions track cumulative token usage, tool call counts, and exact context size from the most recent API response.
 
+### Passing images directly to ExecuteAsync
+
+You can also attach images directly to any turn when your own code loads or captures them. Pass an `IReadOnlyList<ImageAttachment>` to the image-capable `ExecuteAsync` or `ExecuteStreamingAsync` overload. The user message is sent as `TextContent` plus one `DataContent` per attachment. Callers must set `ImageAttachment.MediaType` explicitly (for example `"image/png"`, `"image/jpeg"`, `"application/pdf"`); there is no automatic inference from file extension for direct attachments.
+
+```csharp
+using Microsoft.Extensions.AI;
+using SharpCoder;
+
+IChatClient chatClient = new OllamaChatClient("http://localhost:11434", "llama3.2-vision");
+var agent = new CodingAgent(chatClient, new AgentOptions
+{
+    WorkDirectory = "/path/to/project",
+    MaxSteps = 15
+});
+
+string path = "screenshot.png";
+byte[] screenshotBytes = await File.ReadAllBytesAsync(path);
+
+var images = new List<ImageAttachment>
+{
+    new ImageAttachment
+    {
+        Data = screenshotBytes,
+        MediaType = "image/png",
+        Name = path
+    }
+};
+
+var result = await agent.ExecuteAsync("What does this screenshot show?", images, CancellationToken.None);
+Console.WriteLine(result.Message);
+```
+
+Images count toward `AgentSession.EstimatedContextTokens` with a flat per-attachment estimate. Image attachments are not persisted across `AgentSession.SaveAsync`/`LoadAsync` or `Fork()`.
+
 ## Sub-agents
 
 Delegate self-contained subtasks — codebase analysis, large-text summarization, and parallel research — to background sub-sessions. Only their summaries and status metadata return to the main session, never full transcripts.
@@ -156,6 +190,39 @@ agent.SubAgentChanged += info =>
 ```
 
 Sub-agents cannot spawn their own sub-agents. This flat-design limitation is planned for a future release.
+
+### Handing images to a vision sub-agent
+
+A parent agent that does not itself need vision can still delegate image or PDF analysis to a vision-capable sub-agent. Use `start_sub_agent` with the `image_paths` argument and configure the sub-agent with a vision-capable model. Paths are repo-relative to `WorkDirectory` and are confined by the same path-safety rules as file tools.
+
+```csharp
+var agent = new CodingAgent(mainClient, new AgentOptions
+{
+    WorkDirectory = "/path/to/project",
+    MaxSteps = 25,
+    SubAgents = new SubAgentOptions
+    {
+        MaxConcurrentSubAgents = 4,
+        DefaultTimeout = TimeSpan.FromMinutes(10),
+        MaxTimeout = TimeSpan.FromMinutes(30),
+        MaxSummaryChars = 8_000,
+        AvailableModels =
+        {
+            new SubAgentModelInfo("llama3.2-vision", "Vision-capable analyzer", 128_000)
+        },
+        ClientFactory = modelId => new OllamaChatClient("http://localhost:11434", modelId)
+    }
+});
+
+// The LLM can call:
+// start_sub_agent(
+//     task: "Describe this UI screenshot and suggest accessibility fixes",
+//     model: "llama3.2-vision",
+//     image_paths: new[] { "docs/screenshots/homepage.png" })
+//
+// Only the summary returns to the parent session; the full image transcript
+// never enters the main conversation.
+```
 
 ## Streaming
 

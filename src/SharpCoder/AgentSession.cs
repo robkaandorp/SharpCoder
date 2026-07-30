@@ -47,6 +47,12 @@ public sealed class AgentSession
     public long LastKnownContextTokens { get; set; }
 
     /// <summary>
+    /// Flat per-image token estimate added to the text-based estimate.
+    /// Heuristic: images consume roughly 1500 tokens regardless of size.
+    /// </summary>
+    internal const long ImageTokenEstimate = 1500;
+
+    /// <summary>
     /// Estimated token count of the current message history.
     /// Uses a rough heuristic (~4 chars per token).
     /// </summary>
@@ -55,6 +61,7 @@ public sealed class AgentSession
         get
         {
             long chars = 0;
+            long imageCount = 0;
             foreach (var msg in MessageHistory)
             {
                 foreach (var content in msg.Contents)
@@ -65,9 +72,16 @@ public sealed class AgentSession
                         chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
                     else if (content is FunctionResultContent fr)
                         chars += EstimateResultLength(fr);
+                    else if (content is DataContent dc)
+                    {
+                        var mt = dc.MediaType ?? string.Empty;
+                        if (mt.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+                            mt.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
+                            imageCount++;
+                    }
                 }
             }
-            return chars / 4; // ~4 chars per token heuristic
+            return chars / 4 + imageCount * ImageTokenEstimate; // ~4 chars per token heuristic
         }
     }
 

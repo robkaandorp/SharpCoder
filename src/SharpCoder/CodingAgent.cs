@@ -182,14 +182,37 @@ public sealed class CodingAgent : IAsyncDisposable
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
-        return ExecuteAsync(null, taskDescription, ct);
+        return ExecuteAsync(null, taskDescription, images: null, ct);
+    }
+
+    /// <summary>
+    /// Execute a task as a single-turn (stateless) conversation with optional image attachments.
+    /// For multi-turn, use the overload that accepts an <see cref="AgentSession"/>.
+    /// </summary>
+    public Task<AgentResult> ExecuteAsync(string taskDescription, IReadOnlyList<ImageAttachment>? images, CancellationToken ct)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
+        return ExecuteAsync(null, taskDescription, images, ct);
     }
 
     /// <summary>
     /// Execute a task within a session, preserving conversation history across calls.
     /// Pass null for a stateless single-turn execution.
     /// </summary>
-    public async Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
+    public Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CodingAgent));
+        return ExecuteAsync(session, userMessage, images: null, ct);
+    }
+
+    /// <summary>
+    /// Execute a task within a session, preserving conversation history across calls,
+    /// with optional image attachments.
+    /// Pass null for a stateless single-turn execution.
+    /// </summary>
+    public async Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, IReadOnlyList<ImageAttachment>? images, CancellationToken ct)
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
@@ -206,7 +229,7 @@ public sealed class CodingAgent : IAsyncDisposable
             throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
 
-        var messages = BuildMessages(session, userMessage);
+        var messages = BuildMessages(session, userMessage, images);
 
         // Capture diagnostics before the LLM call so they're available even on failure
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
@@ -232,7 +255,7 @@ public sealed class CodingAgent : IAsyncDisposable
             // Update session with new messages and usage
             if (session != null)
             {
-                UpdateSession(session, userMessage, response, captureClient);
+                UpdateSession(session, userMessage, images, response, captureClient);
             }
 
             if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -270,10 +293,24 @@ public sealed class CodingAgent : IAsyncDisposable
     /// Execute a task with streaming, yielding incremental text updates as they arrive.
     /// The final update has <see cref="StreamingUpdateKind.Completed"/> with the full <see cref="AgentResult"/>.
     /// </summary>
+    public IAsyncEnumerable<StreamingUpdate> ExecuteStreamingAsync(
+        AgentSession? session,
+        string userMessage,
+        CancellationToken ct = default)
+    {
+        return ExecuteStreamingAsync(session, userMessage, images: null, ct);
+    }
+
+    /// <summary>
+    /// Execute a task with streaming, yielding incremental text updates as they arrive,
+    /// with optional image attachments.
+    /// The final update has <see cref="StreamingUpdateKind.Completed"/> with the full <see cref="AgentResult"/>.
+    /// </summary>
     public async IAsyncEnumerable<StreamingUpdate> ExecuteStreamingAsync(
         AgentSession? session,
         string userMessage,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        IReadOnlyList<ImageAttachment>? images,
+        [EnumeratorCancellation] CancellationToken ct)
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
@@ -288,7 +325,7 @@ public sealed class CodingAgent : IAsyncDisposable
         // so we can inject markdown-formatted tool call text at the right position.
         if (_options.ShowToolCallsInStream)
         {
-            await foreach (var update in StreamWithToolCallsAsync(session, userMessage, ct))
+            await foreach (var update in StreamWithToolCallsAsync(session, userMessage, images, ct))
                 yield return update;
             yield break;
         }
@@ -297,7 +334,7 @@ public sealed class CodingAgent : IAsyncDisposable
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
-        var messages = BuildMessages(session, userMessage);
+        var messages = BuildMessages(session, userMessage, images);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
         var updates = new List<ChatResponseUpdate>();
@@ -374,7 +411,7 @@ public sealed class CodingAgent : IAsyncDisposable
 
         if (session != null)
         {
-            UpdateSession(session, userMessage, response, captureClient);
+            UpdateSession(session, userMessage, images, response, captureClient);
         }
 
         if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -400,12 +437,13 @@ public sealed class CodingAgent : IAsyncDisposable
     private async IAsyncEnumerable<StreamingUpdate> StreamWithToolCallsAsync(
         AgentSession? session,
         string userMessage,
+        IReadOnlyList<ImageAttachment>? images,
         [EnumeratorCancellation] CancellationToken ct)
     {
         var chatOptions = BuildChatOptions(ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
-        var messages = BuildMessages(session, userMessage);
+        var messages = BuildMessages(session, userMessage, images);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
         var allResponseMessages = new List<ChatMessage>();
@@ -453,8 +491,7 @@ public sealed class CodingAgent : IAsyncDisposable
                     _logger.LogWarning(streamError, "Context overflow — compacting and retrying");
                     if (session != null && await _compactor.ForceCompactAsync(session, _options, ct))
                     {
-                        messages = BuildMessages(session, ""); // rebuild from compacted session
-                        messages.RemoveAt(messages.Count - 1); // remove the empty user message
+                        messages = BuildMessages(session, userMessage, images); // rebuild from compacted session
                         continue; // retry the round
                     }
                 }
@@ -711,7 +748,7 @@ public sealed class CodingAgent : IAsyncDisposable
         return (wrapped, capture);
     }
 
-    private List<ChatMessage> BuildMessages(AgentSession? session, string userMessage)
+    private List<ChatMessage> BuildMessages(AgentSession? session, string userMessage, IReadOnlyList<ImageAttachment>? images = null)
     {
         var messages = new List<ChatMessage>
         {
@@ -724,17 +761,36 @@ public sealed class CodingAgent : IAsyncDisposable
             messages.AddRange(session.MessageHistory);
         }
 
-        messages.Add(new ChatMessage(ChatRole.User, userMessage));
+        messages.Add(BuildUserMessage(userMessage, images));
         return messages;
     }
 
-    private void UpdateSession(AgentSession session, string userMessage, ChatResponse response,
-        UsageCapturingChatClient? captureClient = null)
+
+    private static ChatMessage BuildUserMessage(string userMessage, IReadOnlyList<ImageAttachment>? images)
+    {
+        if (images == null || images.Count == 0)
+            return new ChatMessage(ChatRole.User, userMessage);
+
+        var contents = new List<AIContent>(images.Count + 1)
+        {
+            new TextContent(userMessage)
+        };
+
+        foreach (var image in images)
+        {
+            contents.Add(new DataContent(image.Data, image.MediaType));
+        }
+
+        return new ChatMessage(ChatRole.User, contents);
+    }
+
+    private void UpdateSession(AgentSession session, string userMessage, IReadOnlyList<ImageAttachment>? images,
+        ChatResponse response, UsageCapturingChatClient? captureClient = null)
     {
         // Append the user message and all response messages to the existing history.
         // response.Messages contains assistant responses (and tool call/result messages
         // from the function invocation loop) but NOT the input messages we sent.
-        session.MessageHistory.Add(new ChatMessage(ChatRole.User, userMessage));
+        session.MessageHistory.Add(BuildUserMessage(userMessage, images));
         foreach (var msg in response.Messages)
         {
             if (msg.Role != ChatRole.System)

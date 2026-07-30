@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace SharpCoder.SubAgents;
 
@@ -30,4 +31,7 @@ public sealed class SubAgentRequest
 
     /// <summary>Optional per-sub-agent timeout; must be positive, clamped to <see cref="SubAgentOptions.MaxTimeout"/>.</summary>
     public TimeSpan? Timeout { get; set; }
+
+    /// <summary>Optional image/PDF attachments handed to the sub-agent's initial message.</summary>
+    public IReadOnlyList<ImageAttachment>? Images { get; set; }
 }
