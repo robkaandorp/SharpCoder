@@ -654,6 +654,74 @@ public class SubAgentToolsTests
             json);
     }
 
+    [Fact]
+    public async Task ListModels_Every_Model_Includes_SupportsVision_Property()
+    {
+        var options = new SubAgentOptions { DefaultClient = new OptionsCapturingClient() };
+        options.AvailableModels.Add(new SubAgentModelInfo("vision-model", "vision", 128_000, supportsVision: true));
+        options.AvailableModels.Add(new SubAgentModelInfo("text-model", "text", 8000, supportsVision: false));
+        options.AvailableModels.Add(new SubAgentModelInfo("plain")); // 3-param constructor
+        await using var manager = CreateManager(options);
+        var tools = SubAgentTools.BuildTools(manager, options, CancellationToken.None);
+
+        var json = await InvokeAsync(tools, "list_sub_agent_models");
+
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
+        Assert.Equal(3, doc.RootElement.GetArrayLength());
+        foreach (var element in doc.RootElement.EnumerateArray())
+        {
+            Assert.True(element.TryGetProperty("supports_vision", out var visionProp),
+                "Every model must include a supports_vision property.");
+            Assert.True(visionProp.ValueKind == JsonValueKind.True || visionProp.ValueKind == JsonValueKind.False,
+                "supports_vision must be a JSON boolean.");
+        }
+    }
+
+    [Fact]
+    public async Task ListModels_Vision_Marked_Model_Reports_True()
+    {
+        var options = new SubAgentOptions { DefaultClient = new OptionsCapturingClient() };
+        options.AvailableModels.Add(new SubAgentModelInfo("gpt-4o", "vision model", 128_000, supportsVision: true));
+        await using var manager = CreateManager(options);
+        var tools = SubAgentTools.BuildTools(manager, options, CancellationToken.None);
+
+        var json = await InvokeAsync(tools, "list_sub_agent_models");
+
+        using var doc = JsonDocument.Parse(json);
+        var element = doc.RootElement[0];
+        Assert.Equal("gpt-4o", element.GetProperty("id").GetString());
+        Assert.True(element.GetProperty("supports_vision").GetBoolean());
+    }
+
+    [Fact]
+    public async Task ListModels_Non_Vision_Models_Report_False()
+    {
+        var options = new SubAgentOptions { DefaultClient = new OptionsCapturingClient() };
+        options.AvailableModels.Add(new SubAgentModelInfo("text-model", "text", 8000, supportsVision: false));
+        options.AvailableModels.Add(new SubAgentModelInfo("plain")); // 3-param constructor defaults to false
+        await using var manager = CreateManager(options);
+        var tools = SubAgentTools.BuildTools(manager, options, CancellationToken.None);
+
+        var json = await InvokeAsync(tools, "list_sub_agent_models");
+
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(2, doc.RootElement.GetArrayLength());
+        Assert.False(doc.RootElement[0].GetProperty("supports_vision").GetBoolean());
+        Assert.False(doc.RootElement[1].GetProperty("supports_vision").GetBoolean());
+    }
+
+    [Fact]
+    public async Task ListModels_Tool_Description_Documents_SupportsVision_Field()
+    {
+        var options = new SubAgentOptions { DefaultClient = new OptionsCapturingClient() };
+        await using var manager = CreateManager(options);
+        var tools = SubAgentTools.BuildTools(manager, options, CancellationToken.None);
+
+        var listTool = tools.OfType<AIFunction>().Single(f => f.Name == "list_sub_agent_models");
+        Assert.Contains("supports_vision", listTool.Description);
+    }
+
     // ========================================================================
     // Saturated concurrency
     // ========================================================================

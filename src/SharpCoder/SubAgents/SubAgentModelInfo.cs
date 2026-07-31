@@ -21,6 +21,21 @@ public sealed record SubAgentModelInfo
         ContextWindow = contextWindow;
     }
 
+    /// <summary>Creates a new model descriptor with explicit vision support.</summary>
+    /// <param name="id">The model identifier. Must not be null or whitespace.</param>
+    /// <param name="description">Optional human/LLM-readable description.</param>
+    /// <param name="contextWindow">Optional context window size in tokens.</param>
+    /// <param name="supportsVision">
+    /// Informational flag indicating whether the model is vision-capable. Hosts use this to guide
+    /// image/PDF <c>image_paths</c> model selection; SharpCoder does not enforce it.
+    /// </param>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="id"/> is null or whitespace.</exception>
+    public SubAgentModelInfo(string id, string? description, int? contextWindow, bool supportsVision)
+        : this(id, description, contextWindow)
+    {
+        SupportsVision = supportsVision;
+    }
+
     /// <summary>The model identifier.</summary>
     public string Id { get; }
 
@@ -29,4 +44,12 @@ public sealed record SubAgentModelInfo
 
     /// <summary>Optional context window size in tokens.</summary>
     public int? ContextWindow { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the model is vision-capable. This is informational only:
+    /// hosts use it to tell the LLM which models support image/PDF <c>image_paths</c>, but
+    /// SharpCoder does not reject visual inputs when this flag is <see langword="false"/>.
+    /// Defaults to <see langword="false"/>.
+    /// </summary>
+    public bool SupportsVision { get; } = false;
 }
