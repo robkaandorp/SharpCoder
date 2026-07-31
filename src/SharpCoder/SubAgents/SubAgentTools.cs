@@ -35,8 +35,9 @@ internal static class SubAgentTools
         "empty [] if unknown). Without an id, returns all tracked sub-agents.";
 
     private const string ModelsDescription =
-        "List the available sub-agent models. Returns a JSON array of {id, description, context_window}. If no " +
-        "models are configured, returns a message indicating the default model is used.";
+        "List the available sub-agent models. Returns a JSON array of {id, description, context_window, supports_vision}. " +
+        "supports_vision is informational and marks vision-capable models to guide image/PDF image_paths model selection. " +
+        "If no models are configured, returns a message indicating the default model is used.";
 
     /// <summary>Creates the four sub-agent tools bound to the given manager.</summary>
     internal static IList<AITool> BuildTools(SubAgentManager manager, SubAgentOptions options, CancellationToken executionCt)
@@ -187,6 +188,7 @@ internal static class SubAgentTools
                         w.WriteNumber("context_window", model.ContextWindow.Value);
                     else
                         w.WriteNull("context_window");
+                    w.WriteBoolean("supports_vision", model.SupportsVision);
                     w.WriteEndObject();
                 }
                 w.WriteEndArray();

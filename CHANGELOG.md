@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.15.1]
+
+### Added
+
+- **Informational sub-agent vision flag** — `SubAgentModelInfo` gains a `SupportsVision` property (`bool`, default `false`). A new binary-compatible 4-parameter constructor overload `SubAgentModelInfo(string id, string? description, int? contextWindow, bool supportsVision)` is provided; the existing 3-parameter constructor `SubAgentModelInfo(string id, string? description = null, int? contextWindow = null)` is unchanged, so existing callers and compiled binaries continue to work. The `list_sub_agent_models` tool now emits a `supports_vision` field (`true` or `false`) for every catalog model, letting hosts mark which sub-agent models are vision-capable (for example when using `image_paths` for image/PDF tasks). This flag is informational only — SharpCoder does not reject visual inputs when a model's `supports_vision` is `false`.
+
 ## [0.15.0]
 
 ### Added
