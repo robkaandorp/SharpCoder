@@ -1450,4 +1450,759 @@ public class SubAgentToolsTests
             Assert.Contains("image_paths", startTool.Description);
         }
     }
+
+    // ========================================================================
+    // AdditionalImagesRoot — validation, canonicalization, snapshot, loading
+    // ========================================================================
+
+    /// <summary>
+    /// Tests for <see cref="SubAgentOptions.AdditionalImagesRoot"/>: a host-designated directory
+    /// sub-agent attachments may be loaded from IN ADDITION to the parent work directory.
+    /// Joins the ImageLoader collection because several tests read real files through the loader.
+    /// </summary>
+    [Collection("ImageLoader")]
+    public class AdditionalImagesRootTests
+    {
+        private static (string root, string primary, string additional, Action cleanup) MakeRoots()
+        {
+            var root = Path.Combine(Path.GetTempPath(), "subagent-addroot-" + Guid.NewGuid().ToString("N"));
+            var primary = Path.Combine(root, "primary");
+            var additional = Path.Combine(root, "additional");
+            Directory.CreateDirectory(primary);
+            Directory.CreateDirectory(additional);
+            return (root, primary, additional, () =>
+            {
+                try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+            });
+        }
+
+        // ---------- validation ----------
+
+        [Fact]
+        public async Task Null_AdditionalImagesRoot_Is_Not_Configured()
+        {
+            var (_, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = null };
+
+                await using var manager = new SubAgentManager(subOptions, new OptionsCapturingClient(), parent);
+
+                Assert.Null(manager.AdditionalImagesRoot);
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("   ")]
+        public void Whitespace_AdditionalImagesRoot_Throws(string configured)
+        {
+            var (_, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = configured };
+
+                Assert.Throws<ArgumentException>(() =>
+                    new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public void Relative_AdditionalImagesRoot_Throws()
+        {
+            var (_, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = Path.Combine("relative", "attachments") };
+
+                var ex = Assert.Throws<ArgumentException>(() =>
+                    new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+                Assert.Contains("absolute", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public void Nonexistent_AdditionalImagesRoot_Throws()
+        {
+            var (root, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var missing = Path.Combine(root, "does-not-exist");
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = missing };
+
+                Assert.Throws<ArgumentException>(() =>
+                    new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public void File_Not_Directory_AdditionalImagesRoot_Throws()
+        {
+            var (root, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var filePath = Path.Combine(root, "afile.txt");
+                File.WriteAllText(filePath, "not a directory");
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = filePath };
+
+                var ex = Assert.Throws<ArgumentException>(() =>
+                    new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+                Assert.Contains("directory", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task AdditionalImagesRoot_Is_Canonicalized()
+        {
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                // Non-canonical input: trailing separator plus a "./nested/.." detour.
+                var nonCanonical =
+                    Path.Combine(additional, "sub", "..") + Path.DirectorySeparatorChar;
+                Directory.CreateDirectory(Path.Combine(additional, "sub"));
+
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = nonCanonical };
+
+                await using var manager = new SubAgentManager(subOptions, new OptionsCapturingClient(), parent);
+
+                Assert.Equal(Path.GetFullPath(additional), manager.AdditionalImagesRoot);
+                Assert.NotEqual(nonCanonical, manager.AdditionalImagesRoot);
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        // ---------- fully-qualified enforcement ----------
+
+        [Fact]
+        public void Rooted_But_Not_FullyQualified_AdditionalImagesRoot_Throws()
+        {
+            // Path.IsPathRooted accepts drive-relative ("C:images") and root-relative ("\images")
+            // forms on Windows; Path.GetFullPath would then resolve them from the process's current
+            // directory/drive. Only fully-qualified paths may be accepted.
+            var (_, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+
+                var candidates = new List<string>();
+                if (OperatingSystem.IsWindows())
+                {
+                    // Drive-relative: resolved against the current directory ON that drive.
+                    var drive = Path.GetPathRoot(Directory.GetCurrentDirectory())!.Substring(0, 2); // e.g. "C:"
+                    candidates.Add(drive + "images");
+                    // Root-relative: resolved against the current drive.
+                    candidates.Add(@"\images");
+                    candidates.Add("/images-root-relative");
+                }
+                else
+                {
+                    // On Unix nothing but a leading '/' is fully qualified.
+                    candidates.Add("~/attachments");
+                    candidates.Add("./attachments");
+                    candidates.Add("attachments");
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    Assert.False(
+                        Path.IsPathFullyQualified(candidate),
+                        $"Test setup error: '{candidate}' is fully qualified on this platform.");
+
+                    var subOptions = new SubAgentOptions { AdditionalImagesRoot = candidate };
+                    var ex = Assert.Throws<ArgumentException>(() =>
+                        new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+                    Assert.Contains("fully-qualified", ex.Message, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public void DriveRelative_Root_Rejected_Even_When_Resolved_Directory_Exists()
+        {
+            // Removal proof for the IsPathFullyQualified guard: build a non-fully-qualified value
+            // whose one-argument GetFullPath resolution IS an existing directory. Without the
+            // guard, GetFullPath + Directory.Exists would accept it.
+            // The directory is created UNDER the process's current directory so no global state
+            // (the current directory itself) has to be mutated.
+            var (_, primary, _, cleanup) = MakeRoots();
+            var leafName = "subagent-cwdrel-" + Guid.NewGuid().ToString("N");
+            var underCwd = Path.Combine(Directory.GetCurrentDirectory(), leafName);
+            Directory.CreateDirectory(underCwd);
+            try
+            {
+                string candidate;
+                if (OperatingSystem.IsWindows())
+                {
+                    // "C:<leaf>" — drive-relative, resolves against the current dir on that drive.
+                    var drive = Path.GetPathRoot(Directory.GetCurrentDirectory())!.Substring(0, 2);
+                    candidate = drive + leafName;
+                }
+                else
+                {
+                    candidate = leafName;
+                }
+
+                Assert.False(Path.IsPathFullyQualified(candidate));
+                // Proves the test is non-vacuous: the resolved directory really does exist.
+                Assert.True(Directory.Exists(Path.GetFullPath(candidate)));
+
+                var parent = new AgentOptions { WorkDirectory = primary, AutoLoadWorkspaceInstructions = false };
+                var subOptions = new SubAgentOptions { AdditionalImagesRoot = candidate };
+
+                var ex = Assert.Throws<ArgumentException>(() =>
+                    new SubAgentManager(subOptions, new OptionsCapturingClient(), parent));
+                Assert.Contains("fully-qualified", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                try { Directory.Delete(underCwd, recursive: true); } catch (IOException) { }
+                cleanup();
+            }
+        }
+
+        // ---------- snapshot through CodingAgent ----------
+
+        [Fact]
+        public async Task AdditionalImagesRoot_Survives_CodingAgent_Snapshot()
+        {
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                    SubAgents = new SubAgentOptions
+                    {
+                        DefaultClient = new OptionsCapturingClient(),
+                        AdditionalImagesRoot = additional
+                    }
+                };
+
+                await using var agent = new CodingAgent(new OptionsCapturingClient(), parent);
+                await agent.ExecuteAsync("hello", TestContext.Current.CancellationToken);
+
+                var manager = agent.ActiveSubAgentManager;
+                Assert.NotNull(manager);
+                Assert.Equal(Path.GetFullPath(additional), manager!.AdditionalImagesRoot);
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task Post_Construction_Mutation_Does_Not_Widen_Roots()
+        {
+            var (root, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                var widened = Path.Combine(root, "widened");
+                Directory.CreateDirectory(widened);
+                var leakPath = Path.Combine(widened, "leak.png");
+                File.WriteAllBytes(leakPath, TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = additional
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+
+                // Mutate AFTER construction — must not affect the snapshot.
+                subOptions.AdditionalImagesRoot = widened;
+
+                Assert.Equal(Path.GetFullPath(additional), manager.AdditionalImagesRoot);
+
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { leakPath }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.False(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Contains("escapes the work directory", doc.RootElement.GetProperty("error").GetString()!);
+                Assert.Empty(manager.GetStatus());
+                Assert.Equal(0, subClient.CallCount);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        // ---------- loading through the start_sub_agent tool ----------
+
+        [Fact]
+        public async Task ImagePaths_Absolute_Under_AdditionalRoot_Loads()
+        {
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                var attachmentPath = Path.Combine(additional, "attachment.png");
+                File.WriteAllBytes(attachmentPath, TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = additional
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe the attachment",
+                        ["image_paths"] = new[] { attachmentPath }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _), json);
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                Assert.NotEmpty(subClient.ReceivedMessages);
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal("image/png", dataContents[0].MediaType);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_Absolute_Under_AdditionalRoot_Rejected_When_Not_Configured()
+        {
+            // Removal proof: identical setup minus AdditionalImagesRoot must fail.
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                var attachmentPath = Path.Combine(additional, "attachment.png");
+                File.WriteAllBytes(attachmentPath, TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions { DefaultClient = subClient };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                Assert.Null(manager.AdditionalImagesRoot);
+
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe the attachment",
+                        ["image_paths"] = new[] { attachmentPath }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.False(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Contains("escapes the work directory", doc.RootElement.GetProperty("error").GetString()!);
+                Assert.Empty(manager.GetStatus());
+                Assert.Equal(0, subClient.CallCount);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_Relative_Prefers_PrimaryRoot_Copy()
+        {
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(primary, "shared.png"), TinyPng);
+                var additionalPngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0B };
+                File.WriteAllBytes(Path.Combine(additional, "shared.png"), additionalPngBytes);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = additional
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { "shared.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _), json);
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+                Assert.NotEqual(additionalPngBytes, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_Relative_Only_Under_AdditionalRoot_Loads()
+        {
+            var (_, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(additional, "only-there.png"), TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = additional
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { "only-there.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _), json);
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        [Fact]
+        public async Task ImagePaths_DotDot_Escape_Rejected_With_AdditionalRoot_Configured()
+        {
+            var (root, primary, additional, cleanup) = MakeRoots();
+            try
+            {
+                var outside = Path.Combine(root, "outside");
+                Directory.CreateDirectory(outside);
+                File.WriteAllBytes(Path.Combine(outside, "leak.png"), TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = additional
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { Path.Combine("..", "outside", "leak.png") }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.False(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Contains("escapes the work directory", doc.RootElement.GetProperty("error").GetString()!);
+                Assert.Empty(manager.GetStatus());
+                Assert.Equal(0, subClient.CallCount);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        // ---------- no-config path: single-root behaviour through the tool ----------
+
+        /// <summary>
+        /// When AdditionalImagesRoot is null, the start_sub_agent tool must use the ORIGINAL
+        /// single-root LoadAsync (3-arg) path, not the two-root path. This test proves it
+        /// through the tool: an in-root image loads, and an out-of-root image is rejected
+        /// with "escapes the work directory" — exactly as before the feature was added.
+        /// It is removal-proof because if the SubAgentTools null guard were removed and
+        /// the null flowed into the two-root core, the relative-path FileExists probe
+        /// against a null additional root would throw rather than silently load.
+        /// </summary>
+        [Fact]
+        public async Task NoAdditionalRoot_Through_Tool_Uses_SingleRoot_Path()
+        {
+            var (root, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                // In-root image loads successfully.
+                File.WriteAllBytes(Path.Combine(primary, "repo.png"), TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = null // explicitly not configured
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                Assert.Null(manager.AdditionalImagesRoot);
+
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { "repo.png" }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.True(doc.RootElement.TryGetProperty("id", out _), json);
+
+                await manager.AwaitAsync(null, TestContext.Current.CancellationToken);
+
+                Assert.NotEmpty(subClient.ReceivedMessages);
+                var dataContents = UserDataContents(subClient.ReceivedMessages[0]);
+                Assert.Single(dataContents);
+                Assert.Equal("image/png", dataContents[0].MediaType);
+                Assert.Equal(TinyPng, dataContents[0].Data.ToArray());
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        /// <summary>
+        /// No-config regression through the tool: an absolute path outside the primary root
+        /// must still be rejected with "escapes the work directory" when no additional root
+        /// is configured — identical to the pre-feature single-root behaviour.
+        /// </summary>
+        [Fact]
+        public async Task NoAdditionalRoot_Through_Tool_Outside_Rejected()
+        {
+            var (root, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                var outside = Path.Combine(root, "outside");
+                Directory.CreateDirectory(outside);
+                var leakPath = Path.Combine(outside, "leak.png");
+                File.WriteAllBytes(leakPath, TinyPng);
+
+                var subClient = new OptionsCapturingClient("sub done");
+                var parent = new AgentOptions
+                {
+                    WorkDirectory = primary,
+                    EnableBash = false,
+                    EnableSkills = false,
+                    AutoLoadWorkspaceInstructions = false,
+                };
+                var subOptions = new SubAgentOptions
+                {
+                    DefaultClient = subClient,
+                    AdditionalImagesRoot = null
+                };
+                parent.SubAgents = subOptions;
+
+                await using var manager = CreateManager(subOptions, parent, subClient);
+                Assert.Null(manager.AdditionalImagesRoot);
+
+                var tools = SubAgentTools.BuildTools(manager, subOptions, CancellationToken.None);
+                var json = await InvokeAsync(tools, "start_sub_agent",
+                    new Dictionary<string, object?>
+                    {
+                        ["task"] = "describe",
+                        ["image_paths"] = new[] { leakPath }
+                    });
+
+                using var doc = JsonDocument.Parse(json);
+                Assert.False(doc.RootElement.TryGetProperty("id", out _));
+                Assert.Contains("escapes the work directory", doc.RootElement.GetProperty("error").GetString()!);
+                Assert.Empty(manager.GetStatus());
+                Assert.Equal(0, subClient.CallCount);
+            }
+            finally
+            {
+                ImageLoader.FileProbe = null;
+                cleanup();
+            }
+        }
+
+        /// <summary>
+        /// No-config removal proof at the ImageLoader level: calling the 4-arg LoadAsync with
+        /// a null additional root must delegate to the original 3-arg single-root loader. We
+        /// prove this by using the FileProbe seam: the 3-arg core never calls FileExists for
+        /// relative-path resolution (it resolves and reads directly), while the two-root core
+        /// calls FileExists. If the null guard in the 4-arg overload were removed, the null
+        /// would flow into the two-root core and FileExists would be invoked — the probe count
+        /// would be non-zero.
+        /// </summary>
+        [Fact]
+        public async Task NoAdditionalRoot_FourArg_Delegates_To_SingleRoot_Core()
+        {
+            var (_, primary, _, cleanup) = MakeRoots();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(primary, "repo.png"), TinyPng);
+
+                var probedPaths = new System.Collections.Generic.List<string>();
+                ImageLoader.FileProbe = path =>
+                {
+                    probedPaths.Add(path);
+                    return (TinyPng.Length, () => new MemoryStream(TinyPng));
+                };
+
+                try
+                {
+                    // 4-arg overload with null additional root → must use 3-arg single-root core.
+                    var result = await ImageLoader.LoadAsync(
+                        primary, new[] { "repo.png" }, null, TestContext.Current.CancellationToken);
+
+                    Assert.True(result.Success, result.Error ?? "Expected success");
+                    Assert.Single(result.Attachments);
+                    Assert.Equal(TinyPng, result.Attachments[0].Data);
+
+                    // The single-root core calls FileProbe exactly ONCE (to read the resolved file).
+                    // The two-root core would call FileProbe for the FileExists existence check
+                    // AND for the read — but more importantly, for a relative path the two-root
+                    // core calls FileExists on the primary candidate, which invokes the probe.
+                    // The single-root core does NOT call FileExists; it resolves and probes once.
+                    // If the null guard were removed and null flowed to the two-root core,
+                    // ResolveAcrossRoots would call FileExists(primary) → probe invoked once
+                    // for existence, then the read probe invoked again → 2 probe calls.
+                    // With the single-root core, there is exactly 1 probe call (the read).
+                    Assert.Single(probedPaths);
+                }
+                finally
+                {
+                    ImageLoader.FileProbe = null;
+                }
+            }
+            finally
+            {
+                cleanup();
+            }
+        }
+    }
 }

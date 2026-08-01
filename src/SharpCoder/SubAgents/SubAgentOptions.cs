@@ -49,4 +49,18 @@ public sealed class SubAgentOptions
 
     /// <summary>Maximum agent-loop steps per sub-agent.</summary>
     public int MaxSteps { get; set; } = 25;
+
+    /// <summary>
+    /// Optional host-designated directory that sub-agent image/PDF attachments may ALSO be loaded
+    /// from, IN ADDITION to the parent agent's work directory. Null (the default) means not
+    /// configured, and image loading uses the work directory only.
+    /// <para>
+    /// When set it must be a non-empty absolute path to an existing directory; otherwise
+    /// <see cref="SubAgentManager"/> construction throws <see cref="ArgumentException"/>. The value
+    /// is canonicalized and snapshotted at manager construction, so mutating it afterwards cannot
+    /// widen the roots an existing manager accepts. Containment is enforced for this root exactly
+    /// as for the work directory: paths escaping it are rejected.
+    /// </para>
+    /// </summary>
+    public string? AdditionalImagesRoot { get; set; }
 }

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.16.0]
+
+### Added
+
+- **Sub-agent additional images root** — `SubAgentOptions` gains an `AdditionalImagesRoot` property (nullable `string?`). When set to a non-empty absolute path to an existing directory, sub-agent `image_paths` may resolve within it IN ADDITION to the parent agent's working-directory root — useful for volatile/temporary attachments (e.g., a Composer chat upload) without touching the repo. The value is validated at `SubAgentManager` construction (non-null requires a non-empty absolute path to an existing directory; whitespace/relative/nonexistent/file-not-directory → `ArgumentException`; `null` = not configured). It is canonicalized and snapshotted — post-construction mutation of the options does not widen the accepted roots. Two-root resolution: absolute paths inside either root are accepted; relative paths probe the primary root first, then the additional root (primary wins on collision); `../` escapes from either root are rejected. Count/size limits and no-config behavior are unchanged.
+
 ## [0.15.1]
 
 ### Added

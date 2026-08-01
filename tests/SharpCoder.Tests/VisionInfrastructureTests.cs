@@ -596,7 +596,599 @@ public class ImageLoaderSizeLimitTests : IDisposable
 }
 
 // ===========================================================================
-// 7. ImageLoader — cancellation
+// 7. ImageLoader — additional images root (two-root resolution)
+// ===========================================================================
+[Collection("ImageLoader")]
+public class ImageLoaderAdditionalRootTests : IDisposable
+{
+    private static readonly byte[] PrimaryBytes = { 0x89, 0x50, 0x4E, 0x47, 0x01 };
+    private static readonly byte[] AdditionalBytes = { 0x89, 0x50, 0x4E, 0x47, 0x02 };
+    private static readonly byte[] OutsideBytes = { 0x89, 0x50, 0x4E, 0x47, 0x03 };
+
+    private readonly string _tempRoot;
+    private readonly string _primaryRoot;
+    private readonly string _additionalRoot;
+    private readonly string _outsideRoot;
+
+    public ImageLoaderAdditionalRootTests()
+    {
+        _tempRoot = Path.Combine(Path.GetTempPath(), "SharpCoderImgAdd_" + Guid.NewGuid().ToString("N"));
+        _primaryRoot = Path.Combine(_tempRoot, "primary");
+        _additionalRoot = Path.Combine(_tempRoot, "additional");
+        _outsideRoot = Path.Combine(_tempRoot, "outside");
+        Directory.CreateDirectory(_primaryRoot);
+        Directory.CreateDirectory(_additionalRoot);
+        Directory.CreateDirectory(_outsideRoot);
+    }
+
+    public void Dispose()
+    {
+        ImageLoader.FileProbe = null;
+        if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, true);
+    }
+
+    private static string Write(string directory, string name, byte[] content)
+    {
+        var path = Path.Combine(directory, name);
+        File.WriteAllBytes(path, content);
+        return path;
+    }
+
+    [Fact]
+    public async Task Absolute_Under_AdditionalRoot_Loads()
+    {
+        var attachmentPath = Write(_additionalRoot, "attachment.png", AdditionalBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success, result.Error ?? "Expected success");
+        Assert.Single(result.Attachments);
+        Assert.Equal("image/png", result.Attachments[0].MediaType);
+        Assert.Equal(AdditionalBytes, result.Attachments[0].Data);
+    }
+
+    [Fact]
+    public async Task Absolute_Under_AdditionalRoot_Rejected_When_Not_Configured()
+    {
+        // Removal proof for the additional-root plumbing: the SAME absolute path that loads
+        // with the additional root configured must be rejected without it.
+        var attachmentPath = Write(_additionalRoot, "attachment.png", AdditionalBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { attachmentPath }, null, TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Contains("escapes the work directory", result.Error!);
+        Assert.Empty(result.Attachments);
+    }
+
+    [Fact]
+    public async Task Absolute_Under_PrimaryRoot_Still_Loads_With_AdditionalRoot_Configured()
+    {
+        var attachmentPath = Write(_primaryRoot, "repo.png", PrimaryBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success, result.Error ?? "Expected success");
+        Assert.Equal(PrimaryBytes, Assert.Single(result.Attachments).Data);
+    }
+
+    [Fact]
+    public async Task Absolute_Under_Neither_Root_Escapes()
+    {
+        var attachmentPath = Write(_outsideRoot, "leak.png", OutsideBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Contains("escapes the work directory", result.Error!);
+        Assert.Empty(result.Attachments);
+    }
+
+    [Fact]
+    public async Task Relative_Existing_Only_Under_AdditionalRoot_Loads()
+    {
+        Write(_additionalRoot, "only-additional.png", AdditionalBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { "only-additional.png" }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success, result.Error ?? "Expected success");
+        Assert.Equal(AdditionalBytes, Assert.Single(result.Attachments).Data);
+    }
+
+    [Fact]
+    public async Task Relative_Existing_Under_Both_Roots_Resolves_To_Primary()
+    {
+        Write(_primaryRoot, "shared.png", PrimaryBytes);
+        Write(_additionalRoot, "shared.png", AdditionalBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { "shared.png" }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success, result.Error ?? "Expected success");
+        var attachment = Assert.Single(result.Attachments);
+        Assert.Equal(PrimaryBytes, attachment.Data);
+        Assert.NotEqual(AdditionalBytes, attachment.Data);
+    }
+
+    [Fact]
+    public async Task Relative_Existing_Under_Neither_Root_Fails()
+    {
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { "missing.png" }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.NotNull(result.Error);
+        Assert.Empty(result.Attachments);
+    }
+
+    [Fact]
+    public async Task Relative_DotDot_Escape_Rejected_From_Both_Roots()
+    {
+        Write(_outsideRoot, "leak.png", OutsideBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot,
+            new[] { Path.Combine("..", "outside", "leak.png") },
+            _additionalRoot,
+            TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Contains("escapes the work directory", result.Error!);
+        Assert.Empty(result.Attachments);
+    }
+
+    [Fact]
+    public async Task AdditionalRoot_Sibling_Sharing_Prefix_Rejected()
+    {
+        // Boundary safety must hold for the additional root too.
+        var sibling = _additionalRoot + "-other";
+        Directory.CreateDirectory(sibling);
+        var leakPath = Write(sibling, "leak.png", OutsideBytes);
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { leakPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Contains("escapes the work directory", result.Error!);
+    }
+
+    [Fact]
+    public async Task NoAdditionalRoot_Behaviour_Unchanged()
+    {
+        Write(_primaryRoot, "repo.png", PrimaryBytes);
+        var outsidePath = Write(_outsideRoot, "leak.png", OutsideBytes);
+
+        var ok = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { "repo.png" }, null, TestContext.Current.CancellationToken);
+        Assert.True(ok.Success, ok.Error ?? "Expected success");
+        Assert.Equal(PrimaryBytes, Assert.Single(ok.Attachments).Data);
+
+        var escape = await ImageLoader.LoadAsync(
+            _primaryRoot, new[] { outsidePath }, null, TestContext.Current.CancellationToken);
+        Assert.False(escape.Success);
+        Assert.Contains("escapes the work directory", escape.Error!);
+    }
+
+    [Fact]
+    public async Task Relative_Precedence_Uses_FileProbe_Seam_For_Existence()
+    {
+        // The seam decides which root "has" the file: the primary-root candidate throws
+        // (treated as missing), the additional-root candidate resolves.
+        var primaryCandidate = Path.Combine(_primaryRoot, "seam.png");
+        var additionalCandidate = Path.Combine(_additionalRoot, "seam.png");
+        var probedPaths = new System.Collections.Generic.List<string>();
+
+        ImageLoader.FileProbe = path =>
+        {
+            probedPaths.Add(path);
+            if (string.Equals(path, additionalCandidate, StringComparison.Ordinal))
+                return (AdditionalBytes.Length, () => new MemoryStream(AdditionalBytes));
+            throw new FileNotFoundException("not here", path);
+        };
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { "seam.png" }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.True(result.Success, result.Error ?? "Expected success");
+            Assert.Equal(AdditionalBytes, Assert.Single(result.Attachments).Data);
+            // The primary root was consulted FIRST and only then the additional root.
+            Assert.Contains(primaryCandidate, probedPaths);
+            Assert.Equal(primaryCandidate, probedPaths[0]);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task AdditionalRoot_Whitespace_Throws_ArgumentException()
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            ImageLoader.LoadAsync(_primaryRoot, new[] { "a.png" }, "   ", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CountLimit_Unchanged_With_AdditionalRoot()
+    {
+        for (var i = 0; i < 9; i++)
+        {
+            Write(_additionalRoot, $"img{i}.png", AdditionalBytes);
+        }
+
+        var paths = new string[9];
+        for (var i = 0; i < 9; i++) paths[i] = $"img{i}.png";
+
+        var result = await ImageLoader.LoadAsync(
+            _primaryRoot, paths, _additionalRoot, TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Contains("8", result.Error!);
+        Assert.Empty(result.Attachments);
+    }
+
+    // -----------------------------------------------------------------------
+    // Size limits on the CONFIGURED (two-root) path.
+    //
+    // The two-root loader has its own size-limit implementation in
+    // ImageLoader.AppendResolvedAsync, separate from the untouched single-root
+    // LoadCoreAsync. These tests drive images through the ADDITIONAL root so the
+    // configured path's own per-file and cumulative guards are exercised: if either
+    // guard is removed from AppendResolvedAsync, every one of these tests fails
+    // because the over-limit load would succeed.
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task SingleFileOverLimit_UnderAdditionalRoot_Rejected_WithNoRead()
+    {
+        // Absolute path under the ADDITIONAL root: it is contained in neither the primary
+        // root nor anywhere else, so only the two-root resolver can accept it.
+        var attachmentPath = Path.Combine(_additionalRoot, "huge.png");
+        var openWasCalled = false;
+
+        ImageLoader.FileProbe = _ => (ImageLoader.MaxTotalBytes + 1, () =>
+        {
+            openWasCalled = true;
+            return new MemoryStream(new byte[ImageLoader.MaxTotalBytes + 1]);
+        });
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.NotNull(result.Error);
+            Assert.Empty(result.Attachments);
+            // Not an escape: the path IS accepted by the additional root, it is the
+            // per-file size guard on the configured path that rejects it.
+            Assert.DoesNotContain("escapes the work directory", result.Error!);
+            Assert.Contains("too large", result.Error!, StringComparison.OrdinalIgnoreCase);
+            // Pre-read fast reject: the stream must never be opened.
+            Assert.False(openWasCalled, "open() should NOT have been called for a file exceeding the limit.");
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task SingleFileOverLimit_RelativeUnderAdditionalRoot_Rejected()
+    {
+        // Relative path that exists ONLY under the additional root: the probe throws for the
+        // primary-root candidate (treated as missing) and answers for the additional-root one,
+        // so resolution lands on the additional root and the size guard must still fire.
+        var additionalCandidate = Path.Combine(_additionalRoot, "huge.png");
+
+        ImageLoader.FileProbe = path =>
+        {
+            if (!string.Equals(path, additionalCandidate, StringComparison.Ordinal))
+                throw new FileNotFoundException("not here", path);
+            return (ImageLoader.MaxTotalBytes + 1, () => new MemoryStream(new byte[ImageLoader.MaxTotalBytes + 1]));
+        };
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { "huge.png" }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.Empty(result.Attachments);
+            Assert.DoesNotContain("escapes the work directory", result.Error!);
+            Assert.Contains("too large", result.Error!, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task CumulativeOverLimit_UnderAdditionalRoot_Rejected()
+    {
+        // Two files under the additional root, each 15 MiB: the first is individually legal,
+        // the second pushes the cumulative total past 20 MiB.
+        const int fifteenMiB = 15_728_640;
+        var first = Path.Combine(_additionalRoot, "first.png");
+        var second = Path.Combine(_additionalRoot, "second.png");
+        var openCount = 0;
+
+        ImageLoader.FileProbe = _ => (fifteenMiB, () =>
+        {
+            openCount++;
+            return new MemoryStream(new byte[fifteenMiB]);
+        });
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { first, second }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.NotNull(result.Error);
+            Assert.Empty(result.Attachments);
+            Assert.DoesNotContain("escapes the work directory", result.Error!);
+            Assert.Contains("size", result.Error!, StringComparison.OrdinalIgnoreCase);
+            // Removal proof: the cumulative allowance check rejects the SECOND file BEFORE its
+            // stream is opened. Without that guard the bounded read would open it (openCount 2).
+            Assert.Equal(1, openCount);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task CumulativeLimit_Counts_Across_Both_Roots()
+    {
+        // 15 MiB from the PRIMARY root plus 15 MiB from the ADDITIONAL root must still trip the
+        // single cumulative allowance — the additional root does not get its own budget.
+        const int fifteenMiB = 15_728_640;
+        var fromPrimary = Path.Combine(_primaryRoot, "primary.png");
+        var fromAdditional = Path.Combine(_additionalRoot, "additional.png");
+        var openCount = 0;
+
+        ImageLoader.FileProbe = _ => (fifteenMiB, () =>
+        {
+            openCount++;
+            return new MemoryStream(new byte[fifteenMiB]);
+        });
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot,
+                new[] { fromPrimary, fromAdditional },
+                _additionalRoot,
+                TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.Empty(result.Attachments);
+            Assert.DoesNotContain("escapes the work directory", result.Error!);
+            Assert.Contains("size", result.Error!, StringComparison.OrdinalIgnoreCase);
+            // Removal proof: the second file is rejected before its stream is opened.
+            Assert.Equal(1, openCount);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task ExactlyLimit_SingleFile_UnderAdditionalRoot_Allowed()
+    {
+        // Boundary: exactly 20 MiB is still allowed on the configured path, proving the guard
+        // rejects only what is genuinely over the limit.
+        var exactlyLimit = (int)ImageLoader.MaxTotalBytes;
+        var data = new byte[exactlyLimit];
+        var attachmentPath = Path.Combine(_additionalRoot, "exact.png");
+
+        ImageLoader.FileProbe = _ => (exactlyLimit, () => new MemoryStream(data));
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.True(result.Success, result.Error ?? "Expected success");
+            Assert.Equal(exactlyLimit, Assert.Single(result.Attachments).Data.Length);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task CheckVsReadMismatch_UnderAdditionalRoot_BoundedReadCatchesIt()
+    {
+        // The probe under-reports the length but the stream yields far more than the allowance.
+        // The configured path's bounded read must cap the read and reject.
+        var attachmentPath = Path.Combine(_additionalRoot, "mismatch.png");
+        var remainingAllowance = ImageLoader.MaxTotalBytes;
+        var streamSize = (int)(remainingAllowance + 10_000);
+        var countingStream = new CountingStream(new byte[streamSize]);
+
+        ImageLoader.FileProbe = _ => (1_000L, () => countingStream);
+
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { attachmentPath }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.False(result.Success);
+            Assert.Empty(result.Attachments);
+            Assert.Contains("size", result.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.True(
+                countingStream.TotalBytesRead <= remainingAllowance + 1,
+                $"Expected at most {remainingAllowance + 1} bytes read, but {countingStream.TotalBytesRead} were read.");
+            Assert.True(streamSize > remainingAllowance + 1,
+                "Test setup error: stream must contain more bytes than the cap for the test to be meaningful.");
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task DualRoot_PerFile_Error_Message_Matches_SingleRoot()
+    {
+        // Removal-proof for message drift: the dual-root per-file size guard must produce the
+        // SAME error message format as the single-root per-file guard. If someone changed
+        // AppendResolvedAsync's error text to diverge from LoadCoreAsync's, this test fails
+        // because it asserts the exact message a single-root load produces for the same path.
+        var overLimit = ImageLoader.MaxTotalBytes + 1;
+        var path = "huge.png";
+
+        // Capture the single-root error message.
+        ImageLoader.FileProbe = _ => (overLimit, () => new MemoryStream(new byte[overLimit]));
+        string singleRootError;
+        try
+        {
+            var singleResult = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { path }, null, TestContext.Current.CancellationToken);
+            Assert.False(singleResult.Success);
+            singleRootError = singleResult.Error!;
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+
+        // Capture the dual-root error message for the same path under the additional root.
+        var additionalCandidate = Path.Combine(_additionalRoot, path);
+        ImageLoader.FileProbe = p =>
+        {
+            if (!string.Equals(p, additionalCandidate, StringComparison.Ordinal))
+                throw new FileNotFoundException("not here", p);
+            return (overLimit, () => new MemoryStream(new byte[overLimit]));
+        };
+        try
+        {
+            var dualResult = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { path }, _additionalRoot, TestContext.Current.CancellationToken);
+            Assert.False(dualResult.Success);
+            Assert.Equal(singleRootError, dualResult.Error);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task DualRoot_Cumulative_Error_Message_Matches_SingleRoot()
+    {
+        // Removal-proof for message drift: the dual-root cumulative size guard must produce
+        // the SAME error message as the single-root cumulative guard.
+        const int fifteenMiB = 15_728_640;
+        var first = "first.png";
+        var second = "second.png";
+
+        // Single-root: both files under the primary root.
+        ImageLoader.FileProbe = _ => (fifteenMiB, () => new MemoryStream(new byte[fifteenMiB]));
+        string singleRootError;
+        try
+        {
+            var singleResult = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { first, second }, null, TestContext.Current.CancellationToken);
+            Assert.False(singleResult.Success);
+            singleRootError = singleResult.Error!;
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+
+        // Dual-root: both files under the additional root.
+        var firstCandidate = Path.Combine(_additionalRoot, first);
+        var secondCandidate = Path.Combine(_additionalRoot, second);
+        ImageLoader.FileProbe = p =>
+        {
+            if (string.Equals(p, firstCandidate, StringComparison.Ordinal) ||
+                string.Equals(p, secondCandidate, StringComparison.Ordinal))
+                return (fifteenMiB, () => new MemoryStream(new byte[fifteenMiB]));
+            throw new FileNotFoundException("not here", p);
+        };
+        try
+        {
+            var dualResult = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { first, second }, _additionalRoot, TestContext.Current.CancellationToken);
+            Assert.False(dualResult.Success);
+            Assert.Equal(singleRootError, dualResult.Error);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    [Fact]
+    public async Task ExactlyLimit_TwoFiles_CumulativeBoundary_UnderAdditionalRoot_Allowed()
+    {
+        // Two files that together total exactly MaxTotalBytes through the additional root.
+        // Each is individually under the limit and together they are exactly at the cumulative
+        // boundary — the guard must accept this, not reject it with an off-by-one error.
+        var half = ImageLoader.MaxTotalBytes / 2;
+        var first = Path.Combine(_additionalRoot, "half1.png");
+        var second = Path.Combine(_additionalRoot, "half2.png");
+
+        ImageLoader.FileProbe = _ => ((long)half, () => new MemoryStream(new byte[half]));
+        try
+        {
+            var result = await ImageLoader.LoadAsync(
+                _primaryRoot, new[] { first, second }, _additionalRoot, TestContext.Current.CancellationToken);
+
+            Assert.True(result.Success, result.Error ?? "Expected success at exact cumulative boundary");
+            Assert.Equal(2, result.Attachments.Count);
+            Assert.Equal(half, result.Attachments[0].Data.Length);
+            Assert.Equal(half, result.Attachments[1].Data.Length);
+        }
+        finally
+        {
+            ImageLoader.FileProbe = null;
+        }
+    }
+
+    /// <summary>
+    /// A MemoryStream subclass that counts the total bytes read, used to prove the bounded read
+    /// on the two-root path reads at most allowance + 1 bytes.
+    /// </summary>
+    private sealed class CountingStream : MemoryStream
+    {
+        public int TotalBytesRead { get; private set; }
+
+        public CountingStream(byte[] buffer) : base(buffer) { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = base.Read(buffer, offset, count);
+            TotalBytesRead += read;
+            return read;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            var read = base.Read(buffer, offset, count);
+            TotalBytesRead += read;
+            return Task.FromResult(read);
+        }
+    }
+}
+
+// ===========================================================================
+// 8. ImageLoader — cancellation
 // ===========================================================================
 [Collection("ImageLoader")]
 public class ImageLoaderCancellationTests : IDisposable

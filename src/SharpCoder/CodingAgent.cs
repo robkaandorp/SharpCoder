@@ -79,7 +79,8 @@ public sealed class CodingAgent : IAsyncDisposable
                 DefaultEnableFileOps = source.DefaultEnableFileOps,
                 DefaultEnableFileWrites = source.DefaultEnableFileWrites,
                 DefaultEnableSkills = source.DefaultEnableSkills,
-                MaxSteps = source.MaxSteps
+                MaxSteps = source.MaxSteps,
+                AdditionalImagesRoot = source.AdditionalImagesRoot
             };
             foreach (var model in source.AvailableModels)
                 snapshot.AvailableModels.Add(model);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -118,6 +119,7 @@ public sealed class SubAgentManager : IAsyncDisposable
     private readonly bool _parentEnableFileWritesSnapshot;
     private readonly bool _parentEnableSkillsSnapshot;
     private readonly string _workDirectorySnapshot;
+    private readonly string? _additionalImagesRootSnapshot;
 
     /// <summary>
     /// Test seam: invoked with the freshly built <see cref="AgentOptions"/> for each sub-agent,
@@ -143,6 +145,14 @@ public sealed class SubAgentManager : IAsyncDisposable
 
     /// <summary>The working directory snapshotted at construction time, used for RunSpec creation and ImageLoader resolution.</summary>
     internal string WorkDirectory => _workDirectorySnapshot;
+
+    /// <summary>
+    /// The canonicalized additional images root snapshotted at construction time, or null when
+    /// <see cref="SubAgentOptions.AdditionalImagesRoot"/> was not configured. Image/PDF attachments
+    /// may be loaded from this directory IN ADDITION to <see cref="WorkDirectory"/>. Fixed at
+    /// construction: mutating the options afterwards cannot widen the accepted roots.
+    /// </summary>
+    public string? AdditionalImagesRoot => _additionalImagesRootSnapshot;
 
     /// <summary>
     /// Raised when a sub-agent transitions state — once when it starts (<see cref="SubAgentStatus.Running"/>)
@@ -175,6 +185,7 @@ public sealed class SubAgentManager : IAsyncDisposable
         _parentEnableFileWritesSnapshot = parentOptions.EnableFileWrites;
         _parentEnableSkillsSnapshot = parentOptions.EnableSkills;
         _workDirectorySnapshot = parentOptions.WorkDirectory;
+        _additionalImagesRootSnapshot = CanonicalizeAdditionalImagesRoot(options.AdditionalImagesRoot);
 
         if (options.MaxConcurrentSubAgents < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxConcurrentSubAgents must be at least 1.");
@@ -197,6 +208,58 @@ public sealed class SubAgentManager : IAsyncDisposable
         }
 
         _slots = new SemaphoreSlim(options.MaxConcurrentSubAgents, options.MaxConcurrentSubAgents);
+    }
+
+    /// <summary>
+    /// Validates and canonicalizes <see cref="SubAgentOptions.AdditionalImagesRoot"/>.
+    /// Null means "not configured" and is returned as null without validation. Any non-null value
+    /// must be a non-blank, fully-qualified absolute path to an existing directory.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when a non-null value is not a valid existing fully-qualified directory.</exception>
+    private static string? CanonicalizeAdditionalImagesRoot(string? configured)
+    {
+        if (configured is null) return null;
+
+        if (configured.Trim().Length == 0)
+            throw new ArgumentException(
+                "AdditionalImagesRoot must not be empty or whitespace when configured.", "options");
+
+        // Path.IsPathRooted is NOT sufficient: on Windows it accepts drive-relative ("C:images")
+        // and root-relative ("\images") forms, which the one-argument Path.GetFullPath would then
+        // resolve against the process's current directory/drive — silently turning relative
+        // configuration into an accepted root. Only fully-qualified paths are allowed.
+        if (!Path.IsPathFullyQualified(configured))
+            throw new ArgumentException(
+                $"AdditionalImagesRoot must be a fully-qualified absolute path, but was '{configured}'.", "options");
+
+        string canonical;
+        try
+        {
+            canonical = Path.GetFullPath(configured);
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException(
+                $"AdditionalImagesRoot '{configured}' is not a valid path: {ex.Message}", "options", ex);
+        }
+
+        if (!Directory.Exists(canonical))
+        {
+            throw new ArgumentException(
+                File.Exists(canonical)
+                    ? $"AdditionalImagesRoot '{configured}' is a file, not a directory."
+                    : $"AdditionalImagesRoot '{configured}' does not exist or is not a directory.",
+                "options");
+        }
+
+        // Normalize a trailing separator away, except for a filesystem root ("/" or "C:\")
+        // where the separator is part of the root itself.
+        if (!string.Equals(Path.GetPathRoot(canonical), canonical, StringComparison.Ordinal))
+        {
+            canonical = canonical.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        return canonical;
     }
 
     /// <summary>
