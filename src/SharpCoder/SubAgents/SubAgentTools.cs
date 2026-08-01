@@ -69,7 +69,12 @@ internal static class SubAgentTools
 
                 if (image_paths is { Length: > 0 } paths)
                 {
-                    var loadResult = await ImageLoader.LoadAsync(manager.WorkDirectory, paths, executionCt).ConfigureAwait(false);
+                    // No additional root configured → the original single-root loader, untouched.
+                    var additionalRoot = manager.AdditionalImagesRoot;
+                    var loadResult = additionalRoot is null
+                        ? await ImageLoader.LoadAsync(manager.WorkDirectory, paths, executionCt).ConfigureAwait(false)
+                        : await ImageLoader.LoadAsync(manager.WorkDirectory, paths, additionalRoot, executionCt).ConfigureAwait(false);
+
                     if (!loadResult.Success)
                     {
                         return WriteJson(w =>
