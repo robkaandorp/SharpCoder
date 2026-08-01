@@ -197,6 +197,8 @@ Sub-agents cannot spawn their own sub-agents. This flat-design limitation is pla
 
 A parent agent that does not itself need vision can still delegate image or PDF analysis to a vision-capable sub-agent. Use `start_sub_agent` with the `image_paths` argument and configure the sub-agent with a vision-capable model. Paths are repo-relative to `WorkDirectory` and are confined by the same path-safety rules as file tools.
 
+By default, `image_paths` resolve only within the parent agent's `WorkDirectory`. Set `SubAgentOptions.AdditionalImagesRoot` to an absolute directory path to allow `image_paths` to also resolve within that directory — useful for temporary or uploaded attachments outside the repo. The value is validated and snapshotted at manager construction; `null` (the default) means no additional root is configured.
+
 ```csharp
 var agent = new CodingAgent(mainClient, new AgentOptions
 {
