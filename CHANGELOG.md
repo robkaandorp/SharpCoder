@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.17.0] — 2026-08-20
+
+### Added
+
+- **`SharpCoder.Providers`** — extracted model-provider library (IChatClient factories for GitHub Copilot, GitHub Models and Ollama, with resilience, reasoning-effort mapping and opt-in diagnostics). Published as a separate NuGet package.
+- **Central `Directory.Build.props`** — shared `<VersionPrefix>` at the repo root; individual csproj files no longer carry their own version.
+
+### Removed
+
+- **`SharpCoder.CliAgent`** — the example CLI project has been removed.
+
 ## [0.16.1] — 2026-08-15
 
 ### Changed

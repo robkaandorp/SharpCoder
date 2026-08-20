@@ -10,7 +10,6 @@
     <!-- NuGet Package Properties -->
     <IsPackable>true</IsPackable>
     <PackageId>SharpCoder.Providers</PackageId>
-    <VersionPrefix>0.16.1</VersionPrefix>
     <Authors>Rob</Authors>
     <Description>Model-provider infrastructure for SharpCoder: IChatClient factories for GitHub Copilot, GitHub Models and Ollama, with resilience, reasoning-effort mapping and opt-in diagnostics.</Description>
     <PackageTags>ai;agent;llm;copilot;ollama;openai;providers</PackageTags>

@@ -1,7 +1,4 @@
 <Solution>
-  <Folder Name="/examples/">
-    <Project Path="examples/SharpCoder.CliAgent/SharpCoder.CliAgent.csproj" />
-  </Folder>
   <Folder Name="/src/">
     <Project Path="src/SharpCoder/SharpCoder.csproj" />
     <Project Path="src/SharpCoder.Providers/SharpCoder.Providers.csproj" />
