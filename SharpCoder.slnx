@@ -1,11 +1,10 @@
 <Solution>
-  <Folder Name="/examples/">
-    <Project Path="examples/SharpCoder.CliAgent/SharpCoder.CliAgent.csproj" />
-  </Folder>
   <Folder Name="/src/">
     <Project Path="src/SharpCoder/SharpCoder.csproj" />
+    <Project Path="src/SharpCoder.Providers/SharpCoder.Providers.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SharpCoder.Tests/SharpCoder.Tests.csproj" />
+    <Project Path="tests/SharpCoder.Providers.Tests/SharpCoder.Providers.Tests.csproj" />
   </Folder>
 </Solution>

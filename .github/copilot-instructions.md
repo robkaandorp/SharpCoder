@@ -10,9 +10,12 @@ NuGet package.
 
 - `src/SharpCoder/` — the library (the NuGet package). Target: `netstandard2.1`,
   `LangVersion 12.0`, nullable enabled, **`TreatWarningsAsErrors=true`**.
+- `src/SharpCoder.Providers/` — model-provider library (packable NuGet package).
+  Target: `net10.0`.
 - `tests/SharpCoder.Tests/` — xUnit v3 tests. Target: `net10.0`.
   `InternalsVisibleTo` is granted so tests can touch internals.
-- `examples/SharpCoder.CliAgent/` — runnable sample CLI agent.
+- `tests/SharpCoder.Providers.Tests/` — xUnit v3 tests for the provider library.
+  Target: `net10.0`.
 - Solution file is `SharpCoder.slnx` (new XML format; use it, not a `.sln`).
 
 ## Build / test / run
@@ -33,15 +36,10 @@ dotnet test tests/SharpCoder.Tests --filter "FullyQualifiedName~CodingAgentTests
 dotnet test tests/SharpCoder.Tests --filter "DisplayName~fragment"
 ```
 
-Run the example CLI:
-
-```bash
-dotnet run --project examples/SharpCoder.CliAgent
-```
-
-There is no separate lint step — `TreatWarningsAsErrors` in both csproj files
-means any new warning fails the build. CI (`.github/workflows/nuget-publish.yml`)
-runs restore → build → test on `ubuntu-latest` with the .NET 10 SDK.
+There is no separate lint step — `TreatWarningsAsErrors` is enabled across the
+solution's projects, so any new warning fails the build. CI
+(`.github/workflows/nuget-publish.yml`) runs restore → build → test on
+`ubuntu-latest` with the .NET 10 SDK.
 
 ## Architecture (the big picture)
 
@@ -107,7 +105,7 @@ Tools live in `src/SharpCoder/Tools/` (`FileTools.cs`, `BashTools.cs`,
 - **Changelog discipline:** every user-visible change is recorded in
   `CHANGELOG.md` under a Keep-a-Changelog heading with
   Added/Changed/Fixed sections. Bump `<VersionPrefix>` in
-  `src/SharpCoder/SharpCoder.csproj` for releases; CI appends `-beta.N` on the
+  `Directory.Build.props` for releases; CI appends `-beta.N` on the
   `develop` branch via `--version-suffix`. Do not set `<VersionSuffix>` in the
   csproj (caused `0.5.0-beta-beta.42`-style double-beta; see `0.6.0`).
 - **Skills:** agent-loadable skills live under `.github/skills/` as Markdown
