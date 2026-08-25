@@ -26,12 +26,72 @@ public static class ChatClientFactory
 
     /// <summary>
     /// Registers a provider that supplies the GitHub access token to use for the Copilot
-    /// provider. When set and it returns a non-null value, the provided token is used in
-    /// preference to the <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment variables. This is the
-    /// bridge that lets the orchestrator inject the OAuth access token stored in the database
-    /// without this shared class depending on the main project.
+    /// provider. When set and it returns a non-whitespace value, that token is used in
+    /// preference to the <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment variables; a
+    /// <see langword="null"/> or whitespace value is treated as absent, so the environment
+    /// variables are consulted instead. This is the bridge that lets the orchestrator inject the
+    /// OAuth access token stored in the database without this shared class depending on the main
+    /// project.
     /// </summary>
     public static void SetTokenProvider(Func<string?> provider) => _tokenProvider = provider;
+
+    /// <summary>
+    /// Resolves the token to use for the Copilot provider: the first non-whitespace of the
+    /// stored OAuth token (via <see cref="SetTokenProvider"/>) → <c>GH_TOKEN</c> →
+    /// <c>GITHUB_TOKEN</c>. Whitespace is treated as absent at every level, so a whitespace
+    /// value never suppresses a later valid value.
+    /// </summary>
+    /// <returns>The first non-whitespace token, or <see langword="null"/> when all sources are
+    /// absent or whitespace.</returns>
+    /// <remarks>
+    /// This is the single shared resolver for the Copilot path: both
+    /// <see cref="CreateCopilotClient"/> and <see cref="IsTokenAvailable"/> consult it, so the
+    /// factory's token selection and the public availability report can never diverge.
+    /// </remarks>
+    internal static string? ResolveCopilotToken()
+    {
+        var oauthToken = _tokenProvider?.Invoke();
+        if (!string.IsNullOrWhiteSpace(oauthToken))
+            return oauthToken;
+
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        if (!string.IsNullOrWhiteSpace(ghToken))
+            return ghToken;
+
+        var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        return string.IsNullOrWhiteSpace(githubToken) ? null : githubToken;
+    }
+
+    /// <summary>
+    /// Resolves the token to use for the GitHub Models provider: the first non-whitespace of the
+    /// <c>GH_TOKEN</c> → <c>GITHUB_TOKEN</c> environment variables. Whitespace is treated as
+    /// absent, so a whitespace value never suppresses a later valid value. Unlike
+    /// <see cref="ResolveCopilotToken"/>, the stored OAuth token does <b>not</b> participate.
+    /// </summary>
+    /// <returns>The first non-whitespace environment token, or <see langword="null"/> when both
+    /// variables are absent or whitespace.</returns>
+    internal static string? ResolveGitHubEnvToken()
+    {
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        if (!string.IsNullOrWhiteSpace(ghToken))
+            return ghToken;
+
+        var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        return string.IsNullOrWhiteSpace(githubToken) ? null : githubToken;
+    }
+
+    /// <summary>
+    /// Reports whether a non-whitespace Copilot token is available, using the same precedence as
+    /// the Copilot client factory: stored OAuth token (via <see cref="SetTokenProvider"/>) →
+    /// <c>GH_TOKEN</c> → <c>GITHUB_TOKEN</c>, with whitespace treated as absent at every level.
+    /// </summary>
+    /// <returns><see langword="true"/> when a non-whitespace Copilot token is available;
+    /// <see langword="false"/> when all sources are absent or whitespace.</returns>
+    /// <remarks>
+    /// This is intentionally Copilot-only: the GitHub Models branch keeps its own internal
+    /// resolver (<see cref="ResolveGitHubEnvToken"/>) and is not surfaced here.
+    /// </remarks>
+    public static bool IsTokenAvailable() => ResolveCopilotToken() != null;
 
     /// <summary>
     /// The environment variable that enables request/response diagnostics logging when it holds a
@@ -360,8 +420,8 @@ public static class ChatClientFactory
 
             case "github":
                 {
-                    var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-                    if (string.IsNullOrEmpty(token)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for github provider");
+                    var token = ResolveGitHubEnvToken();
+                    if (token is null) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for github provider");
 
                     model ??= Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
 
@@ -535,11 +595,8 @@ public static class ChatClientFactory
 
     private static IChatClient CreateCopilotClient(string model)
     {
-        var oauthToken = _tokenProvider?.Invoke();
-        var ghToken = oauthToken
-            ?? Environment.GetEnvironmentVariable("GH_TOKEN")
-            ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        if (string.IsNullOrEmpty(ghToken)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
+        var ghToken = ResolveCopilotToken();
+        if (ghToken is null) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
 
         var useResponsesApi = RequiresResponsesEndpoint(model);
 

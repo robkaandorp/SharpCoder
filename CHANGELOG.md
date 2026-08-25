@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.18.0] — 2026-08-25
+
+### Added
+
+- **`SharpCoder.Providers` token availability API** — `ChatClientFactory.IsTokenAvailable()` reports whether a non-whitespace Copilot token is available, using the exact same precedence as the Copilot client factory (stored OAuth token → `GH_TOKEN` → `GITHUB_TOKEN`, whitespace treated as absent at every level). This lets hosts gate Copilot-dependent startup on token availability without duplicating the factory's selection logic.
+- **First-non-whitespace token selection** — the Copilot and GitHub Models branches of `ChatClientFactory.Create` now treat whitespace token values as absent: a whitespace stored token, `GH_TOKEN`, or `GITHUB_TOKEN` no longer suppresses a later valid value. The Copilot branch's selection is shared with `IsTokenAvailable` via the internal `ResolveCopilotToken()` resolver; the GitHub Models branch resolves env-only via the internal `ResolveGitHubEnvToken()`.
+
 ## [0.17.0] — 2026-08-20
 
 ### Added
