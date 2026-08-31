@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.18.1] — 2026-08-31
+
+### Changed
+
+- **Resilience pipeline timeout doubled** — the HTTP resilience pipeline timeout in `ChatClientFactory.CreateResilientHandler` (`SharpCoder.Providers`) is doubled from 10 minutes to 20 minutes, so long-running streaming LLM calls are no longer aborted by the resilience pipeline at the previous 10-minute boundary. `NetworkTimeout` (30 minutes), the resilience retry parameters, and the sub-agent timeouts (10/30 minutes) are unchanged.
+
 ## [0.18.0] — 2026-08-25
 
 ### Added
