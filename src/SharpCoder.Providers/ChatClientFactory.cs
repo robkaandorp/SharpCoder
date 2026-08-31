@@ -578,7 +578,7 @@ public static class ChatClientFactory
                     return default;
                 },
             })
-            .AddTimeout(TimeSpan.FromMinutes(10))
+            .AddTimeout(TimeSpan.FromMinutes(20))
             .Build();
 
         return BuildHandlerChain(
