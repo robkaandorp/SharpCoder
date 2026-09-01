@@ -11,6 +11,7 @@ using Polly;
 
 using System.ClientModel;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -1089,14 +1090,25 @@ public static class ChatClientFactory
     /// never correctness: no state from another conversation is ever mixed in.
     /// </para>
     /// <para>
-    /// TEMPORARY, DECLARED PARTIAL FIX: streaming (SSE) responses are handed back unparsed, so
-    /// their response id is not available here and their state can only be committed to a single
-    /// shared <see cref="StreamingLegacySlotKey"/> slot, which every streaming request falls back
-    /// to when its <c>previous_response_id</c> does not resolve. Concurrent streaming
-    /// conversations therefore still share one slot, and evicting the slot degrades streaming
-    /// follow-ups to first-request transformations. This is knowingly only a partial resolution of
-    /// the isolation problem and stays in place until the follow-up work replaces the slot with
-    /// per-conversation streaming state (SSE id extraction).
+    /// STREAMING IS FULLY ISOLATED TOO. A successful <c>text/event-stream</c> response is handed
+    /// back untouched, but every byte the SDK's parser reads also flows through a transport tee
+    /// (<see cref="TeeStreamContent"/>) into an incremental SSE parser
+    /// (<see cref="StreamingResponseParser"/>). The parser lifts the real response id out of the
+    /// FIRST <c>response.created</c> event and commits the staged state under that id — exactly
+    /// like a non-streaming exchange — so concurrent streaming conversations no longer share
+    /// anything. It then buffers the <c>response.output_item.done</c> items and amends the entry
+    /// with them on <c>response.completed</c>. When no valid id is ever seen, NO entry is written
+    /// under any key (there is no fallback slot), and the next follow-up degrades exactly like a
+    /// non-streaming one.
+    /// </para>
+    /// <para>
+    /// RACING FOLLOW-UP LIMITATION: the commit happens when the id arrives and the output
+    /// amendment only when the stream completes, so a follow-up that raced in between would read
+    /// the entry WITHOUT its output items. This is theoretical rather than practical: the SDK
+    /// consumes the whole stream before the caller can issue the follow-up that names the response
+    /// id, so the amendment has always landed by then. Likewise a stream that ends WITHOUT a
+    /// <c>response.completed</c> event drops its buffered items — the entry keeps its committed
+    /// base and history, degrading context but never correctness.
     /// </para>
     /// </remarks>
     internal sealed class CopilotResponsesHandler : DelegatingHandler
@@ -1110,6 +1122,21 @@ public static class ChatClientFactory
         {
             public required JsonArray BaseInput { get; init; }
             public required List<JsonNode> TurnHistory { get; init; }
+
+            /// <summary>
+            /// A monotonically increasing stamp assigned under the store lock by
+            /// <see cref="StoreConversationState"/> when this instance is written.
+            /// </summary>
+            /// <remarks>
+            /// It exists solely so the streaming output amendment can tell "the entry I committed"
+            /// from "a different entry that happens to sit under the same key now" — a
+            /// re-commit, an eviction plus a re-insert, or another conversation reusing the id all
+            /// produce a NEW generation, and an amendment carrying a stale one is silently dropped.
+            /// Clones handed out by <see cref="TryResolveConversationState"/> deliberately do NOT
+            /// carry it (they default to 0): the non-streaming paths and the test seams neither
+            /// see nor depend on it.
+            /// </remarks>
+            public long Generation { get; init; }
         }
 
         /// <summary>Guards <see cref="_store"/> and <see cref="_insertionOrder"/> bookkeeping.</summary>
@@ -1133,10 +1160,10 @@ public static class ChatClientFactory
         private const int MaxEntries = 50;
 
         /// <summary>
-        /// The single slot every streaming conversation shares until SSE response ids can be
-        /// extracted. See the class remarks: this is a declared temporary partial fix.
+        /// Source of <see cref="ConversationState.Generation"/> stamps. Only ever read and
+        /// incremented while <see cref="_storeLock"/> is held.
         /// </summary>
-        internal const string StreamingLegacySlotKey = "streaming-legacy";
+        private long _generationCounter;
 
         private int _requestCount;
 
@@ -1146,13 +1173,20 @@ public static class ChatClientFactory
         /// finally receives an authoritative response.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// <see cref="BaseInput"/> and <see cref="TurnHistory"/> are always either both set or both
         /// <see langword="null"/>. Both <see langword="null"/> means NOTHING was staged (the
         /// request's <c>input</c> was not a JSON array), which is deliberately distinct from a
-        /// staged-but-empty history: the streaming commit is a no-op for the former and writes the
-        /// slot for the latter.
+        /// staged-but-empty history: the streaming commit is a no-op for the former and writes an
+        /// entry under the streamed response id for the latter.
+        /// </para>
+        /// <para>
+        /// Internal rather than private only so <see cref="StreamingResponseParser"/> — which
+        /// commits this state from inside the transport tee — can name it in its constructor
+        /// signature. It stays an implementation detail of this handler.
+        /// </para>
         /// </remarks>
-        private sealed class PendingConversationState
+        internal sealed class PendingConversationState
         {
             public JsonArray? BaseInput { get; init; }
             public List<JsonNode>? TurnHistory { get; init; }
@@ -1213,18 +1247,9 @@ public static class ChatClientFactory
 
                 if (json is JsonObject obj)
                 {
-                    // A request declares itself streaming through "stream": true. This governs
-                    // TRANSFORMATION and STAGING only; the commit is governed by the response's
-                    // content type. When the two disagree, the response's signal wins.
-                    var isStreamingRequest = obj["stream"] is JsonValue streamValue
-                        && streamValue.TryGetValue<bool>(out var streamFlag)
-                        && streamFlag;
-
-                    // STATE SELECTION.
+                    // STATE SELECTION — identical for streaming and non-streaming requests:
                     // 1. A present, valid, found previous_response_id resolves that conversation.
-                    // 2. A streaming request otherwise falls back to the shared legacy slot (see
-                    //    the class remarks: declared temporary partial fix).
-                    // 3. Neither resolves → degraded/fresh: first-request transformation.
+                    // 2. Otherwise → degraded/fresh: first-request transformation.
                     ConversationState? parent = null;
                     var bodyWasRewritten = false;
                     if (obj.ContainsKey("previous_response_id"))
@@ -1236,9 +1261,6 @@ public static class ChatClientFactory
                         bodyWasRewritten = true;
                         parent = TryResolveConversationState(previousId);
                     }
-
-                    if (parent is null && isStreamingRequest)
-                        parent = TryResolveConversationState(StreamingLegacySlotKey);
 
                     var currentInput = obj["input"] as JsonArray;
 
@@ -1360,26 +1382,34 @@ public static class ChatClientFactory
             }
 
             // Successful streaming response: the SSE stream must be consumed directly by the
-            // OpenAI SDK's streaming parser, so this is the last point at which the exchange can be
-            // treated as authoritative — and the response id is never observable here. Commit the
-            // staged state to the shared legacy slot, before handing the untouched stream back.
-            //
-            // ONE COMMIT RULE: every successful SSE response writes the slot, with NO response
-            // output appended (extracting it from the stream is follow-up work). A request that
-            // staged nothing (non-array input) is a no-op, so the slot's previous entry keeps.
+            // OpenAI SDK's streaming parser, so nothing may be read here. The conversation state
+            // is committed by the SSE parser instead, from inside the transport tee, the moment
+            // the stream's own response id becomes observable.
             if (isStreaming)
             {
                 // TRANSPORT TEE: the content is wrapped so that every byte the SDK's streaming
-                // parser reads can also be observed here, WITHOUT changing what the SDK sees. The
+                // parser reads is also observed here, WITHOUT changing what the SDK sees. The
                 // wrapper acquires the underlying stream lazily — on the first ACTUAL read, not
                 // when the stream handle is requested — so the response still leaves this handler
-                // completely unconsumed and unacquired, exactly as before. The per-chunk observer
-                // is left unset for now: plugging the SSE parser (and with it the per-conversation
-                // id commit) into this seam is the follow-up work.
+                // completely unconsumed and unacquired.
+                //
+                // ONE PARSER PER RESPONSE: the parser owns this exchange's staged state and
+                // commits it under the real id from the first response.created event, then amends
+                // the entry with the streamed output items on response.completed. No id → no
+                // entry, ever: the staged state is simply abandoned.
+                //
+                // BOTH SEAMS ARE WIRED. Chunks feed the incremental parse; the tee's END-OF-INPUT
+                // signal completes it, so a final line the server left unterminated is processed
+                // exactly once, before the reader is told the body is over. Disposal is
+                // deliberately NOT wired: a response abandoned mid-stream never reached its end,
+                // and completing its parse would act on a line the server had not finished.
                 if (response.Content is not null)
-                    response.Content = new TeeStreamContent(response.Content, onChunk: null);
+                {
+                    var parser = new StreamingResponseParser(this, pending);
+                    response.Content = new TeeStreamContent(
+                        response.Content, parser.Append, parser.CompleteInput);
+                }
 
-                CommitStreamingState(pending);
                 return response;
             }
 
@@ -1500,30 +1530,15 @@ public static class ChatClientFactory
         }
 
         /// <summary>
-        /// Promotes state staged for a streaming request into the single shared legacy slot. See
-        /// the class remarks: a declared temporary partial fix, because an SSE response's id is not
-        /// observable here.
-        /// </summary>
-        /// <remarks>
-        /// No response output is appended — extracting it from the event stream is follow-up work.
-        /// A request that staged nothing (non-array input) leaves the slot's previous entry alone.
-        /// </remarks>
-        private void CommitStreamingState(PendingConversationState? pending)
-        {
-            if (pending is null || pending.Committed) return;
-            pending.Committed = true;
-
-            if (!pending.HasStagedState) return;
-
-            StoreConversationState(StreamingLegacySlotKey, pending.BaseInput!, pending.TurnHistory!);
-        }
-
-        /// <summary>
         /// Writes one conversation entry, bounding the store to <see cref="MaxEntries"/> by
         /// evicting the oldest key. A key that is already present is updated in place, without
         /// adding a second insertion-order entry.
         /// </summary>
-        private void StoreConversationState(string key, JsonArray baseInput, List<JsonNode> turnHistory)
+        /// <returns>
+        /// The <see cref="ConversationState.Generation"/> stamp of the entry just written, so a
+        /// later amendment can prove it is amending THAT entry and not a replacement.
+        /// </returns>
+        private long StoreConversationState(string key, JsonArray baseInput, List<JsonNode> turnHistory)
         {
             lock (_storeLock)
             {
@@ -1539,13 +1554,72 @@ public static class ChatClientFactory
                     _insertionOrder.Enqueue(key);
                 }
 
+                var generation = ++_generationCounter;
+
                 _store[key] = new ConversationState
                 {
                     BaseInput = baseInput,
                     TurnHistory = turnHistory,
+                    Generation = generation,
                 };
+
+                return generation;
             }
         }
+
+        /// <summary>
+        /// Appends streamed output items to the entry under <paramref name="key"/>, as ONE batch,
+        /// but only when that entry is still the exact one identified by
+        /// <paramref name="generation"/>.
+        /// </summary>
+        /// <remarks>
+        /// A generation mismatch means the entry was replaced (re-committed, or evicted and
+        /// re-inserted) between the streaming commit and this amendment, so the buffered items
+        /// belong to a state that no longer exists: the amendment is SILENTLY DROPPED rather than
+        /// grafted onto an unrelated conversation. The amended entry keeps its generation — this
+        /// is a completion of the same write, not a new one — and the insertion order is untouched.
+        /// </remarks>
+        private void AmendConversationState(string key, long generation, List<JsonNode> outputItems)
+        {
+            if (outputItems.Count == 0) return;
+
+            lock (_storeLock)
+            {
+                if (!_store.TryGetValue(key, out var state)) return;
+                if (state.Generation != generation) return;
+
+                var turnHistory = new List<JsonNode>(state.TurnHistory.Count + outputItems.Count);
+                turnHistory.AddRange(state.TurnHistory);
+                turnHistory.AddRange(outputItems);
+
+                _store[key] = new ConversationState
+                {
+                    BaseInput = state.BaseInput,
+                    TurnHistory = turnHistory,
+                    Generation = generation,
+                };
+
+                // Test seam: reports the write that just happened, from INSIDE the lock, so a
+                // test can prove an amendment is ONE batch rather than a per-item drip. No
+                // observer (the default) means no behaviour of any kind.
+                OnAmendmentForTest?.Invoke(key, turnHistory.Count);
+            }
+        }
+
+        /// <summary>
+        /// Test seam: invoked once per APPLIED amendment, inside the store lock, with the entry's
+        /// key and the resulting turn-history count.
+        /// </summary>
+        /// <remarks>
+        /// It exists so a test can count amendment OPERATIONS rather than merely inspect the final
+        /// state: an implementation that amended item-by-item under separate lock acquisitions
+        /// produces one invocation per item (and a growing count), while the one-batch contract
+        /// produces exactly one invocation carrying the full count. Because it fires inside the
+        /// lock, every intermediate state an implementation could publish is observed — a batch
+        /// that is never partially visible is one that never reports a partial count.
+        /// <see langword="null"/> by default, so it is invisible to all production behaviour.
+        /// </remarks>
+        internal Action<string, int>? OnAmendmentForTest { get; set; }
 
         /// <summary>
         /// Resolves the conversation state recorded under <paramref name="key"/>, as a private deep
@@ -1623,6 +1697,655 @@ public static class ChatClientFactory
         }
 
         /// <summary>
+        /// Test accessor: builds a parser wired to this handler over freshly staged state, exactly
+        /// as the streaming path does, so the SSE algorithm can be driven byte-by-byte without an
+        /// HTTP exchange.
+        /// </summary>
+        /// <param name="stagedBase">
+        /// The staged base input, or <see langword="null"/> together with
+        /// <paramref name="stagedHistory"/> to model a request that staged NOTHING (non-array input).
+        /// </param>
+        /// <param name="stagedHistory">The staged turn history; see <paramref name="stagedBase"/>.</param>
+        internal StreamingResponseParser CreateStreamingParserForTest(
+            JsonArray? stagedBase, List<JsonNode>? stagedHistory)
+            => new(this, new PendingConversationState
+            {
+                BaseInput = stagedBase,
+                TurnHistory = stagedHistory,
+            });
+
+        /// <summary>
+        /// Incremental SSE parser for ONE successful streaming response, fed the response's bytes
+        /// through <see cref="TeeStreamContent.OnChunk"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHAT IT DOES. It lifts the conversation's real response id out of the FIRST
+        /// <c>event: response.created</c> block (<c>$.response.id</c>, under the same uniform id
+        /// rule as the non-streaming path) and commits the request's staged state under it, then
+        /// buffers every <c>response.output_item.done</c> item (<c>$.item</c>) and amends the
+        /// committed entry with them, as one batch, on <c>response.completed</c>. The result is an
+        /// entry composed exactly like a non-streaming one: staged base + staged history + the
+        /// response's output items.
+        /// </para>
+        /// <para>
+        /// PASSTHROUGH IS SACRED, AND SO IS NOT THROWING. This is a pure side channel: it never
+        /// touches the bytes and never throws. The tee's observer containment is the backstop, not
+        /// the excuse — every entry point absorbs its own failures and simply goes inert.
+        /// </para>
+        /// <para>
+        /// PARSING. Chunk boundaries are irrelevant: lines are assembled from RAW BYTES, so a
+        /// UTF-8 multi-byte sequence split across two chunks is reassembled before it is ever
+        /// decoded (a newline byte can never occur inside a multi-byte sequence, which is what
+        /// makes byte-level line splitting safe). LF and CRLF both terminate a line; multiple
+        /// <c>data:</c> lines in one block are concatenated with <c>\n</c> per the SSE spec;
+        /// <c>event:</c> and <c>data:</c> may appear in any order; comment lines (<c>:…</c>) and
+        /// unknown fields are ignored; a blank line dispatches the block; malformed events are
+        /// skipped.
+        /// </para>
+        /// <para>
+        /// END OF INPUT. The chunk seam delivers only non-empty reads, so the stream's END is
+        /// signalled through a second seam — <see cref="TeeStreamContent.OnEof"/>, raised on the
+        /// first zero-length read — which drives <see cref="CompleteInput"/>. That is what makes a
+        /// FINAL UNTERMINATED line (and the block it completes) processable at all: a zero-length
+        /// read is the transport's own statement that every byte the server sent has arrived, so
+        /// the line can no longer grow.
+        /// </para>
+        /// <para>
+        /// EOF, NOT DISPOSAL, COMPLETES THE PARSE. Disposal carries no such statement: a response
+        /// abandoned mid-stream (cancellation, an early break out of the SDK's enumeration, a
+        /// transport failure) is disposed with the body still in flight, and completing the parse
+        /// there would act on a line the server had not finished writing. There is therefore no
+        /// disposal hook, and the disposal semantics fall out for free: because the commit happens
+        /// BEFORE the chunk carrying <c>response.created</c> is returned to the reader, a stream
+        /// disposed or abandoned before that point committed nothing (the staged state is simply
+        /// abandoned), and one disposed after it keeps the entry that was already written. A
+        /// stream that ends without <c>response.completed</c> keeps its committed entry but DROPS
+        /// the buffered output items — degraded context, never incorrect context.
+        /// </para>
+        /// <para>
+        /// BOUNDED MEMORY. Three limits keep an adversarial or runaway stream from accumulating:
+        /// a single line over <see cref="MaxLineBytes"/> is discarded at the boundary (the next
+        /// terminator resets the line), the id search gives up after
+        /// <see cref="IdSearchByteCap"/> retained event-block bytes, and buffered output payloads
+        /// stop at <see cref="OutputByteCap"/>. Every limit is INCLUSIVE and applies per complete
+        /// event: a block that fits at-or-below its cap is accepted whole, one that straddles the
+        /// boundary is dropped whole. Breaching a cap only ever stops RETENTION — the passthrough
+        /// is untouched.
+        /// </para>
+        /// </remarks>
+        internal sealed class StreamingResponseParser
+        {
+            /// <summary>
+            /// Maximum retained length, in bytes and excluding the line terminator, of a single
+            /// SSE line. A longer line is discarded at the boundary rather than buffered.
+            /// </summary>
+            internal const int MaxLineBytes = 8 * 1024;
+
+            /// <summary>
+            /// Inclusive cap on the event-block bytes RETAINED while searching for the response
+            /// id. Exceeding it abandons the id search (and with it this response's entry).
+            /// </summary>
+            internal const int IdSearchByteCap = 64 * 1024;
+
+            /// <summary>
+            /// Inclusive cap on the raw <c>data:</c> payload bytes of buffered
+            /// <c>response.output_item.done</c> events.
+            /// </summary>
+            internal const int OutputByteCap = 2 * 1024 * 1024;
+
+            private const string EventResponseCreated = "response.created";
+            private const string EventOutputItemDone = "response.output_item.done";
+            private const string EventResponseCompleted = "response.completed";
+
+            private readonly CopilotResponsesHandler _owner;
+            private readonly PendingConversationState? _pending;
+
+            /// <summary>
+            /// Serializes the parser's state. The SDK consumes a response stream one read at a
+            /// time, but nothing guarantees those reads happen on the same thread.
+            /// </summary>
+            private readonly object _gate = new();
+
+            // ── Line assembly ────────────────────────────────────────────────
+            private byte[] _line = new byte[256];
+            private int _lineLength;
+
+            /// <summary>
+            /// A carriage return has arrived and is being held back until the next byte reveals
+            /// whether it was the first half of a CRLF terminator (dropped) or ordinary content
+            /// (retained then, and only then charged against the line's content limit).
+            /// </summary>
+            private bool _pendingCr;
+
+            /// <summary>
+            /// Set once the current line has passed <see cref="MaxLineBytes"/>: its bytes are
+            /// dropped from here on, and the next terminator clears it.
+            /// </summary>
+            private bool _lineDiscarded;
+
+            // ── Current event block ──────────────────────────────────────────
+            private string? _eventName;
+            private readonly StringBuilder _blockData = new();
+            private bool _blockHasData;
+            private int _blockDataBytes;
+
+            /// <summary>Set when this block's data was dropped whole by the output cap.</summary>
+            private bool _blockDataDropped;
+
+            private bool _blockHasFields;
+
+            // ── Phase state ──────────────────────────────────────────────────
+            private bool _idSearchActive = true;
+            private int _idSearchBytes;
+            private bool _idSearchCapBreached;
+            private bool _createdSeen;
+
+            private string? _committedId;
+            private long _committedGeneration;
+
+            private readonly List<JsonNode> _outputItems = new();
+            private int _outputBytes;
+            private bool _outputCapBreached;
+
+            private bool _terminated;
+
+            /// <summary>
+            /// Set once this parser can no longer affect any state — it then retains nothing and
+            /// does nothing but let the bytes flow past.
+            /// </summary>
+            private bool _inert;
+
+            internal StreamingResponseParser(
+                CopilotResponsesHandler owner, PendingConversationState? pending)
+            {
+                _owner = owner ?? throw new ArgumentNullException(nameof(owner));
+                _pending = pending;
+            }
+
+            /// <summary>
+            /// The chunk observer handed to <see cref="TeeStreamContent"/>: consumes one chunk of
+            /// response bytes. Called synchronously BEFORE the chunk is returned to the reader, so
+            /// a commit triggered by this chunk is durable before the SDK ever sees those bytes.
+            /// </summary>
+            internal void Append(ReadOnlyMemory<byte> chunk)
+            {
+                lock (_gate)
+                {
+                    if (_inert) return;
+
+                    try
+                    {
+                        Consume(chunk.Span);
+                    }
+                    catch
+                    {
+                        // A side channel that fails must never disturb the response: give up on
+                        // this stream's state entirely rather than propagate. Deliberately broad —
+                        // "never throws" is this class's contract, not an aspiration.
+                        GoInert();
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Signals end of input: processes a FINAL UNTERMINATED line, then dispatches the
+            /// block it completes, because no further bytes can arrive to terminate it.
+            /// </summary>
+            /// <remarks>
+            /// Wired in production to <see cref="TeeStreamContent.OnEof"/>, which raises it on the
+            /// first zero-length read — the transport's own statement that the body is complete.
+            /// It is deliberately NOT wired to disposal: a response abandoned mid-stream never
+            /// reached its end, so its partial line must not be treated as finished. Idempotent
+            /// either way: a second call has nothing left to process.
+            /// </remarks>
+            internal void CompleteInput()
+            {
+                lock (_gate)
+                {
+                    if (_inert) return;
+
+                    try
+                    {
+                        // A held-back CR that nothing followed was never a terminator's first
+                        // half, so it is content on this final line — retain it before closing.
+                        if (_pendingCr)
+                        {
+                            _pendingCr = false;
+                            AppendLineByte((byte)'\r');
+                        }
+
+                        if (_lineLength > 0 || _lineDiscarded) EndLine();
+                        if (!_inert && _blockHasFields) DispatchBlock();
+                    }
+                    catch
+                    {
+                        GoInert();
+                    }
+                }
+            }
+
+            /// <summary>Feeds one chunk through the line splitter.</summary>
+            /// <remarks>
+            /// THE TERMINATOR IS NEVER CONTENT. A carriage return is held back rather than
+            /// retained: if the next byte is the line feed it completes, the CR was the first half
+            /// of a CRLF terminator and is dropped; if anything else follows, the CR was ordinary
+            /// content after all and is retained then — and only then does it count against the
+            /// line's content limit. Deferring it is what keeps an exactly-<see cref="MaxLineBytes"/>
+            /// line legal under CRLF as well as LF: the limit measures FIELD CONTENT, and a
+            /// terminator byte must never be able to push a line over it.
+            /// </remarks>
+            private void Consume(ReadOnlySpan<byte> chunk)
+            {
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    var value = chunk[i];
+
+                    if (value == (byte)'\n')
+                    {
+                        // The held-back CR (if any) was this terminator's first half: drop it.
+                        _pendingCr = false;
+                        EndLine();
+                        if (_inert) return;
+                        continue;
+                    }
+
+                    if (_pendingCr)
+                    {
+                        // No line feed followed, so the held-back CR was content. Retain it now,
+                        // charged against the content limit like any other byte.
+                        _pendingCr = false;
+                        AppendLineByte((byte)'\r');
+                    }
+
+                    if (value == (byte)'\r')
+                    {
+                        // Possibly the first half of a CRLF terminator — decided by the next byte.
+                        _pendingCr = true;
+                        continue;
+                    }
+
+                    AppendLineByte(value);
+                }
+            }
+
+            /// <summary>
+            /// Retains one byte of the current line's CONTENT, enforcing the per-line bound. A
+            /// line is discarded only once its content EXCEEDS <see cref="MaxLineBytes"/>: the
+            /// byte that would make it longer than the bound discards the line, nothing more of it
+            /// is retained, and the terminator that follows resets the buffer. Line terminators
+            /// never reach here (see <see cref="Consume"/>), so they can never trip the bound.
+            /// </summary>
+            private void AppendLineByte(byte value)
+            {
+                if (_lineDiscarded) return;
+
+                if (_lineLength >= MaxLineBytes)
+                {
+                    _lineDiscarded = true;
+                    _lineLength = 0;
+                    return;
+                }
+
+                if (_lineLength == _line.Length)
+                    Array.Resize(ref _line, Math.Clamp(_line.Length * 2, 256, MaxLineBytes));
+
+                _line[_lineLength++] = value;
+            }
+
+            /// <summary>
+            /// Completes the current line at a terminator: the buffer holds CONTENT only — the
+            /// terminator's bytes were never retained — and a discarded (over-long) line is
+            /// skipped entirely, its terminator resetting the buffer for the next line.
+            /// </summary>
+            private void EndLine()
+            {
+                if (_lineDiscarded)
+                {
+                    _lineDiscarded = false;
+                    _lineLength = 0;
+                    return;
+                }
+
+                var length = _lineLength;
+                _lineLength = 0;
+
+                ProcessLine(_line.AsSpan(0, length));
+            }
+
+            /// <summary>Applies one complete SSE line to the current block.</summary>
+            private void ProcessLine(ReadOnlySpan<byte> line)
+            {
+                if (line.Length == 0)
+                {
+                    // The blank line is the block boundary. It is never counted against any cap.
+                    DispatchBlock();
+                    return;
+                }
+
+                // Comments are ignored and retained not at all, so they cost nothing.
+                if (line[0] == (byte)':') return;
+
+                var colon = line.IndexOf((byte)':');
+                var field = colon < 0 ? line : line.Slice(0, colon);
+                var value = colon < 0 ? ReadOnlySpan<byte>.Empty : line.Slice(colon + 1);
+
+                // Per the SSE spec exactly one leading space of the value is removed.
+                if (value.Length > 0 && value[0] == (byte)' ') value = value.Slice(1);
+
+                var isEvent = FieldIs(field, "event");
+                var isData = !isEvent && FieldIs(field, "data");
+
+                // Only RETAINED lines are accounted for; unknown fields are dropped like comments.
+                if (!isEvent && !isData) return;
+
+                if (!ChargeIdSearch(line.Length)) return;
+
+                _blockHasFields = true;
+
+                if (isEvent)
+                {
+                    _eventName = Encoding.UTF8.GetString(value);
+                    return;
+                }
+
+                AppendBlockData(value);
+            }
+
+            /// <summary>
+            /// Charges a retained line against the id-search accumulator while the search is still
+            /// running. Breaching the cap ends the search — and with it this response's entry,
+            /// since without an id there is nothing to write.
+            /// </summary>
+            /// <returns>
+            /// <see langword="false"/> when the parser went inert and the caller must stop.
+            /// </returns>
+            private bool ChargeIdSearch(int lineBytes)
+            {
+                if (!_idSearchActive) return true;
+
+                _idSearchBytes += lineBytes;
+                if (_idSearchBytes <= IdSearchByteCap) return true;
+
+                // NO FALLBACK KEY: the id can no longer be found, so nothing is ever written for
+                // this response and everything retained so far is released.
+                _idSearchActive = false;
+                _idSearchCapBreached = true;
+                GoInert();
+                return false;
+            }
+
+            /// <summary>
+            /// Buffers one <c>data:</c> payload for the current block, charging its RAW bytes
+            /// against the output cap. An item that would straddle the cap is dropped WHOLE — its
+            /// payload is released immediately rather than half-retained — and once the cap has
+            /// been breached no block's data is retained at all.
+            /// </summary>
+            /// <remarks>
+            /// The cap is enforced while the payload arrives, before the block's event name is
+            /// necessarily known (SSE fields may come in any order), so it provisionally bounds
+            /// EVERY block's data. Only the payloads of accepted
+            /// <c>response.output_item.done</c> items are charged permanently.
+            /// </remarks>
+            private void AppendBlockData(ReadOnlySpan<byte> value)
+            {
+                if (_blockDataDropped) return;
+
+                if (_outputCapBreached
+                    || (long)_outputBytes + _blockDataBytes + value.Length > OutputByteCap)
+                {
+                    _blockDataDropped = true;
+                    _blockData.Clear();
+                    _blockDataBytes = 0;
+                    return;
+                }
+
+                // Multi-line data payloads are concatenated with a newline; the synthesized
+                // separator is not part of the raw payload and is not charged.
+                if (_blockHasData) _blockData.Append('\n');
+                _blockData.Append(Encoding.UTF8.GetString(value));
+                _blockHasData = true;
+                _blockDataBytes += value.Length;
+            }
+
+            /// <summary>Acts on a complete event block, then resets the block state.</summary>
+            private void DispatchBlock()
+            {
+                var eventName = _eventName;
+                var hadFields = _blockHasFields;
+                var data = _blockHasData ? _blockData.ToString() : null;
+                var dataBytes = _blockDataBytes;
+                var dataDropped = _blockDataDropped;
+
+                ResetBlock();
+
+                if (!hadFields) return;
+
+                // response.completed is a TERMINAL MARKER: everything after it is ignored.
+                if (_terminated) return;
+
+                switch (eventName)
+                {
+                    case EventResponseCreated:
+                        HandleResponseCreated(data);
+                        break;
+
+                    case EventOutputItemDone:
+                        HandleOutputItemDone(data, dataBytes, dataDropped);
+                        break;
+
+                    case EventResponseCompleted:
+                        // NEVER parsed for items — the sole authoritative output source is
+                        // response.output_item.done.
+                        _terminated = true;
+                        FlushOutputItems();
+                        GoInert();
+                        break;
+                }
+            }
+
+            /// <summary>
+            /// Handles the FIRST <c>response.created</c> block, which permanently decides this
+            /// response's fate: a valid <c>$.response.id</c> commits the staged state under it,
+            /// while malformed JSON or an unusable id abandons the state for good. No later
+            /// <c>response.created</c> is ever considered.
+            /// </summary>
+            private void HandleResponseCreated(string? data)
+            {
+                if (_createdSeen) return;
+                _createdSeen = true;
+
+                // Whatever the outcome, the id search is over: its accumulator is released.
+                _idSearchActive = false;
+
+                var id = ReadIdString(SelectProperty(SelectProperty(TryParse(data), "response"), "id"));
+                if (id is null)
+                {
+                    // NO FALLBACK KEY: no entry is written under any key, ever, so the next
+                    // follow-up naming this response degrades exactly like an unknown parent.
+                    GoInert();
+                    return;
+                }
+
+                Commit(id);
+            }
+
+            /// <summary>
+            /// Buffers one streamed output item, in arrival order, as a fully detached clone.
+            /// </summary>
+            private void HandleOutputItemDone(string? data, int dataBytes, bool dataDropped)
+            {
+                if (dataDropped)
+                {
+                    // The item straddled the output cap: it is dropped whole and nothing further
+                    // is buffered for this stream.
+                    _outputCapBreached = true;
+                    return;
+                }
+
+                if (_outputCapBreached) return;
+
+                var item = SelectProperty(TryParse(data), "item");
+                if (item is null) return;
+
+                _outputItems.Add(item.DeepClone());
+                _outputBytes += dataBytes;
+            }
+
+            /// <summary>
+            /// Promotes the staged state under the stream's real response id, remembering the
+            /// generation of the entry written so the later amendment can prove it is amending
+            /// that exact entry.
+            /// </summary>
+            private void Commit(string responseId)
+            {
+                var pending = _pending;
+
+                // Nothing staged (non-array input) or already committed elsewhere: this response
+                // gets NO entry at all, and the staged state is abandoned.
+                if (pending is null || pending.Committed || !pending.HasStagedState)
+                {
+                    if (pending is not null) pending.Committed = true;
+                    GoInert();
+                    return;
+                }
+
+                pending.Committed = true;
+
+                _committedGeneration = _owner.StoreConversationState(
+                    responseId, pending.BaseInput!, pending.TurnHistory!);
+                _committedId = responseId;
+            }
+
+            /// <summary>
+            /// Amends the committed entry with every buffered output item, as ONE batch. Dropped
+            /// silently when nothing was committed, or when the entry has since been replaced.
+            /// </summary>
+            private void FlushOutputItems()
+            {
+                if (_committedId is null || _outputItems.Count == 0) return;
+
+                _owner.AmendConversationState(_committedId, _committedGeneration, _outputItems);
+            }
+
+            /// <summary>Parses a data payload, treating a malformed one as absent.</summary>
+            private static JsonNode? TryParse(string? data)
+            {
+                if (string.IsNullOrWhiteSpace(data)) return null;
+
+                try
+                {
+                    return JsonNode.Parse(data!);
+                }
+                catch (JsonException)
+                {
+                    return null;
+                }
+            }
+
+            /// <summary>
+            /// Reads a property off a node when — and only when — that node is a JSON object.
+            /// Indexing a non-object <see cref="JsonNode"/> throws, and this parser must not.
+            /// </summary>
+            private static JsonNode? SelectProperty(JsonNode? node, string name)
+                => node is JsonObject obj && obj.TryGetPropertyValue(name, out var value) ? value : null;
+
+            private void ResetBlock()
+            {
+                _eventName = null;
+                _blockData.Clear();
+                _blockHasData = false;
+                _blockDataBytes = 0;
+                _blockDataDropped = false;
+                _blockHasFields = false;
+            }
+
+            /// <summary>
+            /// Releases everything and stops retaining: the parser can no longer change any state,
+            /// so from here on it only lets the bytes flow past.
+            /// </summary>
+            private void GoInert()
+            {
+                _inert = true;
+                _idSearchActive = false;
+                _lineLength = 0;
+                _lineDiscarded = false;
+                _pendingCr = false;
+                _line = Array.Empty<byte>();
+                ResetBlock();
+                _outputItems.Clear();
+            }
+
+            // ── Test seams ───────────────────────────────────────────────────
+
+            /// <summary>Test accessor: the id the staged state was committed under, if any.</summary>
+            internal string? CommittedIdForTest
+            {
+                get { lock (_gate) { return _committedId; } }
+            }
+
+            /// <summary>Test accessor: the generation captured at commit time (0 when uncommitted).</summary>
+            internal long CommittedGenerationForTest
+            {
+                get { lock (_gate) { return _committedGeneration; } }
+            }
+
+            /// <summary>Test accessor: how many output items are buffered, awaiting the flush.</summary>
+            internal int BufferedOutputCountForTest
+            {
+                get { lock (_gate) { return _outputItems.Count; } }
+            }
+
+            /// <summary>Test accessor: retained bytes charged to the id search so far.</summary>
+            internal int IdSearchBytesForTest
+            {
+                get { lock (_gate) { return _idSearchBytes; } }
+            }
+
+            /// <summary>Test accessor: raw payload bytes of the buffered output items.</summary>
+            internal int OutputBytesForTest
+            {
+                get { lock (_gate) { return _outputBytes; } }
+            }
+
+            /// <summary>Test accessor: whether the id-search cap was breached.</summary>
+            internal bool IdSearchCapBreachedForTest
+            {
+                get { lock (_gate) { return _idSearchCapBreached; } }
+            }
+
+            /// <summary>Test accessor: whether the output cap was breached.</summary>
+            internal bool OutputCapBreachedForTest
+            {
+                get { lock (_gate) { return _outputCapBreached; } }
+            }
+
+            /// <summary>Test accessor: whether <c>response.completed</c> has been seen.</summary>
+            internal bool TerminatedForTest
+            {
+                get { lock (_gate) { return _terminated; } }
+            }
+
+            /// <summary>Test accessor: whether the parser has stopped retaining anything.</summary>
+            internal bool InertForTest
+            {
+                get { lock (_gate) { return _inert; } }
+            }
+        }
+
+        /// <summary>Compares an SSE field name against an ASCII literal.</summary>
+        private static bool FieldIs(ReadOnlySpan<byte> field, string name)
+        {
+            if (field.Length != name.Length) return false;
+
+            for (var i = 0; i < name.Length; i++)
+                if (field[i] != (byte)name[i])
+                    return false;
+
+            return true;
+        }
+
+        /// <summary>
         /// Writes one side of a responses-API exchange to the diagnostics directory.
         /// </summary>
         /// <remarks>
@@ -1695,7 +2418,7 @@ public static class ChatClientFactory
             /// <summary>
             /// Parser seam: invoked synchronously with each chunk BEFORE that chunk is returned to
             /// the reader. <see langword="null"/> (the default) means no observer at all — a pure
-            /// passthrough. The follow-up work plugs the SSE parser in here.
+            /// passthrough.
             /// </summary>
             /// <remarks>
             /// The observer never throws out of the tee: an exception from it is caught and the
@@ -1703,10 +2426,45 @@ public static class ChatClientFactory
             /// </remarks>
             internal Action<ReadOnlyMemory<byte>>? OnChunk { get; set; }
 
-            public TeeStreamContent(HttpContent original, Action<ReadOnlyMemory<byte>>? onChunk = null)
+            /// <summary>
+            /// End-of-input seam: invoked synchronously EXACTLY ONCE, BEFORE the first zero-length
+            /// read is returned to the reader. <see langword="null"/> (the default) means no
+            /// observer at all, leaving every byte-exact passthrough guarantee untouched.
+            /// </summary>
+            /// <remarks>
+            /// <para>
+            /// WHY EOF AND NOT DISPOSAL. A zero-length read is the transport's own statement that
+            /// the response body is COMPLETE — every byte the server sent has been handed over — so
+            /// it is the only point at which a final unterminated line may safely be treated as a
+            /// finished line. Disposal says nothing of the sort: a caller that abandons a response
+            /// mid-stream (cancellation, an early <c>break</c> out of the SDK's enumeration, a
+            /// failure) disposes it with the body still in flight, and completing the parse there
+            /// would act on a line the server had not finished writing. Disposal therefore has NO
+            /// hook, deliberately: a stream abandoned before EOF simply never completes its parse.
+            /// </para>
+            /// <para>
+            /// The signal fires at most once per content, however many times the reader reads at
+            /// EOF, and — exactly like <see cref="OnChunk"/> — a throwing observer is caught and
+            /// disabled rather than propagated: the passthrough must never break.
+            /// </para>
+            /// </remarks>
+            internal Action? OnEof { get; set; }
+
+            /// <summary>
+            /// Once-only latch for <see cref="OnEof"/>: 0 until the signal has been raised, 1
+            /// after. Flipped with <see cref="Interlocked"/> so repeated — including concurrent —
+            /// reads at EOF still raise it exactly once.
+            /// </summary>
+            private int _eofSignalled;
+
+            public TeeStreamContent(
+                HttpContent original,
+                Action<ReadOnlyMemory<byte>>? onChunk = null,
+                Action? onEof = null)
             {
                 _original = original ?? throw new ArgumentNullException(nameof(original));
                 OnChunk = onChunk;
+                OnEof = onEof;
 
                 // Every original content header is carried over unvalidated, so the response the
                 // caller sees is indistinguishable from the one the server sent (content type and
@@ -1735,6 +2493,33 @@ public static class ChatClientFactory
                 {
                     // The side channel failed; drop it and keep streaming.
                     OnChunk = null;
+                }
+            }
+
+            /// <summary>
+            /// Raises the end-of-input signal, at most once, absorbing any failure.
+            /// </summary>
+            /// <remarks>
+            /// The latch is claimed BEFORE the observer runs, so an observer that throws — or one
+            /// that re-enters through another read — still cannot produce a second signal. See
+            /// <see cref="OnEof"/> for why this is driven by a zero-length read rather than by
+            /// disposal.
+            /// </remarks>
+            internal void NotifyEof()
+            {
+                if (Interlocked.Exchange(ref _eofSignalled, 1) != 0) return;
+
+                var observer = OnEof;
+                if (observer is null) return;
+
+                try
+                {
+                    observer();
+                }
+                catch
+                {
+                    // The side channel failed; drop it and keep streaming.
+                    OnEof = null;
                 }
             }
 
@@ -1824,7 +2609,8 @@ public static class ChatClientFactory
 
             /// <summary>
             /// The tee itself: a read-only passthrough over the response's content stream that
-            /// offers every chunk it returns to <see cref="TeeStreamContent.OnChunk"/> first.
+            /// offers every chunk it returns to <see cref="TeeStreamContent.OnChunk"/> first, and
+            /// raises <see cref="TeeStreamContent.OnEof"/> when the wrapped stream reports its end.
             /// </summary>
             /// <remarks>
             /// <para>
@@ -1833,9 +2619,19 @@ public static class ChatClientFactory
             /// Nothing is read ahead, coalesced or split.
             /// </para>
             /// <para>
-            /// This stream does NOT dispose the wrapped stream — its ownership stays with the
-            /// original <see cref="HttpContent"/>. Disposal only finalizes this wrapper's own
-            /// state, and is idempotent in both the synchronous and asynchronous form.
+            /// END OF INPUT. All four read overloads treat a zero-length read as end of input and
+            /// raise the owner's EOF signal BEFORE returning that 0 — the mirror of the chunk
+            /// seam's "observe before the reader sees it" rule, so an observer that finalizes
+            /// state has done so by the time the reader learns the body is over. The signal is
+            /// raised at most once per content, however many times a reader reads at EOF.
+            /// </para>
+            /// <para>
+            /// DISPOSAL IS NOT END OF INPUT. This stream does NOT dispose the wrapped stream — its
+            /// ownership stays with the original <see cref="HttpContent"/>. Disposal only
+            /// finalizes this wrapper's own state, is idempotent in both the synchronous and
+            /// asynchronous form, and deliberately raises NO signal: a response abandoned
+            /// mid-stream never reached its end, so nothing about it may be treated as complete.
+            /// See <see cref="TeeStreamContent.OnEof"/>.
             /// </para>
             /// <para>
             /// ACQUISITION IS DEFERRED TO THE FIRST ACTUAL READ. Constructing this stream — and
@@ -2114,6 +2910,7 @@ public static class ChatClientFactory
                     var inner = EnsureAcquired(CancellationToken.None);
                     var read = inner.Read(buffer, offset, count);
                     if (read > 0) _owner.NotifyChunk(new ReadOnlyMemory<byte>(buffer, offset, read));
+                    else _owner.NotifyEof();
                     return read;
                 }
 
@@ -2123,6 +2920,7 @@ public static class ChatClientFactory
                     var inner = EnsureAcquired(CancellationToken.None);
                     var read = inner.Read(buffer);
                     if (read > 0) NotifySpan(buffer.Slice(0, read));
+                    else _owner.NotifyEof();
                     return read;
                 }
 
@@ -2133,6 +2931,7 @@ public static class ChatClientFactory
                     var inner = await EnsureAcquiredAsync(cancellationToken).ConfigureAwait(false);
                     var read = await inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
                     if (read > 0) _owner.NotifyChunk(new ReadOnlyMemory<byte>(buffer, offset, read));
+                    else _owner.NotifyEof();
                     return read;
                 }
 
@@ -2143,6 +2942,7 @@ public static class ChatClientFactory
                     var inner = await EnsureAcquiredAsync(cancellationToken).ConfigureAwait(false);
                     var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
                     if (read > 0) _owner.NotifyChunk(buffer.Slice(0, read));
+                    else _owner.NotifyEof();
                     return read;
                 }
 

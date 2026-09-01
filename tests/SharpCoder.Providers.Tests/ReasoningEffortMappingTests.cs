@@ -1270,6 +1270,18 @@ public sealed class CopilotResponsesHandlerRetryTests
         ResponsesRequest(body);
 
     /// <summary>
+    /// A scripted SSE body that announces <paramref name="responseId"/> through a
+    /// <c>response.created</c> event — the ONLY way a streaming exchange can commit now that the
+    /// shared legacy slot is gone — and still ends with the <c>event: done</c> marker the
+    /// passthrough assertions look for.
+    /// </summary>
+    internal static string SseBodyWithId(string responseId) =>
+        "event: response.created\n" +
+        "data: {\"response\":{\"id\":\"" + responseId + "\"}}\n" +
+        "\n" +
+        "event: done\ndata: {}\n\n";
+
+    /// <summary>
     /// A first request that is retried must record the ORIGINAL input as the base context exactly
     /// once, under the response's own id. Before the fix, the retry re-read the (already-transformed)
     /// body and staged the expanded conversation as the base, corrupting every later conversation
@@ -1531,12 +1543,12 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
         }
 
-        Assert.False(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey,
-            out var baseInput, out var turnHistory));
+        // A failed exchange records nothing under any key — there is no streaming slot to check.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
         Assert.Null(baseInput);
         Assert.Empty(turnHistory);
-        Assert.Equal(0, handler.StoreCountForTest);
     }
 
     /// <summary>
@@ -1565,9 +1577,8 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        // Neither the streaming slot nor the parent entry may have grown.
-        Assert.False(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey, out _, out _));
+        // Nothing new was recorded, and the parent entry did not grow.
+        Assert.Equal(1, handler.StoreCountForTest);
 
         Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
         Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
@@ -1578,7 +1589,8 @@ public sealed class CopilotResponsesHandlerRetryTests
     /// <summary>
     /// An SSE attempt that fails transiently and then SUCCEEDS as SSE must commit exactly once —
     /// the fix must not swing too far and drop state for genuinely successful streaming responses.
-    /// A streaming response's id is not observable, so its state lands in the shared legacy slot.
+    /// The stream announces its own id through <c>response.created</c>, so the entry lands under
+    /// that real response id, exactly like a non-streaming exchange.
     /// </summary>
     [Fact]
     public async Task FailedThenSuccessfulSseResponse_CommitsStateExactlyOnce()
@@ -1587,6 +1599,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         {
             FailuresUseSseContentType = true,
             SuccessUsesSseContentType = true,
+            SuccessSseBody = SseBodyWithId("resp_stream"),
         };
         using var client = CreateClient(terminal, out var handler);
 
@@ -1604,14 +1617,14 @@ public sealed class CopilotResponsesHandlerRetryTests
 
         Assert.Equal(3, terminal.Attempts);
 
-        Assert.True(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey, out var baseInput, out _));
+        Assert.True(handler.TryGetConversationStateForTest("resp_stream", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
 
-        // Exactly one entry — the slot — despite the three attempts.
+        // Exactly one entry — under the streamed id — despite the three attempts.
         Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_stream" }, handler.InsertionOrderForTest);
     }
 
     /// <summary>
@@ -1633,6 +1646,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         terminal.ResetFailures(2);
         terminal.FailuresUseSseContentType = true;
         terminal.SuccessUsesSseContentType = true;
+        terminal.SuccessSseBody = SseBodyWithId("resp_stream");
 
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","stream":true,"previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"sse-result"}]}"""))
@@ -1641,13 +1655,16 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        // The SSE follow-up's state lands in the shared legacy slot: the parent's base and history
-        // with its own input appended exactly once, despite the failed attempts before it.
+        // The SSE follow-up's state lands under the streamed response id: the parent's base and
+        // history with its own input appended exactly once, despite the failed attempts before it.
         Assert.True(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey,
-            out _, out var slotHistory));
-        Assert.Equal(historyAfterFirst.Count + 1, slotHistory.Count);
-        Assert.Equal("sse-result", slotHistory[^1]["output"]!.GetValue<string>());
+            "resp_stream", out _, out var streamHistory));
+        Assert.Equal(historyAfterFirst.Count + 1, streamHistory.Count);
+        Assert.Equal("sse-result", streamHistory[^1]["output"]!.GetValue<string>());
+
+        // The parent is untouched by the streaming turn.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var parentHistory));
+        Assert.Equal(historyAfterFirst.Count, parentHistory.Count);
     }
 
     /// <summary>
@@ -1693,7 +1710,7 @@ public sealed class CopilotResponsesHandlerRetryTests
 
         // The successful attempt still committed exactly once. Its response is NOT
         // text/event-stream, so — the response's signal governing the commit — it takes the normal
-        // id-keyed path rather than the streaming legacy slot.
+        // non-streaming id-keyed path rather than the SSE parser.
         Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
@@ -1721,17 +1738,17 @@ public sealed class CopilotResponsesHandlerRetryTests
         using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
-        Assert.False(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey,
-            out var baseInput, out var turnHistory));
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
         Assert.Null(baseInput);
         Assert.Empty(turnHistory);
-        Assert.Equal(0, handler.StoreCountForTest);
     }
 
     /// <summary>
     /// A SUCCESSFUL SSE response of any casing must still be recognized as streaming: it must be
-    /// handed back unconsumed for the SDK's parser and must commit exactly once.
+    /// handed back unconsumed for the SDK's parser and must commit exactly once, under the id the
+    /// stream itself announces.
     /// </summary>
     [Theory]
     [InlineData("Text/Event-Stream")]
@@ -1742,6 +1759,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         {
             SuccessUsesSseContentType = true,
             SuccessContentType = successContentType,
+            SuccessSseBody = SseBodyWithId("resp_stream"),
         };
         using var client = CreateClient(terminal, out var handler);
 
@@ -1758,8 +1776,7 @@ public sealed class CopilotResponsesHandlerRetryTests
             await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken),
             StringComparison.Ordinal);
 
-        Assert.True(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey, out var baseInput, out _));
+        Assert.True(handler.TryGetConversationStateForTest("resp_stream", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
     }
@@ -2081,6 +2098,13 @@ public sealed class CopilotResponsesHandlerRetryTests
         public bool SuccessUsesSseContentType { get; set; }
 
         /// <summary>
+        /// The SSE body returned when <see cref="SuccessUsesSseContentType"/> is set. The default
+        /// announces no response id at all, so a stream using it commits NOTHING; tests that want
+        /// a real-id commit script a <c>response.created</c> event here.
+        /// </summary>
+        public string SuccessSseBody { get; set; } = "event: done\ndata: {}\n\n";
+
+        /// <summary>
         /// When set alongside <see cref="FailuresUseSseContentType"/>, failure bodies are backed by a
         /// stream that never completes — modelling a live error event stream the server holds open.
         /// </summary>
@@ -2140,7 +2164,7 @@ public sealed class CopilotResponsesHandlerRetryTests
             {
                 RequestMessage = request,
                 Content = SuccessUsesSseContentType
-                    ? SseStringContent("event: done\ndata: {}\n\n", SuccessContentType)
+                    ? SseStringContent(SuccessSseBody, SuccessContentType)
                     : new StringContent(SuccessBody, Encoding.UTF8, "application/json"),
             };
         }
@@ -2766,13 +2790,10 @@ public sealed class ReasoningEffortRetry3IntegrationTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        // No state should have been committed from the failed first request — not even the slot.
+        // No state should have been committed from the failed first request — nothing under any
+        // key, since a failed exchange never reaches the streaming parser at all.
         Assert.Equal(0, handler.StoreCountForTest);
-        Assert.False(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey,
-            out var failedBaseInput, out var failedTurnHistory));
-        Assert.Null(failedBaseInput);
-        Assert.Empty(failedTurnHistory);
+        Assert.Empty(handler.InsertionOrderForTest);
 
         // Second request: succeeds cleanly (non-SSE).
         terminal.ResetFailures(0);
@@ -2946,8 +2967,8 @@ public sealed class ReasoningEffortRetry4IntegrationTests
 /// <summary>
 /// Spec-driven tests for <see cref="ChatClientFactory.CopilotResponsesHandler"/>'s
 /// per-conversation state store: the FRESH/CONTINUATION/non-array staging rules, the id-keyed
-/// commit, deep-clone isolation, the bounded FIFO, the uniform id validation, and the streaming
-/// legacy slot.
+/// commit (streaming and non-streaming alike), deep-clone isolation, the bounded FIFO and the
+/// uniform id validation.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -2964,8 +2985,6 @@ public sealed class ReasoningEffortRetry4IntegrationTests
 /// </remarks>
 public sealed class CopilotResponsesHandlerConversationStoreTests
 {
-    private const string SlotKey = ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey;
-
     // ── Shared plumbing ──────────────────────────────────────────────────────
 
     /// <summary>
@@ -3045,6 +3064,30 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
         var outputs = string.Join(",",
             outputMarkers.Select(m => "{\"type\":\"message\",\"content\":\"" + m + "\"}"));
         return "{\"id\":\"" + id + "\",\"output\":[" + outputs + "]}";
+    }
+
+    /// <summary>
+    /// A well-formed SSE body: a <c>response.created</c> event carrying <paramref name="id"/> —
+    /// the sole id source for a streaming exchange — one
+    /// <c>response.output_item.done</c> event per output marker, and a terminal
+    /// <c>response.completed</c> event that triggers the amendment.
+    /// </summary>
+    private static string SseReply(string id, params string[] outputMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in outputMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        sb.Append("event: response.completed\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        return sb.ToString();
     }
 
     /// <summary>
@@ -3689,23 +3732,29 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
     }
 
     /// <summary>
-    /// The streaming slot participates in the store like any other key: re-committing it updates in
-    /// place, so repeated streaming turns never grow the queue or displace other conversations.
+    /// Streamed entries participate in the store like any other key: re-committing the SAME
+    /// streamed id updates it in place, so repeated streaming turns never grow the queue or
+    /// displace other conversations.
     /// </summary>
     [Fact]
-    public async Task TheStreamingSlot_IsUpdatedInPlaceAcrossTurns()
+    public async Task ARecommittedStreamedId_IsUpdatedInPlaceAcrossTurns()
     {
-        var terminal = new ScriptedTerminal().Sse().Sse().Sse();
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"));
         using var client = CreateClient(terminal, out var handler);
 
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
-        await SendAsync(client, Request(ToolInput("turn2"), stream: true));
-        await SendAsync(client, Request(ToolInput("turn3"), stream: true));
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn2"), previousResponseId: "\"resp_s\"", stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn3"), previousResponseId: "\"resp_s\"", stream: true));
 
         Assert.Equal(1, handler.StoreCountForTest);
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Equal(new[] { "turn2", "turn3" }, HistoryMarkers(handler, SlotKey));
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2", "turn3" }, HistoryMarkers(handler, "resp_s"));
     }
 
     // ── (g) Uniform id validation and the seam miss contract ─────────────────
@@ -3829,110 +3878,116 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
     // ── (h) The streaming algorithm ──────────────────────────────────────────
 
     /// <summary>
-    /// STREAMING SELECTION, case 3 — neither a resolving id nor a slot entry: FRESH staging. The
-    /// slot receives the current input as its base and an EMPTY history.
+    /// STREAMING SELECTION, case 2 — no resolving <c>previous_response_id</c>: FRESH staging. The
+    /// entry lands under the id the STREAM announces, with the current input as its base and an
+    /// EMPTY history.
     /// </summary>
     [Fact]
-    public async Task StreamingRequest_WithNoIdAndNoSlot_CommitsFreshStateToTheSlot()
+    public async Task StreamingRequest_WithNoResolvingId_CommitsFreshStateUnderTheStreamedId()
     {
-        var terminal = new ScriptedTerminal().Sse();
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_s"));
         using var client = CreateClient(terminal, out var handler);
 
         await SendAsync(client, Request(UserInput("fresh-input"), stream: true));
 
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
-        Assert.Equal(new[] { "fresh-input" }, BaseMarkers(handler, SlotKey));
-        Assert.Empty(HistoryMarkers(handler, SlotKey));
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "fresh-input" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
     }
 
     /// <summary>
-    /// STREAMING SELECTION, case 2 — an absent, or present-but-unresolvable,
-    /// <c>previous_response_id</c> with the slot present: the SLOT's state is CONTINUED, so the base
-    /// stays the slot's original base and the current input is appended to the slot's history.
+    /// STREAMING SELECTION, case 2 in detail — an absent, or present-but-unresolvable,
+    /// <c>previous_response_id</c> stages FRESH and DEGRADES: there is no shared fallback to
+    /// inherit from any more, so an unrelated earlier streaming conversation contributes nothing
+    /// to either the reconstruction or the new entry.
     /// </summary>
     /// <remarks>
-    /// Without the slot fallback this would stage FRESH, making the base the current input and the
-    /// history empty — exactly what the assertions here exclude.
+    /// This is the direct replacement for the old shared-slot fallback: the very inputs that used
+    /// to resolve to the slot now resolve to nothing at all.
     /// </remarks>
     [Theory]
     [InlineData(null)]
     [InlineData("\"resp_unknown\"")]
     [InlineData("\"\"")]
     [InlineData("null")]
-    public async Task StreamingRequest_FallsBackToTheSlot_WhenTheIdDoesNotResolve(string? rawId)
+    public async Task StreamingRequest_StagesFreshAndDegrades_WhenTheIdDoesNotResolve(string? rawId)
     {
-        var terminal = new ScriptedTerminal().Sse().Sse();
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_first"))
+            .Sse(SseReply("resp_second"));
         using var client = CreateClient(terminal, out var handler);
 
-        // Seed the slot with a FRESH streaming turn.
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
+        // An earlier, unrelated streaming conversation.
+        await SendAsync(client, Request(UserInput("earlier-base"), stream: true));
 
-        // Second streaming turn: continues from the slot.
-        await SendAsync(client, Request(ToolInput("slot-turn2"), previousResponseId: rawId, stream: true));
+        // Second streaming turn, naming nothing resolvable.
+        await SendAsync(client, Request(ToolInput("degraded-input"), previousResponseId: rawId, stream: true));
 
-        // CONTINUATION from the slot: the base is unchanged, the input went to the history.
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Equal(new[] { "slot-turn2" }, HistoryMarkers(handler, SlotKey));
+        // FRESH: the current input became the base and the history is empty.
+        Assert.Equal(new[] { "degraded-input" }, BaseMarkers(handler, "resp_second"));
+        Assert.Empty(HistoryMarkers(handler, "resp_second"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_second", "earlier-base"));
 
-        // The reconstruction the server saw carried the slot's conversation forward.
-        Assert.Equal(new[] { "slot-base", "slot-turn2" }, SentInputMarkers(terminal.LastBody));
+        // The reconstruction the server saw carried nothing forward either.
+        Assert.Equal(new[] { "degraded-input" }, SentInputMarkers(terminal.LastBody));
 
-        // Still exactly one key: the slot. Streaming never writes an id-keyed entry.
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
+        // Two independent, id-keyed conversations — no shared key between them.
+        Assert.Equal(new[] { "resp_first", "resp_second" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "earlier-base" }, BaseMarkers(handler, "resp_first"));
     }
 
     /// <summary>
-    /// A NON-streaming request gets NO slot fallback: with a slot present but no resolving id, its
-    /// selection is parent-or-fresh only, so it stages FRESH and never inherits the slot.
+    /// A NON-streaming request never inherits a streamed conversation either: with a streamed
+    /// entry present but no resolving id, its selection is parent-or-fresh only.
     /// </summary>
     [Fact]
-    public async Task NonStreamingRequest_NeverFallsBackToTheSlot()
+    public async Task NonStreamingRequest_NeverInheritsAStreamedConversation()
     {
         var terminal = new ScriptedTerminal()
-            .Sse()
+            .Sse(SseReply("resp_s"))
             .Json(JsonReply("resp_plain", "plain-out"));
         using var client = CreateClient(terminal, out var handler);
 
-        // Seed the slot.
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
+        // A streamed conversation.
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
 
         // A non-streaming request with no previous_response_id at all.
         await SendAsync(client, Request(UserInput("plain-input")));
 
-        // FRESH — not a continuation of the slot.
+        // FRESH — not a continuation of the streamed entry.
         Assert.Equal(new[] { "plain-input" }, SentInputMarkers(terminal.LastBody));
         Assert.Equal(new[] { "plain-input" }, BaseMarkers(handler, "resp_plain"));
         Assert.Equal(new[] { "plain-out" }, HistoryMarkers(handler, "resp_plain"));
-        Assert.Equal(0, OccurrencesIn(handler, "resp_plain", "slot-base"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_plain", "stream-base"));
 
-        // The slot itself is untouched by the non-streaming exchange.
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Empty(HistoryMarkers(handler, SlotKey));
+        // The streamed entry itself is untouched by the non-streaming exchange.
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
     }
 
     /// <summary>
-    /// STREAMING SELECTION, case 1 — a valid, present, FOUND <c>previous_response_id</c> wins over
-    /// the slot: the real parent's state is continued, not the slot's.
+    /// STREAMING SELECTION, case 1 — a valid, present, FOUND <c>previous_response_id</c> continues
+    /// that exact parent, and the continuation is committed under the streamed response id.
     /// </summary>
     [Fact]
-    public async Task StreamingRequest_WithResolvingId_ContinuesTheRealParentNotTheSlot()
+    public async Task StreamingRequest_WithResolvingId_ContinuesTheRealParent()
     {
         var terminal = new ScriptedTerminal()
-            .Sse()                                  // seeds the slot with a different conversation
+            .Sse(SseReply("resp_other"))            // an unrelated streaming conversation
             .Json(JsonReply("resp_a", "answer"))    // the real parent
-            .Sse();                                 // the streaming follow-up under test
+            .Sse(SseReply("resp_s"));               // the streaming follow-up under test
         using var client = CreateClient(terminal, out var handler);
 
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
+        await SendAsync(client, Request(UserInput("other-base"), stream: true));
         await SendAsync(client, Request(UserInput("first")));
 
         await SendAsync(client,
             Request(ToolInput("stream-input"), previousResponseId: "\"resp_a\"", stream: true));
 
-        // The REAL parent's base and history were continued — not the slot's previous entry.
-        Assert.Equal(new[] { "first" }, BaseMarkers(handler, SlotKey));
-        Assert.Equal(new[] { "answer", "stream-input" }, HistoryMarkers(handler, SlotKey));
-        Assert.Equal(0, OccurrencesIn(handler, SlotKey, "slot-base"));
+        // The REAL parent's base and history were continued — nothing from the other conversation.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "answer", "stream-input" }, HistoryMarkers(handler, "resp_s"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_s", "other-base"));
 
         // The request body proves the same selection.
         Assert.Equal(new[] { "first", "answer", "stream-input" }, SentInputMarkers(terminal.LastBody));
@@ -3940,87 +3995,140 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
         // The parent's own entry is untouched by the streaming turn.
         Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
         Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+
+        // And the unrelated streaming conversation kept its own, separate entry.
+        Assert.Equal(new[] { "other-base" }, BaseMarkers(handler, "resp_other"));
     }
 
     /// <summary>
-    /// A successful SSE response commits the staged base + staged history under the slot key and
-    /// performs NO output extraction: nothing derived from the event-stream body reaches the entry,
-    /// and no entry is written under the id the stream itself carries.
+    /// A successful SSE response commits the staged base + staged history under the id from the
+    /// stream's own <c>response.created</c> event, and <c>response.completed</c> is a TERMINAL
+    /// MARKER ONLY: its payload is never mined for output items.
     /// </summary>
     [Fact]
-    public async Task SuccessfulSse_CommitsToSlotWithoutExtractingAnyOutput()
+    public async Task SuccessfulSse_CommitsUnderTheStreamedId_WithoutMiningResponseCompleted()
     {
-        // A payload an output-extracting implementation would happily mine.
+        // A completed payload an output-extracting implementation would happily mine.
         const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_sse\"}}\n\n" +
             "event: response.completed\n" +
-            "data: {\"id\":\"resp_sse\",\"output\":[{\"type\":\"message\",\"content\":\"sse-output\"}]}\n\n";
+            "data: {\"response\":{\"id\":\"resp_sse\",\"output\":[{\"type\":\"message\",\"content\":\"sse-output\"}]}}\n\n";
 
         var terminal = new ScriptedTerminal().Sse(sseBody);
         using var client = CreateClient(terminal, out var handler);
 
         await SendAsync(client, Request(UserInput("stream-first"), stream: true));
 
-        // Committed under the slot key only — never under the id embedded in the stream.
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
-        Assert.False(handler.TryGetConversationStateForTest("resp_sse", out _, out _));
+        // Committed under the stream's own id — the only key written.
+        Assert.Equal(new[] { "resp_sse" }, handler.InsertionOrderForTest);
 
-        // Staged base + staged history exactly, with nothing extracted from the SSE body.
-        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, SlotKey));
-        Assert.Empty(HistoryMarkers(handler, SlotKey));
-        Assert.Equal(0, OccurrencesIn(handler, SlotKey, "sse-output"));
+        // Staged base + staged history exactly, with nothing mined from response.completed.
+        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, "resp_sse"));
+        Assert.Empty(HistoryMarkers(handler, "resp_sse"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_sse", "sse-output"));
+    }
+
+    /// <summary>
+    /// <c>response.output_item.done</c> is the SOLE authoritative output source: its items amend
+    /// the committed entry, in arrival order, on <c>response.completed</c> — composing exactly
+    /// like a non-streaming entry (staged base + staged history + output).
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulSse_AmendsTheEntryWithTheStreamedOutputItems()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_a", "out1", "out2"))
+            .Sse(SseReply("resp_b", "out3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first"), stream: true));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "out1", "out2" }, HistoryMarkers(handler, "resp_a"));
+
+        // A streaming follow-up continues from the amended entry.
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\"", stream: true));
+
+        Assert.Equal(new[] { "first", "out1", "out2", "tool-result" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "out1", "out2", "tool-result", "out3" }, HistoryMarkers(handler, "resp_b"));
+    }
+
+    /// <summary>
+    /// NO FALLBACK KEY: a stream that never announces a usable id writes NO entry under any key.
+    /// The staged state is abandoned and the next follow-up degrades.
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulSseWithoutAResponseCreatedEvent_WritesNoEntryAtAll()
+    {
+        var terminal = new ScriptedTerminal().Sse();
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-first"), stream: true));
+
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
     }
 
     /// <summary>
     /// THE NON-ARRAY STREAMING NO-OP: a <c>stream:true</c> request whose input is not an array
-    /// stages nothing, so a successful SSE response leaves the slot's PREVIOUS entry exactly as it
-    /// was — it must not be overwritten with an empty-base entry.
+    /// stages nothing, so a successful SSE response writes NO entry — not even under the id the
+    /// stream announces — and every previous entry stays exactly as it was.
     /// </summary>
     [Fact]
-    public async Task StreamingRequestWithNonArrayInput_LeavesThePreviousSlotEntryUntouched()
+    public async Task StreamingRequestWithNonArrayInput_WritesNoEntryAndLeavesPreviousOnesUntouched()
     {
-        var terminal = new ScriptedTerminal().Sse().Sse().Sse();
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_noop"));
         using var client = CreateClient(terminal, out var handler);
 
-        // Build a slot entry with both a base and a history so any overwrite is visible.
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
-        await SendAsync(client, Request(ToolInput("slot-turn2"), stream: true));
+        // Build an entry with both a base and a history so any overwrite is visible.
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn2"), previousResponseId: "\"resp_s\"", stream: true));
 
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Equal(new[] { "slot-turn2" }, HistoryMarkers(handler, SlotKey));
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2" }, HistoryMarkers(handler, "resp_s"));
 
-        // The no-op request.
+        // The no-op request: its stream announces resp_noop, but nothing was staged.
         await SendAsync(client, Request("\"not-an-array\"", stream: true));
 
+        Assert.False(handler.TryGetConversationStateForTest("resp_noop", out _, out _));
+
         // Exactly the same entry, and still exactly one key in the store.
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Equal(new[] { "slot-turn2" }, HistoryMarkers(handler, SlotKey));
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2" }, HistoryMarkers(handler, "resp_s"));
         Assert.Equal(1, handler.StoreCountForTest);
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
     }
 
     /// <summary>
-    /// The same no-op with an EMPTY store: a non-array streaming request creates no slot entry at
-    /// all — "nothing staged" must not be normalized into an empty-base slot write.
+    /// The same no-op with an EMPTY store: a non-array streaming request creates no entry at all —
+    /// "nothing staged" must not be normalized into an empty-base write under the streamed id.
     /// </summary>
     [Fact]
-    public async Task StreamingRequestWithNonArrayInput_OnAnEmptyStore_WritesNoSlotEntry()
+    public async Task StreamingRequestWithNonArrayInput_OnAnEmptyStore_WritesNoEntry()
     {
-        var terminal = new ScriptedTerminal().Sse();
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_noop"));
         using var client = CreateClient(terminal, out var handler);
 
         await SendAsync(client, Request("\"not-an-array\"", stream: true));
 
         Assert.Equal(0, handler.StoreCountForTest);
-        Assert.False(handler.TryGetConversationStateForTest(SlotKey, out _, out _));
+        Assert.False(handler.TryGetConversationStateForTest("resp_noop", out _, out _));
     }
 
     /// <summary>
     /// THE <c>stream:true</c> + NON-SSE RESPONSE CASE: the response's Content-Type governs the
-    /// commit, so this routes through the NORMAL id-keyed path — output append included — and never
-    /// touches the slot.
+    /// commit, so this routes through the NORMAL non-streaming id-keyed path — output append
+    /// included — and the SSE parser is never involved.
     /// </summary>
     [Fact]
-    public async Task StreamTrueRequestWithJsonResponse_CommitsUnderTheResponseIdNotTheSlot()
+    public async Task StreamTrueRequestWithJsonResponse_CommitsUnderTheResponseId()
     {
         var terminal = new ScriptedTerminal().Json(JsonReply("resp_json", "json-out"));
         using var client = CreateClient(terminal, out var handler);
@@ -4031,14 +4139,12 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
         Assert.Equal(new[] { "resp_json" }, handler.InsertionOrderForTest);
         Assert.Equal(new[] { "stream-json" }, BaseMarkers(handler, "resp_json"));
         Assert.Equal(new[] { "json-out" }, HistoryMarkers(handler, "resp_json"));
-
-        // The slot was not written.
-        Assert.False(handler.TryGetConversationStateForTest(SlotKey, out _, out _));
+        Assert.Equal(1, handler.StoreCountForTest);
     }
 
     /// <summary>
     /// The same case with NON-ARRAY input: it still takes the normal path, including the EMPTY-base
-    /// normalization and the output append — and still never the slot.
+    /// normalization and the output append.
     /// </summary>
     [Fact]
     public async Task StreamTrueRequestWithNonArrayInputAndJsonResponse_UsesEmptyBaseNormalization()
@@ -4051,23 +4157,23 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
         Assert.Equal(new[] { "resp_json" }, handler.InsertionOrderForTest);
         Assert.Empty(BaseMarkers(handler, "resp_json"));
         Assert.Equal(new[] { "json-out" }, HistoryMarkers(handler, "resp_json"));
-        Assert.False(handler.TryGetConversationStateForTest(SlotKey, out _, out _));
+        Assert.Equal(1, handler.StoreCountForTest);
     }
 
     /// <summary>
     /// A <c>stream:true</c> FOLLOW-UP whose response is JSON continues its parent normally and lands
-    /// under the response id — the slot stays exactly as it was.
+    /// under the response id — an unrelated streamed conversation stays exactly as it was.
     /// </summary>
     [Fact]
-    public async Task StreamTrueFollowUpWithJsonResponse_DoesNotDisturbTheSlot()
+    public async Task StreamTrueFollowUpWithJsonResponse_DoesNotDisturbOtherConversations()
     {
         var terminal = new ScriptedTerminal()
-            .Sse()                                  // seeds the slot
+            .Sse(SseReply("resp_other"))            // an unrelated streamed conversation
             .Json(JsonReply("resp_a", "answer"))    // the parent
             .Json(JsonReply("resp_b", "answer2"));  // stream:true request, JSON response
         using var client = CreateClient(terminal, out var handler);
 
-        await SendAsync(client, Request(UserInput("slot-base"), stream: true));
+        await SendAsync(client, Request(UserInput("other-base"), stream: true));
         await SendAsync(client, Request(UserInput("first")));
         await SendAsync(client,
             Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\"", stream: true));
@@ -4076,9 +4182,9 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
         Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
         Assert.Equal(new[] { "answer", "tool-result", "answer2" }, HistoryMarkers(handler, "resp_b"));
 
-        // The slot never moved.
-        Assert.Equal(new[] { "slot-base" }, BaseMarkers(handler, SlotKey));
-        Assert.Empty(HistoryMarkers(handler, SlotKey));
+        // The unrelated streamed conversation never moved.
+        Assert.Equal(new[] { "other-base" }, BaseMarkers(handler, "resp_other"));
+        Assert.Empty(HistoryMarkers(handler, "resp_other"));
     }
 
     // ── (i) Retry-safe staging, migrated semantics ───────────────────────────
@@ -4125,17 +4231,18 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
     }
 
     /// <summary>
-    /// A retried STREAMING exchange commits to the slot exactly once too: the failed attempts leave
-    /// no partial state and the successful one does not double-append.
+    /// A retried STREAMING exchange commits exactly once too: the failed attempts leave no partial
+    /// state and the successful one does not double-append under the streamed id.
     /// </summary>
     [Fact]
-    public async Task RetriedStreamingRequest_CommitsToTheSlotExactlyOnce()
+    public async Task RetriedStreamingRequest_CommitsUnderTheStreamedIdExactlyOnce()
     {
         var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
             failures: 2, JsonReply("unused", "unused"))
         {
             FailuresUseSseContentType = true,
             SuccessUsesSseContentType = true,
+            SuccessSseBody = SseReply("resp_s"),
         };
         using var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(
             terminal, out var handler);
@@ -4144,8 +4251,622 @@ public sealed class CopilotResponsesHandlerConversationStoreTests
 
         Assert.Equal(3, terminal.Attempts);
         Assert.Equal(1, handler.StoreCountForTest);
-        Assert.Equal(new[] { SlotKey }, handler.InsertionOrderForTest);
-        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, SlotKey));
-        Assert.Empty(HistoryMarkers(handler, SlotKey));
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
+    }
+
+    // ── (j) The streaming commit, amendment and generation safety ────────────
+
+    /// <summary>
+    /// A scripted SSE body carrying <c>response.output_item.done</c> items AND a
+    /// <c>response.completed</c> marker whose payload also lists output — the marker's items must
+    /// NEVER reach the entry.
+    /// </summary>
+    /// <remarks>
+    /// The two sources are marked differently on purpose: <paramref name="doneMarkers"/> are the
+    /// authoritative items, <paramref name="markerPayloadMarkers"/> are decoys embedded in the
+    /// terminal marker's own payload.
+    /// </remarks>
+    private static string SseReplyWithDecoyCompleted(
+        string id, string[] doneMarkers, string[] markerPayloadMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in doneMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        var decoys = string.Join(",",
+            markerPayloadMarkers.Select(m => "{\"type\":\"message\",\"content\":\"" + m + "\"}"));
+
+        sb.Append("event: response.completed\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id)
+          .Append("\",\"output\":[").Append(decoys).Append("]}}\n\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// An SSE body that ends WITHOUT a <c>response.completed</c> event: the id is announced and
+    /// output items arrive, but the stream is truncated before the terminal marker.
+    /// </summary>
+    private static string TruncatedSseReply(string id, params string[] outputMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in outputMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// THE COMMIT IS OBSERVABLE THROUGH THE PUBLIC SEAM the moment the stream has been consumed:
+    /// the entry sits under the STREAM'S OWN id with the staged composition, and no other key was
+    /// written — the id came from the first <c>response.created</c> payload, not from anywhere else.
+    /// </summary>
+    [Fact]
+    public async Task StreamingCommit_LandsUnderTheIdFromTheCreatedEvent()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_created"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("commit-input"), stream: true));
+
+        Assert.Equal(new[] { "resp_created" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "commit-input" }, BaseMarkers(handler, "resp_created"));
+        Assert.Empty(HistoryMarkers(handler, "resp_created"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// THE FIRST-EVENT-DECIDES RULE: a MALFORMED first <c>response.created</c> permanently settles
+    /// this response's fate. A later, perfectly valid <c>response.created</c> is never considered,
+    /// so NO entry is written under either id — the staged state is abandoned for good.
+    /// </summary>
+    /// <remarks>
+    /// This is the direct mutation target for "consider a later response.created": that
+    /// implementation writes an entry under <c>resp_late</c> and fails here.
+    /// </remarks>
+    [Fact]
+    public async Task MalformedFirstCreatedEvent_PermanentlyDecidesTheFallback_IgnoringLaterValidOnes()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\": broken json\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_late\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"late-out\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("doomed-input"), stream: true));
+
+        // Nothing under the later id, and nothing under any other key either.
+        Assert.False(handler.TryGetConversationStateForTest("resp_late", out _, out _));
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// The same permanence for an INVALID (rather than unparseable) id in the first event: a blank
+    /// id is as decisive as malformed JSON, and the later valid event changes nothing.
+    /// </summary>
+    [Fact]
+    public async Task BlankIdInTheFirstCreatedEvent_PermanentlyDecidesTheFallback()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"   \"}}\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_late\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("doomed-input"), stream: true));
+
+        Assert.False(handler.TryGetConversationStateForTest("resp_late", out _, out _));
+        Assert.Equal(0, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// FIRST-EVENT-DECIDES ON THE SUCCESS PATH TOO: when the FIRST <c>response.created</c> carries
+    /// a VALID id, a second valid one later in the same stream is ignored as well. Exactly one
+    /// entry exists — under the FIRST id — and the second id was never written, so the staged
+    /// state is committed once and once only.
+    /// </summary>
+    /// <remarks>
+    /// The malformed-first variants above are masked for an implementation that merely re-arms on
+    /// FAILURE; this one pins the rule on the path where a re-arming parser would produce a real,
+    /// duplicate entry.
+    /// </remarks>
+    [Fact]
+    public async Task SecondValidCreatedEvent_IsIgnored_LeavingExactlyOneEntryUnderTheFirstId()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_first\"}}\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_second\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"only-out\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("once-input"), stream: true));
+
+        // Exactly ONE entry, under the FIRST id — the second id was never written.
+        Assert.Equal(new[] { "resp_first" }, handler.InsertionOrderForTest);
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_second", out _, out _));
+
+        // …and it carries the staged input exactly once, amended with the streamed output.
+        Assert.Equal(new[] { "once-input" }, BaseMarkers(handler, "resp_first"));
+        Assert.Equal(new[] { "only-out" }, HistoryMarkers(handler, "resp_first"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_first", "once-input"));
+    }
+
+    /// <summary>
+    /// NO FALLBACK KEY: a stream that never announces a usable id writes nothing under ANY key —
+    /// the store is exactly as large after the exchange as before it, so no shared or synthesized
+    /// key absorbed the staged state.
+    /// </summary>
+    [Fact]
+    public async Task StreamWithoutAUsableId_WritesNothingUnderAnyKey()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_existing", "existing-out"))
+            .Sse("event: response.output_item.done\ndata: {\"item\":{\"content\":\"orphan\"}}\n\n"
+                 + "event: response.completed\ndata: {}\n\n");
+        using var client = CreateClient(terminal, out var handler);
+
+        // A pre-existing conversation, so "the store is unchanged" is a meaningful claim.
+        await SendAsync(client, Request(UserInput("existing-input")));
+        var before = handler.InsertionOrderForTest;
+        Assert.Equal(new[] { "resp_existing" }, before);
+
+        await SendAsync(client, Request(UserInput("id-less-input"), stream: true));
+
+        // Nothing was added, and the existing entry was not repurposed.
+        Assert.Equal(before, handler.InsertionOrderForTest);
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "existing-input" }, BaseMarkers(handler, "resp_existing"));
+        Assert.Equal(new[] { "existing-out" }, HistoryMarkers(handler, "resp_existing"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_existing", "id-less-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_existing", "orphan"));
+    }
+
+    /// <summary>
+    /// <c>response.output_item.done</c> IS THE SOLE OUTPUT SOURCE: with both real items and a
+    /// <c>response.completed</c> marker whose own payload lists decoy output, each done-item
+    /// appears EXACTLY ONCE and no decoy appears at all.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_TakesItemsOnlyFromOutputItemDone_NeverFromTheCompletedMarker()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReplyWithDecoyCompleted(
+            "resp_src",
+            doneMarkers: new[] { "real-1", "real-2" },
+            markerPayloadMarkers: new[] { "decoy-1", "decoy-2" }));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("src-input"), stream: true));
+
+        // Exactly the done-items, in arrival order, each exactly once.
+        Assert.Equal(new[] { "real-1", "real-2" }, HistoryMarkers(handler, "resp_src"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_src", "real-1"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_src", "real-2"));
+
+        // The terminal marker's payload was never mined.
+        Assert.Equal(0, OccurrencesIn(handler, "resp_src", "decoy-1"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_src", "decoy-2"));
+    }
+
+    /// <summary>
+    /// THE ONE-BATCH FLUSH: every buffered item lands together, on <c>response.completed</c>, in
+    /// arrival order and after the staged history — composing exactly like a non-streaming entry
+    /// (staged base + staged history + output).
+    /// </summary>
+    [Fact]
+    public async Task Amendment_FlushesEveryBufferedItemAsOneBatchOnCompleted()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(SseReply("resp_batch", "b1", "b2", "b3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // Staged base + staged history + the whole output batch, in order.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_batch"));
+        Assert.Equal(
+            new[] { "parent-out", "tool-result", "b1", "b2", "b3" },
+            HistoryMarkers(handler, "resp_batch"));
+    }
+
+    /// <summary>
+    /// THE FLUSH IS ATOMIC — ONE store operation, not a per-item drip. The amendment seam reports
+    /// every applied write from INSIDE the store lock, so this counts OPERATIONS rather than
+    /// merely inspecting the settled result: exactly one write occurs, and the single count it
+    /// reports is the FULL post-amendment history length.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The final-state assertion in the test above is satisfied by an implementation that appends
+    /// item-by-item under separate lock acquisitions — three items, three writes, three moments at
+    /// which a concurrent reader could observe a half-amended entry. That is exactly the
+    /// implementation this test excludes: a per-item amendment reports three invocations with
+    /// counts 3, 4, 5 instead of one invocation with count 5.
+    /// </para>
+    /// <para>
+    /// Because the seam fires inside the lock, the counts it reports ARE the sequence of states
+    /// the store ever published. Asserting that the sequence has exactly one element, and that the
+    /// element is the complete history, is therefore the same as asserting no partially amended
+    /// state was ever observable.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_AppliesExactlyOneStoreOperation_NeverAPartialState()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(SseReply("resp_atomic", "a1", "a2", "a3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // Every amendment write, in order, as (key, resulting history count).
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        // The non-streaming exchange amends nothing — amendments are the streaming path's alone.
+        Assert.Empty(writes);
+
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // EXACTLY ONE write, against the streamed entry.
+        var write = Assert.Single(writes);
+        Assert.Equal("resp_atomic", write.Key);
+
+        // …and that single write already carried the COMPLETE history: staged history (2) plus
+        // all three output items. A per-item implementation would have reported 3, then 4, then 5.
+        Assert.Equal(5, write.HistoryCount);
+
+        // The settled entry agrees, so the one write is genuinely the whole amendment.
+        Assert.Equal(
+            new[] { "parent-out", "tool-result", "a1", "a2", "a3" },
+            HistoryMarkers(handler, "resp_atomic"));
+    }
+
+    /// <summary>
+    /// A DROPPED amendment performs NO store operation at all: when the entry has been replaced in
+    /// the interim, the generation check rejects the flush before any write happens — it is not
+    /// applied and then undone.
+    /// </summary>
+    /// <remarks>
+    /// This is the seam's complement to the generation-safety test: that one proves the resulting
+    /// CONTENT is untouched, this one proves the store was never written to in the first place, so
+    /// no reader could observe a momentarily-grafted state.
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_WhenTheEntryWasReplaced_PerformsNoStoreOperation()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        // The streaming commit under resp_dup, with an item buffered but not yet flushed.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        // A second commit replaces the entry under the same id.
+        var replacement = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"replacement-base\"}")), new List<JsonNode>());
+        replacement.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n"));
+
+        // The first stream now completes: its flush targets a generation that is gone.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        // No amendment write was ever performed — not one that was later corrected.
+        Assert.Empty(writes);
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+        Assert.Empty(HistoryMarkers(handler, "resp_dup"));
+
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A TRUNCATED stream performs NO store operation either: without <c>response.completed</c>
+    /// the buffered items are dropped, so the seam records nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_WhenTheStreamIsTruncated_PerformsNoStoreOperation()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(TruncatedSseReply("resp_trunc_ops", "never-flushed"));
+        using var client = CreateClient(terminal, out var handler);
+
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        await SendAsync(client, Request(UserInput("trunc-input"), stream: true));
+
+        // The commit happened, but no amendment write ever did.
+        Assert.Equal(new[] { "trunc-input" }, BaseMarkers(handler, "resp_trunc_ops"));
+        Assert.Empty(HistoryMarkers(handler, "resp_trunc_ops"));
+        Assert.Empty(writes);
+    }
+
+    /// <summary>
+    /// GENERATION SAFETY: after the streaming commit under id X, a NON-streaming exchange replaces
+    /// the entry under that very same id X — a new generation. The stream's later
+    /// <c>response.completed</c> flush is then SILENTLY DROPPED, and the replacement's content
+    /// survives intact.
+    /// </summary>
+    /// <remarks>
+    /// The two phases are separated by a gate in the terminal: the streaming response's bytes are
+    /// released only AFTER the replacing exchange has committed, so the interleaving is
+    /// deterministic rather than timing-dependent. Removing the generation check makes the stale
+    /// flush graft <c>stream-out</c> onto the replacement and fails this test.
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_WithAReplacedEntry_IsSilentlyDropped()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+
+        // Phase 1: the streaming commit under resp_dup, with one item buffered but NOT yet flushed.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        Assert.Equal("resp_dup", parser.CommittedIdForTest);
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_dup"));
+
+        // Phase 2: a SECOND commit replaces the entry under the same id — a new generation.
+        var replacement = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"replacement-base\"}")), new List<JsonNode>());
+        replacement.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n"));
+
+        Assert.NotEqual(parser.CommittedGenerationForTest, replacement.CommittedGenerationForTest);
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+
+        // Phase 3: the FIRST stream completes. Its flush targets a generation that is gone.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        Assert.True(parser.TerminatedForTest);
+
+        // The replacement survived untouched: the stale batch was dropped, not grafted on.
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+        Assert.Empty(HistoryMarkers(handler, "resp_dup"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "stream-out"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "stream-base"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// THE MATCHING GENERATION STILL FLUSHES — the complement that proves the test above is not
+    /// passing merely because amendments never land: with no interleaving replacement, the same
+    /// buffered item DOES reach the entry.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_WithAnUnchangedEntry_IsApplied()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_same\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        Assert.Empty(HistoryMarkers(handler, "resp_same"));
+
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_same"));
+        Assert.Equal(new[] { "stream-out" }, HistoryMarkers(handler, "resp_same"));
+
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// TRUNCATION: a stream that ends WITHOUT <c>response.completed</c> keeps its committed entry
+    /// but DROPS the buffered items — the entry holds exactly the un-amended staged composition.
+    /// Degraded context, never incorrect context.
+    /// </summary>
+    [Fact]
+    public async Task TruncatedStream_KeepsTheCommitButDropsTheBufferedItems()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(TruncatedSseReply("resp_trunc", "never-flushed-1", "never-flushed-2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // The commit survived…
+        Assert.Equal(new[] { "resp_parent", "resp_trunc" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_trunc"));
+
+        // …with EXACTLY the staged composition: parent history + this turn's input, no output.
+        Assert.Equal(new[] { "parent-out", "tool-result" }, HistoryMarkers(handler, "resp_trunc"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_trunc", "never-flushed-1"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_trunc", "never-flushed-2"));
+    }
+
+    /// <summary>
+    /// THE RACING FOLLOW-UP LIMITATION, pinned exactly as documented: a follow-up that resolves
+    /// the streamed id AFTER the commit but BEFORE the amendment observes the UN-AMENDED entry —
+    /// it reconstructs from the staged base and history only, and the output items that arrive
+    /// later are not in what it sent.
+    /// </summary>
+    /// <remarks>
+    /// The window is driven deterministically by feeding the stream in two halves around the
+    /// follow-up, rather than by racing threads. In production the SDK consumes the stream
+    /// synchronously before any follow-up can be issued, which is precisely why this is documented
+    /// as theoretical — this test pins the behaviour rather than endorsing it.
+    /// </remarks>
+    [Fact]
+    public async Task RacingFollowUp_BetweenCommitAndAmendment_ObservesTheUnAmendedEntry()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_after_race", "after-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // The streaming exchange commits and buffers, but has not completed yet.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"type\":\"message\",\"role\":\"user\",\"content\":\"race-base\"}")),
+            new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_race\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"amended-later\"}}\n\n"));
+
+        Assert.Equal("resp_race", parser.CommittedIdForTest);
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+
+        // THE RACE: a follow-up resolves the id inside the window.
+        await SendAsync(client, Request(ToolInput("racing-input"), previousResponseId: "\"resp_race\""));
+
+        // It reconstructed from the UN-AMENDED entry: base + this input, WITHOUT the pending item.
+        Assert.Equal(new[] { "race-base", "racing-input" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "race-base" }, BaseMarkers(handler, "resp_after_race"));
+        Assert.Equal(new[] { "racing-input", "after-out" }, HistoryMarkers(handler, "resp_after_race"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_after_race", "amended-later"));
+
+        // The amendment then lands on the streaming entry, which the racer never saw.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+        Assert.Equal(new[] { "amended-later" }, HistoryMarkers(handler, "resp_race"));
+    }
+
+    // ── (k) Cross-mode isolation, end to end ─────────────────────────────────
+
+    /// <summary>
+    /// THE MIXED FIXTURE, end to end: a NON-STREAMING first response, a STREAMING follow-up that
+    /// continues that real entry — landing under the STREAM'S own id with the continuation
+    /// composition and amended by its <c>output_item.done</c> items — and a THIRD follow-up naming
+    /// the streaming id, which continues the AMENDED entry.
+    /// </summary>
+    /// <remarks>
+    /// This is the whole isolation story in one test: three distinct id-keyed entries, no shared
+    /// key anywhere, and every hand-off carrying exactly the right context across the
+    /// streaming/non-streaming boundary in both directions.
+    /// </remarks>
+    [Fact]
+    public async Task MixedFixture_NonStreamingThenStreamingThenFollowUp_ChainsAcrossModes()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_one", "one-out"))                    // 1. non-streaming first
+            .Sse(SseReply("resp_two", "two-out-a", "two-out-b"))       // 2. streaming follow-up
+            .Json(JsonReply("resp_three", "three-out"));               // 3. follow-up on the stream
+        using var client = CreateClient(terminal, out var handler);
+
+        // 1. NON-STREAMING FIRST.
+        await SendAsync(client, Request(UserInput("first")));
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_one"));
+        Assert.Equal(new[] { "one-out" }, HistoryMarkers(handler, "resp_one"));
+
+        // 2. STREAMING FOLLOW-UP continuing the REAL entry.
+        await SendAsync(client,
+            Request(ToolInput("stream-input"), previousResponseId: "\"resp_one\"", stream: true));
+
+        // It reconstructed the non-streaming conversation…
+        Assert.Equal(new[] { "first", "one-out", "stream-input" }, SentInputMarkers(terminal.LastBody));
+
+        // …and committed under its OWN streamed id, with the continuation composition amended by
+        // the streamed output items.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_two"));
+        Assert.Equal(
+            new[] { "one-out", "stream-input", "two-out-a", "two-out-b" },
+            HistoryMarkers(handler, "resp_two"));
+
+        // The parent is untouched by the streaming turn.
+        Assert.Equal(new[] { "one-out" }, HistoryMarkers(handler, "resp_one"));
+
+        // 3. A THIRD FOLLOW-UP naming the STREAMING id continues the AMENDED entry.
+        await SendAsync(client,
+            Request(ToolInput("third-input"), previousResponseId: "\"resp_two\""));
+
+        Assert.Equal(
+            new[] { "first", "one-out", "stream-input", "two-out-a", "two-out-b", "third-input" },
+            SentInputMarkers(terminal.LastBody));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_three"));
+        Assert.Equal(
+            new[] { "one-out", "stream-input", "two-out-a", "two-out-b", "third-input", "three-out" },
+            HistoryMarkers(handler, "resp_three"));
+
+        // Three independent, id-keyed conversations — and no fourth, shared key anywhere.
+        Assert.Equal(new[] { "resp_one", "resp_two", "resp_three" }, handler.InsertionOrderForTest);
+        Assert.Equal(3, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// SLOT REMOVAL, proven by exhaustion: two CONCURRENT streaming conversations, each announcing
+    /// its own id, are fully isolated — every entry is asserted directly by its real id, the store
+    /// holds exactly those two keys, and neither conversation's content appears in the other.
+    /// </summary>
+    /// <remarks>
+    /// Under the removed shared slot these two exchanges collided on one key, and the second
+    /// overwrote (or inherited from) the first. Here the store's key set IS the assertion.
+    /// </remarks>
+    [Fact]
+    public async Task TwoStreamingConversations_AreFullyIsolatedUnderTheirOwnIds()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_alpha", "alpha-out"))
+            .Sse(SseReply("resp_beta", "beta-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("alpha-input"), stream: true));
+        await SendAsync(client, Request(UserInput("beta-input"), stream: true));
+
+        // Exactly two keys — both real ids, no shared third.
+        Assert.Equal(new[] { "resp_alpha", "resp_beta" }, handler.InsertionOrderForTest);
+        Assert.Equal(2, handler.StoreCountForTest);
+
+        // Each holds exactly its own content…
+        Assert.Equal(new[] { "alpha-input" }, BaseMarkers(handler, "resp_alpha"));
+        Assert.Equal(new[] { "alpha-out" }, HistoryMarkers(handler, "resp_alpha"));
+        Assert.Equal(new[] { "beta-input" }, BaseMarkers(handler, "resp_beta"));
+        Assert.Equal(new[] { "beta-out" }, HistoryMarkers(handler, "resp_beta"));
+
+        // …and none of the other's.
+        Assert.Equal(0, OccurrencesIn(handler, "resp_alpha", "beta-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_alpha", "beta-out"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_beta", "alpha-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_beta", "alpha-out"));
     }
 }

@@ -1183,18 +1183,20 @@ public sealed class TeeStreamContentTests
         Assert.Equal(0, terminal.SseContent.InnerStream.ReadCallCount);
         Assert.Equal(0, terminal.SseContent.InnerStream.BytesRead);
 
-        // The legacy streaming commit still happened — the tee is transport-only and changes
-        // nothing about the conversation state this round.
-        Assert.True(handler.TryGetConversationStateForTest(
-            ChatClientFactory.CopilotResponsesHandler.StreamingLegacySlotKey,
-            out var baseInput, out var turnHistory));
-        Assert.Equal(1, baseInput?.Count);
-        Assert.Empty(turnHistory);
+        // Nothing has been committed: no chunk has flowed through the tee yet, so the parser can
+        // not have seen a response.created event — a stronger proof of the unconsumed contract
+        // than any state assertion about the old shared streaming slot.
+        Assert.Equal(0, handler.StoreCountForTest);
 
         // Only the caller's own read moves bytes, and it gets the body verbatim.
         var received = await response.Content.ReadAsByteArrayAsync(TestContext.Current.CancellationToken);
         Assert.Equal(body, received);
         Assert.Equal(26, terminal.SseContent.InnerStream.BytesRead);
+
+        // The scripted body carries no response.created event, so no id was ever observable and
+        // NO entry is written under any key — there is no fallback slot any more.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
     }
 
     // ── 10. Observer-exception containment ───────────────────────────────────
@@ -1550,6 +1552,1314 @@ public sealed class TeeStreamContentTests
         });
 
         Assert.Empty(original.CreatedStreams);
+    }
+
+    // ── 13. SSE parser vectors driven through the wrapper ────────────────────
+
+    /// <summary>The <c>event:</c> line of a well-formed <c>response.created</c> block.</summary>
+    private const string CreatedEventLine = "event: response.created";
+
+    /// <summary>The <c>data:</c> line announcing <paramref name="id"/> as the response id.</summary>
+    private static string CreatedDataLine(string id)
+        => "data: {\"response\":{\"id\":\"" + id + "\"}}";
+
+    /// <summary>A complete, well-formed <c>response.created</c> block.</summary>
+    private static string CreatedBlock(string id)
+        => CreatedEventLine + "\n" + CreatedDataLine(id) + "\n\n";
+
+    /// <summary>
+    /// The RETAINED byte count a <see cref="CreatedBlock"/> charges to the id search: its two
+    /// field lines, terminators excluded.
+    /// </summary>
+    private static int CreatedBlockRetainedBytes(string id)
+        => Encoding.UTF8.GetByteCount(CreatedEventLine) + Encoding.UTF8.GetByteCount(CreatedDataLine(id));
+
+    /// <summary>
+    /// A handler plus a parser wired to it over freshly staged state — exactly the pair the
+    /// streaming path builds for one successful SSE response.
+    /// </summary>
+    private static (ChatClientFactory.CopilotResponsesHandler Handler,
+                    ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser Parser)
+        NewParser(string baseMarker = "staged-base")
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+        var stagedBase = new JsonArray(JsonNode.Parse("{\"content\":\"" + baseMarker + "\"}"));
+        return (handler, handler.CreateStreamingParserForTest(stagedBase, new List<JsonNode>()));
+    }
+
+    /// <summary>
+    /// Streams <paramref name="body"/> through the REAL tee into <paramref name="parser"/> with the
+    /// given chunk script, and returns exactly the bytes the reader received.
+    /// </summary>
+    /// <remarks>
+    /// A chunk script of <c>1</c> forces SINGLE-BYTE delivery, which splits every multi-byte UTF-8
+    /// sequence and every SSE line across chunk boundaries.
+    /// </remarks>
+    private static async Task<byte[]> DriveParserAsync(
+        ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser parser,
+        byte[] body,
+        params int[] chunkScript)
+    {
+        using var original = new RecordingHttpContent(body, chunkScript);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append);
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+        return await DrainAsync(stream, 4096);
+    }
+
+    private static Task<byte[]> DriveParserAsync(
+        ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser parser,
+        string body,
+        params int[] chunkScript)
+        => DriveParserAsync(parser, Encoding.UTF8.GetBytes(body), chunkScript);
+
+    /// <summary>
+    /// Streams <paramref name="body"/> through the REAL tee with BOTH seams wired exactly as the
+    /// production handler wires them — chunks to the parser, end-of-input to its completion path —
+    /// and drains to a read == 0 so the EOF signal actually fires.
+    /// </summary>
+    /// <remarks>
+    /// The distinction from <see cref="DriveParserAsync(ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser, byte[], int[])"/>
+    /// is the whole point of these vectors: this is the PRODUCTION wiring, so a final unterminated
+    /// line is processed by the transport's own end-of-stream signal rather than by a test calling
+    /// the completion API directly.
+    /// </remarks>
+    private static async Task<byte[]> DriveParserToEofAsync(
+        ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser parser,
+        byte[] body,
+        params int[] chunkScript)
+    {
+        using var original = new RecordingHttpContent(body, chunkScript);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append, parser.CompleteInput);
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+        return await DrainAsync(stream, 4096);
+    }
+
+    private static Task<byte[]> DriveParserToEofAsync(
+        ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser parser,
+        string body,
+        params int[] chunkScript)
+        => DriveParserToEofAsync(parser, Encoding.UTF8.GetBytes(body), chunkScript);
+
+    /// <summary>The turn history of an entry, reduced to the <c>content</c> marker of each item.</summary>
+    private static string[] HistoryContents(
+        ChatClientFactory.CopilotResponsesHandler handler, string id)
+    {
+        Assert.True(handler.TryGetConversationStateForTest(id, out _, out var history),
+            $"expected an entry under '{id}'");
+        return history.Select(n => n["content"]?.GetValue<string>() ?? n.ToJsonString()).ToArray();
+    }
+
+    /// <summary>The whole entry (base + history) as one JSON string, for containment assertions.</summary>
+    private static string EntryJson(ChatClientFactory.CopilotResponsesHandler handler, string id)
+    {
+        Assert.True(handler.TryGetConversationStateForTest(id, out var baseInput, out var history),
+            $"expected an entry under '{id}'");
+        return (baseInput?.ToJsonString() ?? string.Empty)
+            + string.Concat(history.Select(n => n.ToJsonString()));
+    }
+
+    /// <summary>LF line endings parse: the id is extracted and the entry written.</summary>
+    [Fact]
+    public async Task ParserVector_LfLineEndings_CommitTheId()
+    {
+        var (handler, parser) = NewParser();
+        var body = CreatedBlock("resp_lf");
+
+        var received = await DriveParserAsync(parser, body, 7);
+
+        Assert.Equal("resp_lf", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_lf" }, handler.InsertionOrderForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// CRLF line endings parse identically: the trailing CR is stripped, so the event name is
+    /// <c>response.created</c> and not <c>response.created\r</c> — which would match nothing and
+    /// write nothing.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_CrLfLineEndings_CommitTheId()
+    {
+        var (handler, parser) = NewParser();
+        var body = CreatedEventLine + "\r\n" + CreatedDataLine("resp_crlf") + "\r\n\r\n";
+
+        var received = await DriveParserAsync(parser, body, 5);
+
+        Assert.Equal("resp_crlf", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_crlf" }, handler.InsertionOrderForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// MULTI-LINE <c>data:</c> payloads are concatenated with a newline, per the SSE spec. The
+    /// fixture splits ONE JSON document across two <c>data:</c> lines, so only concatenation
+    /// yields parseable JSON: a first-wins, last-wins or separator-less implementation extracts no
+    /// id at all and writes nothing.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_MultiLineDataPayload_IsConcatenatedPerSpec()
+    {
+        var (handler, parser) = NewParser();
+        var body =
+            "event: response.created\n" +
+            "data: {\"response\":\n" +
+            "data: {\"id\":\"resp_multi\"}}\n" +
+            "\n";
+
+        var received = await DriveParserAsync(parser, body, 4);
+
+        Assert.Equal("resp_multi", parser.CommittedIdForTest);
+        Assert.True(handler.TryGetConversationStateForTest("resp_multi", out _, out _));
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// THE JOIN CHARACTER IS EXACTLY THE SPEC'S NEWLINE. This fixture splits a <c>data:</c>
+    /// payload INSIDE a JSON string literal, where a raw newline is illegal and a space (or no
+    /// separator at all) is perfectly legal. The spec-correct join therefore yields an unparseable
+    /// payload and the item is skipped; any other separator makes it parse and adds a phantom
+    /// item. The well-formed item that follows still lands, proving the parser carried on.
+    /// </summary>
+    /// <remarks>
+    /// The between-token variant above proves concatenation HAPPENS (killing first-wins and
+    /// last-wins); this one proves WHICH character joins the lines.
+    /// </remarks>
+    [Fact]
+    public async Task ParserVector_MultiLineDataPayload_IsJoinedWithNewlineNotAnyOtherSeparator()
+    {
+        var (handler, parser) = NewParser();
+        var body =
+            CreatedBlock("resp_join") +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"alpha\n" +
+            "data: beta\"}}\n" +
+            "\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"well-formed\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var received = await DriveParserAsync(parser, body, 9);
+
+        Assert.Equal("resp_join", parser.CommittedIdForTest);
+
+        // ONLY the well-formed item — no "alpha beta" or "alphabeta" phantom.
+        Assert.Equal(new[] { "well-formed" }, HistoryContents(handler, "resp_join"));
+
+        var entry = EntryJson(handler, "resp_join");
+        Assert.DoesNotContain("alpha", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain("beta", entry, StringComparison.Ordinal);
+
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// <c>event:</c> and <c>data:</c> may appear in EITHER order within a block — SSE imposes no
+    /// field ordering, and a block is interpreted only once its blank line arrives.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ParserVector_EventAndDataInEitherOrder_CommitTheId(bool eventFirst)
+    {
+        var (handler, parser) = NewParser();
+        var body = eventFirst
+            ? CreatedEventLine + "\n" + CreatedDataLine("resp_order") + "\n\n"
+            : CreatedDataLine("resp_order") + "\n" + CreatedEventLine + "\n\n";
+
+        var received = await DriveParserAsync(parser, body, 3);
+
+        Assert.Equal("resp_order", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_order" }, handler.InsertionOrderForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// Comment lines (<c>:…</c>) are ignored entirely: they neither disturb the surrounding block
+    /// nor cost a single byte of the id-search budget.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_CommentLines_AreIgnoredAndCostNothing()
+    {
+        var (handler, parser) = NewParser();
+        var body =
+            ": this is a keep-alive comment\n" +
+            CreatedEventLine + "\n" +
+            ": another comment, mid-block\n" +
+            CreatedDataLine("resp_comment") + "\n" +
+            "\n";
+
+        var received = await DriveParserAsync(parser, body, 6);
+
+        Assert.Equal("resp_comment", parser.CommittedIdForTest);
+        Assert.True(handler.TryGetConversationStateForTest("resp_comment", out _, out _));
+
+        // Only the two retained field lines were charged — the comments cost nothing.
+        Assert.Equal(CreatedBlockRetainedBytes("resp_comment"), parser.IdSearchBytesForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// A UTF-8 MULTI-BYTE character split across a chunk boundary still decodes correctly: the id
+    /// is committed with its exact text. Single-byte chunking guarantees every one of the id's
+    /// two-, three- and four-byte sequences is split, so a per-chunk decoder — one that decodes
+    /// each chunk in isolation and loses the partial sequence — produces replacement characters
+    /// and fails on the DECODED VALUE, not merely on the absence of an exception.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_Utf8CharacterSplitAcrossChunks_DecodesExactly()
+    {
+        const string id = "resp_caf\u00e9_\u65e5\u672c_\U0001F600";
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(CreatedBlock(id));
+
+        // The id really does carry multi-byte sequences — otherwise this vector proves nothing.
+        Assert.True(Encoding.UTF8.GetByteCount(id) > id.Length);
+
+        var received = await DriveParserAsync(parser, bytes, 1);
+
+        Assert.Equal(id, parser.CommittedIdForTest);
+        Assert.Equal(new[] { id }, handler.InsertionOrderForTest);
+        Assert.True(handler.TryGetConversationStateForTest(id, out var baseInput, out _));
+        Assert.Equal("staged-base", baseInput![0]!["content"]!.GetValue<string>());
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// An event split MID-LINE across chunk boundaries reassembles: the script cuts inside the
+    /// event name and again inside the JSON payload.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_EventSplitMidLineAcrossChunks_Reassembles()
+    {
+        var (handler, parser) = NewParser();
+        var body = CreatedBlock("resp_split");
+
+        // 10 bytes lands inside "event: response.created"; the following reads cut through the
+        // rest of that line and into the middle of the data payload.
+        var received = await DriveParserAsync(parser, body, 10, 9, 13, 4);
+
+        Assert.Equal("resp_split", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_split" }, handler.InsertionOrderForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// The FINAL UNTERMINATED line is processed at end of input, through the parser's explicit
+    /// completion API: the block it completes is dispatched and the id committed. Until then it is
+    /// deliberately NOT dispatched — a line that could still grow must not be acted on.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_FinalUnterminatedLine_IsProcessedAtEndOfInput()
+    {
+        var (handler, parser) = NewParser();
+
+        // No trailing newline at all: the data line is the final, unterminated line.
+        var body = CreatedEventLine + "\n" + CreatedDataLine("resp_tail");
+
+        var received = await DriveParserAsync(parser, body, 5);
+
+        // Nothing was dispatched while the line could still grow.
+        Assert.Null(parser.CommittedIdForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+
+        parser.CompleteInput();
+
+        Assert.Equal("resp_tail", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_tail" }, handler.InsertionOrderForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// END OF INPUT IS NOT A TERMINAL MARKER: a stream that ends WITHOUT
+    /// <c>response.completed</c> keeps its committed entry but DROPS the buffered items, even
+    /// after the explicit completion API has processed the final unterminated line. Only
+    /// <c>response.completed</c> ever flushes.
+    /// </summary>
+    /// <remarks>
+    /// Driven through the completion API on purpose: that is the one place an implementation might
+    /// be tempted to treat "no more bytes" as "the response finished", which would amend an entry
+    /// from a stream that was actually truncated.
+    /// </remarks>
+    [Fact]
+    public async Task EndOfInputWithoutCompleted_DoesNotFlushTheBufferedItems()
+    {
+        var (handler, parser) = NewParser();
+        var body =
+            CreatedBlock("resp_no_flush") +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"buffered\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"tail-item\"}}\n";  // unterminated block
+
+        await DriveParserAsync(parser, body, 13);
+
+        // Committed, with items buffered and no terminal marker in sight.
+        Assert.Equal("resp_no_flush", parser.CommittedIdForTest);
+        Assert.False(parser.TerminatedForTest);
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+        Assert.Empty(HistoryContents(handler, "resp_no_flush"));
+
+        parser.CompleteInput();
+
+        // The final line was processed — the second item is buffered now too…
+        Assert.Equal(2, parser.BufferedOutputCountForTest);
+
+        // …but end of input flushed NOTHING: the entry keeps its un-amended staged composition.
+        Assert.False(parser.TerminatedForTest);
+        Assert.Empty(HistoryContents(handler, "resp_no_flush"));
+
+        var entry = EntryJson(handler, "resp_no_flush");
+        Assert.DoesNotContain("buffered", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain("tail-item", entry, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Malformed events are SKIPPED, never fatal: an unknown field, a field-less line, an event
+    /// with no data, a data payload that is not JSON and one that is JSON but not an object all
+    /// pass through without throwing — and a later well-formed block still commits.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_MalformedEvents_AreSkippedWithoutThrowing()
+    {
+        var (handler, parser) = NewParser();
+        var body =
+            "id: 42\n" +                                    // unknown field
+            "retry\n" +                                     // no colon at all
+            "\n" +
+            "event: response.output_item.done\n" +          // no data
+            "\n" +
+            "event: response.output_item.done\n" +
+            "data: {not json at all\n" +                    // unparseable
+            "\n" +
+            "event: response.output_item.done\n" +
+            "data: [1,2,3]\n" +                             // JSON, but not an object
+            "\n" +
+            CreatedBlock("resp_after_garbage");
+
+        var received = await DriveParserAsync(parser, body, 11);
+
+        Assert.Equal("resp_after_garbage", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_after_garbage" }, handler.InsertionOrderForTest);
+
+        // Nothing was buffered from any of the malformed blocks, and the parser stayed alive.
+        Assert.Equal(0, parser.BufferedOutputCountForTest);
+        Assert.False(parser.InertForTest);
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    /// <summary>
+    /// THE 8 KB LINE POLICY IS INCLUSIVE, AND TERMINATOR-BLIND: a <c>data:</c> line carrying
+    /// EXACTLY 8,192 bytes of FIELD CONTENT is legal and fully retained — under the LF terminator
+    /// and the CRLF terminator alike, because the terminator's bytes are not part of the content
+    /// being measured.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The limit is written as a LITERAL 8,192 rather than derived from the production constant:
+    /// deriving it would let a mutation of that constant drag this test's expectation along with
+    /// it, so the boundary would never be pinned at all.
+    /// </para>
+    /// <para>
+    /// The CRLF row is the regression guard for the corrected arithmetic. Counting the CR toward
+    /// the content limit makes this exact line 8,193 bytes and wrongly discards it — legal under
+    /// LF, rejected under CRLF, for a line the contract defines identically in both forms.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public async Task LineLimit_ExactlyEightThousandOneHundredNinetyTwoContentBytes_IsRetained(
+        string terminator)
+    {
+        var (handler, parser) = NewParser();
+
+        // A data: line of exactly 8,192 CONTENT bytes whose payload is the id document, padded
+        // with JSON whitespace so it still parses.
+        var json = CreatedDataLine("resp_exact_line")["data: ".Length..];
+        var pad = new string(' ', LineContentLimitBytes - "data: ".Length - json.Length);
+        var line = "data: " + json + pad;
+        Assert.Equal(LineContentLimitBytes, line.Length);
+
+        var body = CreatedEventLine + terminator + line + terminator + terminator;
+        var bytes = Encoding.UTF8.GetBytes(body);
+
+        var received = await DriveParserAsync(parser, bytes, 1021);
+
+        // Retained in full: the id was parsed out of it and the entry written.
+        Assert.Equal("resp_exact_line", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_exact_line" }, handler.InsertionOrderForTest);
+
+        // …and charged as exactly its content, terminator excluded, whichever terminator it was.
+        Assert.Equal(CreatedEventLine.Length + LineContentLimitBytes, parser.IdSearchBytesForTest);
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// ONE CONTENT BYTE OVER: a <c>data:</c> line of 8,193 content bytes is DISCARDED at the
+    /// boundary — under both terminator forms — the terminator that follows resets the line
+    /// buffer, and the NEXT line parses normally. The discarded bytes are never charged.
+    /// </summary>
+    /// <remarks>
+    /// Paired with the 8,192 test above, these two fixtures differ by a single content byte, so
+    /// shifting the discard boundary in either direction is caught by exactly one of them.
+    /// </remarks>
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public async Task LineLimit_EightThousandOneHundredNinetyThreeContentBytes_IsDiscarded(
+        string terminator)
+    {
+        var (handler, parser) = NewParser();
+
+        var overLong = "data: " + new string('x', LineContentLimitBytes + 1 - "data: ".Length);
+        Assert.Equal(LineContentLimitBytes + 1, overLong.Length);
+
+        var body =
+            overLong + terminator + terminator +
+            CreatedEventLine + terminator + CreatedDataLine("resp_after_over") + terminator + terminator;
+        var bytes = Encoding.UTF8.GetBytes(body);
+
+        var received = await DriveParserAsync(parser, bytes, 1021);
+
+        // The NEXT line parsed: the id was found and the entry written.
+        Assert.Equal("resp_after_over", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_after_over" }, handler.InsertionOrderForTest);
+
+        // …and the discarded line cost the id search nothing at all.
+        Assert.Equal(CreatedBlockRetainedBytes("resp_after_over"), parser.IdSearchBytesForTest);
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// THE 8 KB LINE POLICY: a <c>data:</c> line longer than
+    /// <see cref="ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.MaxLineBytes"/>
+    /// is DISCARDED at the boundary, the terminator that follows resets the line buffer, and the
+    /// NEXT line parses normally — asserted through its parsed RESULT (the committed id and the
+    /// written entry), not merely through the absence of a throw. The passthrough stays byte-exact
+    /// throughout.
+    /// </summary>
+    [Fact]
+    public async Task ParserVector_LineOverEightKilobytes_IsDiscardedAndTheNextLineStillParses()
+    {
+        var (handler, parser) = NewParser();
+        var overLong = "data: " + new string('x',
+            ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.MaxLineBytes + 1);
+
+        var bytes = Encoding.UTF8.GetBytes(overLong + "\n\n" + CreatedBlock("resp_after_long"));
+
+        var received = await DriveParserAsync(parser, bytes, 997);
+
+        // The next line parsed: the id was found and the entry written.
+        Assert.Equal("resp_after_long", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_after_long" }, handler.InsertionOrderForTest);
+
+        // …and the discarded line cost the id search nothing.
+        Assert.Equal(CreatedBlockRetainedBytes("resp_after_long"), parser.IdSearchBytesForTest);
+
+        // The reader received the identical stream, over-long line included.
+        Assert.Equal(bytes, received);
+    }
+
+    // ── 14. The retained-byte caps ───────────────────────────────────────────
+
+    /// <summary>
+    /// Emits <c>data:</c> padding blocks whose RETAINED bytes total exactly
+    /// <paramref name="totalBytes"/>: every line stays safely under the 8 KB line bound and every
+    /// block is closed by a blank line, so each charges as its own complete event.
+    /// </summary>
+    private static string IdSearchPadding(int totalBytes)
+    {
+        const int lineLength = 1024;
+        const int prefixLength = 6; // "data: "
+
+        var sb = new StringBuilder();
+        var remaining = totalBytes;
+
+        while (remaining > 0)
+        {
+            var length = Math.Min(lineLength, remaining);
+            Assert.True(length > prefixLength,
+                $"padding remainder {length} cannot carry the 'data: ' prefix — pick another total.");
+
+            sb.Append("data: ").Append('y', length - prefixLength).Append("\n\n");
+            remaining -= length;
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// THE ID CAP IS INCLUSIVE: an event block completely received at EXACTLY
+    /// <see cref="ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.IdSearchByteCap"/>
+    /// retained bytes is ACCEPTED — the id is extracted and the entry written.
+    /// </summary>
+    /// <remarks>
+    /// This test and its <c>+1</c> twin differ by a SINGLE byte of padding, so an off-by-one in
+    /// either direction is caught by exactly one of the two.
+    /// </remarks>
+    [Fact]
+    public async Task IdSearchCap_BlockCompletedAtExactlyTheCap_IsAccepted()
+    {
+        const string id = "boundary";
+        var cap = ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.IdSearchByteCap;
+
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(
+            IdSearchPadding(cap - CreatedBlockRetainedBytes(id)) + CreatedBlock(id));
+
+        var received = await DriveParserAsync(parser, bytes, 4096);
+
+        // Landed exactly on the cap — and was accepted.
+        Assert.Equal(cap, parser.IdSearchBytesForTest);
+        Assert.False(parser.IdSearchCapBreachedForTest);
+        Assert.Equal(id, parser.CommittedIdForTest);
+        Assert.Equal(new[] { id }, handler.InsertionOrderForTest);
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// ONE BYTE OVER: the same fixture with a single extra padding byte makes the created block
+    /// STRADDLE the cap — its own final line pushes the total to cap + 1 — so the id search STOPS
+    /// and the no-id fallback applies: NO entry under any key, ever.
+    /// </summary>
+    [Fact]
+    public async Task IdSearchCap_BlockStraddlingTheCap_StopsTheSearchAndWritesNoEntry()
+    {
+        const string id = "boundary";
+        var cap = ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.IdSearchByteCap;
+
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(
+            IdSearchPadding(cap - CreatedBlockRetainedBytes(id) + 1) + CreatedBlock(id));
+
+        var received = await DriveParserAsync(parser, bytes, 4096);
+
+        // The breach happened on the created block's own final line.
+        Assert.True(parser.IdSearchCapBreachedForTest);
+        Assert.Equal(cap + 1, parser.IdSearchBytesForTest);
+
+        // NO FALLBACK KEY: nothing under the id, and nothing under anything else either.
+        Assert.Null(parser.CommittedIdForTest);
+        Assert.False(handler.TryGetConversationStateForTest(id, out _, out _));
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+
+        // The passthrough is untouched by the breach.
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// EXACT ACCOUNTING, exclusion 1 — the field-terminating newlines are NOT counted. The fixture
+    /// uses CRLF, so counting terminators would add two bytes per line; the assertion pins the sum
+    /// of the two line lengths with their terminators excluded.
+    /// </summary>
+    [Fact]
+    public async Task IdSearchAccounting_ExcludesLineTerminators()
+    {
+        var (_, parser) = NewParser();
+        var dataLine = CreatedDataLine("resp_terminators");
+
+        await DriveParserAsync(parser, CreatedEventLine + "\r\n" + dataLine + "\r\n\r\n", 3);
+
+        Assert.Equal("resp_terminators", parser.CommittedIdForTest);
+        Assert.Equal(CreatedEventLine.Length + dataLine.Length, parser.IdSearchBytesForTest);
+    }
+
+    /// <summary>
+    /// EXACT ACCOUNTING, exclusion 2 — bytes DROPPED by the 8 KB malformed-line policy are not
+    /// counted: only the created block's two retained lines are charged, even though sixteen
+    /// kilobytes of discarded line preceded them.
+    /// </summary>
+    [Fact]
+    public async Task IdSearchAccounting_ExcludesBytesDroppedByTheLinePolicy()
+    {
+        var (_, parser) = NewParser();
+        var maxLine = ChatClientFactory.CopilotResponsesHandler.StreamingResponseParser.MaxLineBytes;
+
+        var body =
+            "data: " + new string('x', maxLine * 2) + "\n\n" +
+            CreatedBlock("resp_dropped");
+
+        await DriveParserAsync(parser, body, 8192);
+
+        Assert.Equal("resp_dropped", parser.CommittedIdForTest);
+        Assert.Equal(CreatedBlockRetainedBytes("resp_dropped"), parser.IdSearchBytesForTest);
+    }
+
+    /// <summary>
+    /// EXACT ACCOUNTING, exclusion 3 — bytes RELEASED once the id has been extracted are not
+    /// counted: the accumulator freezes the moment the search ends, however much event data
+    /// follows.
+    /// </summary>
+    [Fact]
+    public async Task IdSearchAccounting_ExcludesBytesAfterTheIdWasExtracted()
+    {
+        var (_, parser) = NewParser();
+        var afterExtraction =
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"post-id\"}}\n\n" +
+            "data: " + new string('z', 4096) + "\n\n";
+
+        await DriveParserAsync(parser, CreatedBlock("resp_frozen") + afterExtraction, 512);
+
+        Assert.Equal("resp_frozen", parser.CommittedIdForTest);
+        Assert.Equal(CreatedBlockRetainedBytes("resp_frozen"), parser.IdSearchBytesForTest);
+
+        // The trailing traffic really did arrive — the accumulator simply stopped charging.
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+    }
+
+    /// <summary>
+    /// THE CONTRACTUAL 2 MB OUTPUT CAP, as a LITERAL. Deriving it from the production constant
+    /// would let a mutation of that constant move the test's own expectations with it.
+    /// </summary>
+    private const int OutputCapBytes = 2 * 1024 * 1024;
+
+    /// <summary>THE CONTRACTUAL 8 KB line-content limit, as a LITERAL — same reasoning.</summary>
+    private const int LineContentLimitBytes = 8192;
+
+    /// <summary>
+    /// Builds ONE <c>response.output_item.done</c> event whose RAW <c>data:</c> payload bytes
+    /// total EXACTLY <paramref name="payloadBytes"/>, and whose payload is VALID, parseable JSON
+    /// carrying <paramref name="marker"/> as its item content.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Both properties are load-bearing. EXACT: the cap is a byte boundary, so a fixture that
+    /// overshoots by thousands of bytes cannot tell an inclusive comparison from an exclusive one.
+    /// VALID: if the payload could never parse, the item's absence from the entry proves nothing —
+    /// it would be missing whether the cap dropped it or the JSON parser rejected it. This payload
+    /// parses, so its absence can only be the cap's doing.
+    /// </para>
+    /// <para>
+    /// The payload is split across several <c>data:</c> lines, each well under the 8 KB line
+    /// limit, at positions between JSON array elements — so the SSE spec's newline join lands in
+    /// inter-token whitespace and the concatenated document is still valid. That keeps THIS test
+    /// about the output cap rather than about the line policy.
+    /// </para>
+    /// </remarks>
+    private static string ExactPayloadOutputItemEvent(string marker, int payloadBytes)
+    {
+        const int elementBytes = 8000;                       // safely under the 8 KB line limit
+        var head = "{\"item\":{\"content\":\"" + marker + "\",\"p\":[";
+        var element = "\"" + new string('z', elementBytes - 3) + "\",";
+        Assert.Equal(elementBytes, element.Length);
+
+        var elements = 0;
+        int remainder;
+        while (true)
+        {
+            remainder = payloadBytes - head.Length - (elements * elementBytes);
+            if (remainder is >= 5 and <= elementBytes) break;
+            elements++;
+            Assert.True(elements < 10_000, "payload target is unreachable with this element size.");
+        }
+
+        var tail = "\"" + new string('z', remainder - 5) + "\"]}}";
+        Assert.Equal(remainder, tail.Length);
+
+        var lines = new List<string> { head };
+        for (var i = 0; i < elements; i++) lines.Add(element);
+        lines.Add(tail);
+
+        // The fixture must be exactly on target, and every line must clear the 8 KB limit.
+        Assert.Equal(payloadBytes, lines.Sum(l => l.Length));
+        Assert.All(lines, l => Assert.True(l.Length <= LineContentLimitBytes - "data: ".Length));
+
+        // …and the joined payload must be VALID JSON, or its absence would prove nothing.
+        Assert.Equal(marker, JsonNode.Parse(string.Join("\n", lines))!["item"]!["content"]!.GetValue<string>());
+
+        var sb = new StringBuilder("event: response.output_item.done\n");
+        foreach (var line in lines) sb.Append("data: ").Append(line).Append('\n');
+        return sb.Append('\n').ToString();
+    }
+
+    /// <summary>One small, complete, valid <c>response.output_item.done</c> event.</summary>
+    private static string SmallOutputItemEvent(string marker)
+        => "event: response.output_item.done\n"
+         + "data: {\"item\":{\"content\":\"" + marker + "\"}}\n\n";
+
+    /// <summary>The RAW payload byte count <see cref="SmallOutputItemEvent"/> charges.</summary>
+    private static int SmallOutputItemPayloadBytes(string marker)
+        => ("{\"item\":{\"content\":\"" + marker + "\"}}").Length;
+
+    /// <summary>
+    /// THE OUTPUT CAP IS INCLUSIVE: an item whose complete event brings the buffered RAW payload
+    /// total to EXACTLY 2 MB is ACCEPTED — both items land, and <c>OutputBytesForTest</c> reads
+    /// exactly the cap.
+    /// </summary>
+    /// <remarks>
+    /// This test and its <c>+1</c> twin below differ by a SINGLE payload byte, so an off-by-one in
+    /// either direction — <c>&gt;</c> swapped for <c>&gt;=</c> or the reverse — is caught by
+    /// exactly one of the two. The exact-byte assertion on <c>OutputBytesForTest</c> is what makes
+    /// that possible: a fixture that merely overshoots the cap cannot distinguish the comparisons.
+    /// </remarks>
+    [Fact]
+    public async Task OutputCap_ItemLandingExactlyOnTheCap_IsAcceptedWhole()
+    {
+        var (handler, parser) = NewParser();
+
+        var smallBytes = SmallOutputItemPayloadBytes("kept-first");
+        var body =
+            CreatedBlock("resp_cap_exact") +
+            SmallOutputItemEvent("kept-first") +
+            ExactPayloadOutputItemEvent("kept-boundary", OutputCapBytes - smallBytes) +
+            "event: response.completed\ndata: {}\n\n";
+
+        var bytes = Encoding.UTF8.GetBytes(body);
+        var received = await DriveParserAsync(parser, bytes, 65536);
+
+        // Landed exactly on the cap, and nothing was refused.
+        Assert.Equal(OutputCapBytes, parser.OutputBytesForTest);
+        Assert.False(parser.OutputCapBreachedForTest);
+
+        // BOTH items are in the entry, in arrival order — the boundary item whole.
+        Assert.Equal(new[] { "kept-first", "kept-boundary" }, HistoryContents(handler, "resp_cap_exact"));
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// ONE PAYLOAD BYTE OVER: the identical fixture with a single extra byte makes the second
+    /// item's complete event STRADDLE the cap, so it is DROPPED WHOLE while the item buffered
+    /// before it still flushes. The dropped item's raw bytes are never charged.
+    /// </summary>
+    [Fact]
+    public async Task OutputCap_ItemStraddlingTheCapByOneByte_IsDroppedWhole()
+    {
+        var (handler, parser) = NewParser();
+
+        var smallBytes = SmallOutputItemPayloadBytes("kept-first");
+        var body =
+            CreatedBlock("resp_cap_over") +
+            SmallOutputItemEvent("kept-first") +
+            ExactPayloadOutputItemEvent("straddler", OutputCapBytes - smallBytes + 1) +
+            SmallOutputItemEvent("after-breach") +
+            "event: response.completed\ndata: {}\n\n";
+
+        var bytes = Encoding.UTF8.GetBytes(body);
+        var received = await DriveParserAsync(parser, bytes, 65536);
+
+        Assert.True(parser.OutputCapBreachedForTest);
+
+        // ONLY the item buffered before the breach was charged and amended in.
+        Assert.Equal(smallBytes, parser.OutputBytesForTest);
+        Assert.Equal(new[] { "kept-first" }, HistoryContents(handler, "resp_cap_over"));
+
+        // The straddling item — whose payload is perfectly valid JSON, so only the cap can have
+        // excluded it — contributed NOTHING, not even a fragment. Nor did the item after it.
+        var entry = EntryJson(handler, "resp_cap_over");
+        Assert.DoesNotContain("straddler", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain("zzzz", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain("after-breach", entry, StringComparison.Ordinal);
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// The straddling payload used above really is VALID, parseable JSON that the parser WOULD
+    /// have accepted below the cap — the control that makes the drop assertion meaningful.
+    /// </summary>
+    /// <remarks>
+    /// Without this control, "the straddler is absent" is satisfied by a payload that could never
+    /// have parsed in the first place. Here the very same multi-line payload shape, at a size
+    /// comfortably inside the cap, IS accepted and IS amended in.
+    /// </remarks>
+    [Fact]
+    public async Task OutputCap_TheStraddlingPayloadShape_IsAcceptedWhenItFitsUnderTheCap()
+    {
+        var (handler, parser) = NewParser();
+
+        var body =
+            CreatedBlock("resp_cap_control") +
+            ExactPayloadOutputItemEvent("would-fit", 64 * 1024) +
+            "event: response.completed\ndata: {}\n\n";
+
+        var received = await DriveParserAsync(parser, Encoding.UTF8.GetBytes(body), 65536);
+
+        Assert.False(parser.OutputCapBreachedForTest);
+        Assert.Equal(64 * 1024, parser.OutputBytesForTest);
+        Assert.Equal(new[] { "would-fit" }, HistoryContents(handler, "resp_cap_control"));
+        Assert.Equal(Encoding.UTF8.GetBytes(body), received);
+    }
+
+    // ── 15. Commit ordering and end-of-stream semantics ──────────────────────
+
+    /// <summary>
+    /// THE COMMIT HAPPENS BEFORE THE COMPLETING CHUNK RETURNS. The observation is taken from
+    /// INSIDE the <c>OnChunk</c> callback — while the tee's <c>Read</c> is still on the stack —
+    /// and it already sees the committed entry. Deferring the store write (for example to the
+    /// terminal flush) leaves the in-callback observation empty and fails this test.
+    /// </summary>
+    [Fact]
+    public async Task Commit_IsObservableFromInsideTheChunkCallback_BeforeTheReadReturns()
+    {
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(CreatedBlock("resp_ordering"));
+
+        int? storeCountDuringCallback = null;
+        var entryVisibleDuringCallback = false;
+
+        using var original = new RecordingHttpContent(bytes);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original,
+            chunk =>
+            {
+                parser.Append(chunk);
+
+                // Still inside the read: what does the durable store hold right now?
+                storeCountDuringCallback = handler.StoreCountForTest;
+                entryVisibleDuringCallback =
+                    handler.TryGetConversationStateForTest("resp_ordering", out _, out _);
+            });
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+
+        var buffer = new byte[bytes.Length];
+        var read = stream.Read(buffer, 0, buffer.Length);
+
+        // The whole created block was delivered by this single read…
+        Assert.Equal(bytes.Length, read);
+
+        // …and the entry was already durable while that read was still on the stack.
+        Assert.True(entryVisibleDuringCallback,
+            "the committed entry was not visible from inside the OnChunk callback.");
+        Assert.Equal(1, storeCountDuringCallback);
+    }
+
+    /// <summary>
+    /// END OF STREAM BEFORE a valid <c>response.created</c>: nothing was ever committed, so
+    /// disposing the response leaves NO entry — the staged state is simply abandoned. This is why
+    /// the parser needs no disposal hook.
+    /// </summary>
+    [Fact]
+    public async Task EndOfStreamBeforeAValidCreatedEvent_LeavesNoEntry()
+    {
+        var (handler, parser) = NewParser();
+
+        // A block that never completes: the id is still unannounced when the stream ends.
+        var bytes = Encoding.UTF8.GetBytes(CreatedEventLine + "\n" + "data: {\"resp");
+
+        byte[] received;
+        using (var original = new RecordingHttpContent(bytes, 3))
+        using (var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append))
+        {
+            var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+            received = await DrainAsync(stream, 4096);
+        }
+
+        Assert.Null(parser.CommittedIdForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// END OF STREAM AFTER a valid <c>response.created</c>: the entry was committed before the
+    /// completing chunk returned, so it survives the response's disposal untouched — no disposal
+    /// hook, and no rollback.
+    /// </summary>
+    [Fact]
+    public async Task EndOfStreamAfterAValidCreatedEvent_RetainsTheEntry()
+    {
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(CreatedBlock("resp_kept") + "event: partial\ndata: {\"a");
+
+        using (var original = new RecordingHttpContent(bytes, 3))
+        using (var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append))
+        {
+            var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+            await DrainAsync(stream, 4096);
+        }
+
+        Assert.Equal("resp_kept", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_kept" }, handler.InsertionOrderForTest);
+        Assert.True(handler.TryGetConversationStateForTest("resp_kept", out var baseInput, out var history));
+        Assert.Equal("staged-base", baseInput![0]!["content"]!.GetValue<string>());
+        Assert.Empty(history);
+    }
+
+    // ── 16. The production EOF signal ────────────────────────────────────────
+
+    /// <summary>
+    /// A stream backed by a body of a known length, so a caller can read it to a genuine
+    /// <c>read == 0</c> and read again afterwards.
+    /// </summary>
+    private sealed class CountingEofContent : HttpContent
+    {
+        private readonly byte[] _data;
+        private readonly int _chunk;
+
+        public CountingEofContent(byte[] data, int chunk)
+        {
+            _data = data;
+            _chunk = chunk;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync()
+            => Task.FromResult<Stream>(new ChunkedStream(_data, _chunk));
+
+        protected override Stream CreateContentReadStream(CancellationToken cancellationToken)
+            => new ChunkedStream(_data, _chunk);
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+            => stream.WriteAsync(_data, 0, _data.Length);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        /// <summary>Hands out at most <c>chunk</c> bytes per read; 0 once exhausted, forever.</summary>
+        private sealed class ChunkedStream : Stream
+        {
+            private readonly byte[] _data;
+            private readonly int _chunk;
+            private int _position;
+
+            public ChunkedStream(byte[] data, int chunk)
+            {
+                _data = data;
+                _chunk = chunk;
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => _data.Length;
+
+            public override long Position
+            {
+                get => _position;
+                set => _position = (int)value;
+            }
+
+            private int Take(int max)
+            {
+                var n = Math.Min(Math.Min(_chunk, max), _data.Length - _position);
+                return n;
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                var n = Take(count);
+                Array.Copy(_data, _position, buffer, offset, n);
+                _position += n;
+                return n;
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                var n = Take(buffer.Length);
+                _data.AsSpan(_position, n).CopyTo(buffer);
+                _position += n;
+                return n;
+            }
+
+            public override Task<int> ReadAsync(
+                byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => Task.FromResult(Read(buffer, offset, count));
+
+            public override ValueTask<int> ReadAsync(
+                Memory<byte> buffer, CancellationToken cancellationToken = default)
+                => new(Read(buffer.Span));
+
+            public override void Flush() { }
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        }
+    }
+
+    /// <summary>
+    /// A FINAL UNTERMINATED <c>response.created</c> LINE COMMITS AT EOF, ON THE PRODUCTION PATH.
+    /// The tee's own end-of-stream signal — not a test calling the completion API — is what
+    /// processes it, so this pins the production wiring rather than the parser in isolation.
+    /// </summary>
+    /// <remarks>
+    /// Removing the EOF signal restores the previously-dead completion path and fails this test:
+    /// the final line is never processed and no entry is written.
+    /// </remarks>
+    [Fact]
+    public async Task ProductionEof_FinalUnterminatedCreatedLine_CommitsTheId()
+    {
+        var (handler, parser) = NewParser();
+
+        // No trailing terminator at all: the data line can only be completed by end of input.
+        var body = CreatedEventLine + "\n" + CreatedDataLine("resp_eof_created");
+        var bytes = Encoding.UTF8.GetBytes(body);
+
+        var received = await DriveParserToEofAsync(parser, bytes, 9);
+
+        Assert.Equal("resp_eof_created", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_eof_created" }, handler.InsertionOrderForTest);
+        Assert.True(handler.TryGetConversationStateForTest("resp_eof_created", out var baseInput, out _));
+        Assert.Equal("staged-base", baseInput![0]!["content"]!.GetValue<string>());
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// A FINAL UNTERMINATED <c>response.completed</c> LINE FLUSHES THE BUFFERED OUTPUT AT EOF, on
+    /// the production path: the terminal marker arrives as the stream's last, unterminated line,
+    /// and the amendment still lands.
+    /// </summary>
+    [Fact]
+    public async Task ProductionEof_FinalUnterminatedCompletedLine_FlushesBufferedOutput()
+    {
+        var (handler, parser) = NewParser();
+
+        var body =
+            CreatedBlock("resp_eof_completed") +
+            SmallOutputItemEvent("eof-out-1") +
+            SmallOutputItemEvent("eof-out-2") +
+            "event: response.completed\n" +
+            "data: {}";                       // final line, unterminated
+
+        var bytes = Encoding.UTF8.GetBytes(body);
+        var received = await DriveParserToEofAsync(parser, bytes, 11);
+
+        Assert.True(parser.TerminatedForTest);
+        Assert.Equal(
+            new[] { "eof-out-1", "eof-out-2" }, HistoryContents(handler, "resp_eof_completed"));
+
+        Assert.Equal(bytes, received);
+    }
+
+    /// <summary>
+    /// THE NEGATIVE: disposal BEFORE end of input processes nothing. A response abandoned
+    /// mid-stream never reached its end, so its final partial line must not be treated as
+    /// finished — the staged state is simply abandoned and NO entry is written.
+    /// </summary>
+    /// <remarks>
+    /// Wiring the completion path to disposal instead of (or as well as) EOF fails here: the
+    /// abandoned stream's unterminated <c>response.created</c> line would commit an entry the
+    /// server never finished announcing.
+    /// </remarks>
+    [Fact]
+    public async Task ProductionEof_DisposalBeforeEndOfInput_ProcessesNothing()
+    {
+        var (handler, parser) = NewParser();
+
+        var eofSignals = 0;
+        var body = CreatedEventLine + "\n" + CreatedDataLine("resp_abandoned");
+        var bytes = Encoding.UTF8.GetBytes(body);
+
+        var original = new CountingEofContent(bytes, 8);
+        var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append, () => { eofSignals++; parser.CompleteInput(); });
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+
+        // ONE read only. The body is longer than a single chunk, so EOF is never observed.
+        var buffer = new byte[8];
+        var read = await stream.ReadAsync(buffer.AsMemory(), TestContext.Current.CancellationToken);
+        Assert.True(read > 0);
+        Assert.True(read < bytes.Length);
+
+        tee.Dispose();
+
+        // Disposal raised no signal, so the final line was never processed…
+        Assert.Equal(0, eofSignals);
+        Assert.Null(parser.CommittedIdForTest);
+
+        // …and nothing at all was written: the staged state is abandoned.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// EVERY read overload raises the end-of-input signal, so a caller's choice of overload can
+    /// never decide whether a final unterminated line is processed.
+    /// </summary>
+    public enum EofReadMode
+    {
+        SyncArray,
+        SyncSpan,
+        AsyncArray,
+        AsyncMemory,
+    }
+
+    /// <summary>
+    /// ALL FOUR READ OVERLOADS fire the EOF signal, each committing the same final unterminated
+    /// line. A signal wired into only some overloads leaves the production path's behaviour
+    /// dependent on which overload the SDK happens to use.
+    /// </summary>
+    [Theory]
+    [InlineData(EofReadMode.SyncArray)]
+    [InlineData(EofReadMode.SyncSpan)]
+    [InlineData(EofReadMode.AsyncArray)]
+    [InlineData(EofReadMode.AsyncMemory)]
+    public async Task ProductionEof_EveryReadOverload_RaisesTheSignal(EofReadMode mode)
+    {
+        var (handler, parser) = NewParser();
+        var bytes = Encoding.UTF8.GetBytes(CreatedEventLine + "\n" + CreatedDataLine("resp_overload"));
+
+        using var original = new CountingEofContent(bytes, 7);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, parser.Append, parser.CompleteInput);
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+        var received = new MemoryStream();
+        var buffer = new byte[16];
+
+        while (true)
+        {
+            var read = mode switch
+            {
+                EofReadMode.SyncArray => stream.Read(buffer, 0, buffer.Length),
+                EofReadMode.SyncSpan => stream.Read(buffer.AsSpan()),
+                EofReadMode.AsyncArray => await stream.ReadAsync(
+                    buffer, 0, buffer.Length, TestContext.Current.CancellationToken),
+                _ => await stream.ReadAsync(buffer.AsMemory(), TestContext.Current.CancellationToken),
+            };
+
+            if (read == 0) break;
+            received.Write(buffer, 0, read);
+        }
+
+        Assert.Equal("resp_overload", parser.CommittedIdForTest);
+        Assert.Equal(new[] { "resp_overload" }, handler.InsertionOrderForTest);
+        Assert.Equal(bytes, received.ToArray());
+    }
+
+    /// <summary>
+    /// THE SIGNAL IS RAISED EXACTLY ONCE, however many times — and through whichever overloads —
+    /// the reader keeps reading at end of stream. A repeated signal would re-run the completion
+    /// path over already-consumed state.
+    /// </summary>
+    [Fact]
+    public async Task ProductionEof_RepeatedReadsAtEndOfStream_RaiseExactlyOneSignal()
+    {
+        var signals = 0;
+
+        using var original = new CountingEofContent(Encoding.UTF8.GetBytes("event: x\ndata: 1\n\n"), 4);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, null, () => signals++);
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+        var buffer = new byte[8];
+
+        // Drain to the first read == 0…
+        while (await stream.ReadAsync(buffer.AsMemory(), TestContext.Current.CancellationToken) > 0) { }
+        Assert.Equal(1, signals);
+
+        // …then keep reading at EOF through every overload.
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.Equal(0, stream.Read(buffer, 0, buffer.Length));
+            Assert.Equal(0, stream.Read(buffer.AsSpan()));
+            Assert.Equal(0, await stream.ReadAsync(
+                buffer, 0, buffer.Length, TestContext.Current.CancellationToken));
+            Assert.Equal(0, await stream.ReadAsync(
+                buffer.AsMemory(), TestContext.Current.CancellationToken));
+        }
+
+        Assert.Equal(1, signals);
+    }
+
+    /// <summary>
+    /// A THROWING EOF OBSERVER IS CONTAINED and the hook DISABLED, exactly like the chunk seam: a
+    /// broken parser can never break the response, and the reader still receives every byte.
+    /// </summary>
+    [Fact]
+    public async Task ProductionEof_ThrowingObserver_IsContainedAndDisabled()
+    {
+        var invocations = 0;
+        var body = Encoding.UTF8.GetBytes("event: delta\ndata: 12345\n\n");
+
+        using var original = new CountingEofContent(body, 5);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(
+            original, null, () =>
+            {
+                invocations++;
+                throw new InvalidOperationException("eof observer exploded");
+            });
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+
+        // The throw never escapes the read…
+        var received = await DrainAsync(stream, 4096);
+
+        Assert.Equal(1, invocations);
+
+        // …the hook was dropped rather than retried…
+        Assert.Null(tee.OnEof);
+
+        // …and the passthrough is byte-exact.
+        Assert.Equal(body, received);
+    }
+
+    /// <summary>
+    /// THE NULL DEFAULT IS A PURE NO-OP: with no EOF observer the stream behaves exactly as it did
+    /// before the seam existed — byte-exact passthrough, and end of stream reported normally.
+    /// </summary>
+    [Fact]
+    public async Task ProductionEof_NullObserver_ChangesNothingObservable()
+    {
+        var body = Encoding.UTF8.GetBytes("event: delta\ndata: 12345\n\n");
+
+        using var original = new RecordingHttpContent(body, 6);
+        using var tee = new ChatClientFactory.CopilotResponsesHandler.TeeStreamContent(original);
+
+        Assert.Null(tee.OnEof);
+
+        var stream = await tee.ReadAsStreamAsync(TestContext.Current.CancellationToken);
+        var received = await DrainAsync(stream, 4096);
+
+        Assert.Equal(body, received);
+        Assert.Equal(0, original.InnerStream.Remaining);
+
+        // Reading on at end of stream keeps reporting 0, with no observer to notice.
+        Assert.Equal(0, stream.Read(new byte[8], 0, 8));
+    }
+
+    /// <summary>
+    /// THE HANDLER WIRES BOTH SEAMS. Driven through the real handler, a successful SSE response
+    /// whose LAST line is an unterminated <c>response.created</c> commits once the caller consumes
+    /// the body to its end — and not before.
+    /// </summary>
+    [Fact]
+    public async Task Handler_WiresEndOfInput_SoAFinalUnterminatedLineCommits()
+    {
+        var body = Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_handler_eof\"}}");
+
+        var terminal = new RecordingSseTerminalHandler(body, 5);
+        var handler = new ChatClientFactory.CopilotResponsesHandler(terminal);
+        using var invoker = new HttpMessageInvoker(handler);
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "https://api.githubcopilot.com/responses")
+        {
+            Content = new StringContent(
+                """{"stream":true,"input":[{"role":"user","content":"hi"}]}""",
+                System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        var response = await invoker.SendAsync(request, TestContext.Current.CancellationToken);
+
+        // Nothing is committed while the response sits unconsumed.
+        Assert.Equal(0, handler.StoreCountForTest);
+
+        var received = await response.Content.ReadAsByteArrayAsync(TestContext.Current.CancellationToken);
+
+        // Consuming to the end processed the final unterminated line and committed the entry.
+        Assert.True(handler.TryGetConversationStateForTest(
+            "resp_handler_eof", out var baseInput, out var history));
+        Assert.Equal(1, baseInput?.Count);
+        Assert.Empty(history);
+
+        Assert.Equal(body, received);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
