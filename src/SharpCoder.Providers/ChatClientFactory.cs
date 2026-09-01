@@ -1065,18 +1065,79 @@ public static class ChatClientFactory
     }
 
     /// <summary>
-    /// The Copilot API doesn't support previous_response_id on the /responses endpoint.
-    /// This handler inlines the previous response's output into follow-up requests.
+    /// Handles Responses API requests for Copilot, which doesn't support
+    /// <c>previous_response_id</c>. Strips the id and reconstructs the full conversation in the
+    /// request body by carrying forward the originating request's input messages (system + user)
+    /// plus all accumulated turn history (previous outputs + tool results).
     /// </summary>
-    /// <summary>
-    /// Handles Responses API requests for Copilot, which doesn't support previous_response_id.
-    /// Strips previous_response_id and reconstructs the full conversation by carrying forward
-    /// the original input messages (system + user) and all turn history (outputs + tool results).
-    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A single handler instance serves <b>many</b> conversations — the chain is built once per
+    /// client and every request flows through it — so the conversation state is keyed per
+    /// conversation instead of living in instance fields. Each successful non-streaming response
+    /// writes an entry under its own response <c>id</c>; a follow-up naming that id in
+    /// <c>previous_response_id</c> resolves it and continues from there. Entries are handed out as
+    /// deep clones, so two follow-ups branching from the same parent can never observe each
+    /// other's additions.
+    /// </para>
+    /// <para>
+    /// DEGRADED MODE: a <c>previous_response_id</c> that is missing, malformed or no longer in the
+    /// store (evicted by the <see cref="MaxEntries"/> bound) simply resolves to nothing, and the
+    /// request is transformed exactly like a first request — the id stripped and only the current
+    /// input inlined. Likewise, a successful response carrying no usable <c>id</c> writes no entry
+    /// at all, so the next follow-up naming it degrades in the same way. Degrading loses context,
+    /// never correctness: no state from another conversation is ever mixed in.
+    /// </para>
+    /// <para>
+    /// TEMPORARY, DECLARED PARTIAL FIX: streaming (SSE) responses are handed back unparsed, so
+    /// their response id is not available here and their state can only be committed to a single
+    /// shared <see cref="StreamingLegacySlotKey"/> slot, which every streaming request falls back
+    /// to when its <c>previous_response_id</c> does not resolve. Concurrent streaming
+    /// conversations therefore still share one slot, and evicting the slot degrades streaming
+    /// follow-ups to first-request transformations. This is knowingly only a partial resolution of
+    /// the isolation problem and stays in place until the follow-up work replaces the slot with
+    /// per-conversation streaming state (SSE id extraction).
+    /// </para>
+    /// </remarks>
     internal sealed class CopilotResponsesHandler : DelegatingHandler
     {
-        private JsonArray? _baseInput;
-        private readonly List<JsonNode> _turnHistory = new();
+        /// <summary>
+        /// The durable state of one conversation: the originating request's input plus every turn
+        /// accumulated since. Instances in the store are never handed out directly — readers get a
+        /// deep clone — so an entry is effectively immutable once committed.
+        /// </summary>
+        private sealed class ConversationState
+        {
+            public required JsonArray BaseInput { get; init; }
+            public required List<JsonNode> TurnHistory { get; init; }
+        }
+
+        /// <summary>Guards <see cref="_store"/> and <see cref="_insertionOrder"/> bookkeeping.</summary>
+        /// <remarks>
+        /// The lock covers store bookkeeping and cloning only — never any I/O. Nothing awaited is
+        /// ever executed while it is held.
+        /// </remarks>
+        private readonly object _storeLock = new();
+
+        /// <summary>Conversation state keyed by the response id that produced it.</summary>
+        private readonly Dictionary<string, ConversationState> _store = new();
+
+        /// <summary>Key insertion order, used to evict the oldest entry once the bound is hit.</summary>
+        private readonly Queue<string> _insertionOrder = new();
+
+        /// <summary>
+        /// Upper bound on retained conversations. Long-lived clients would otherwise accumulate one
+        /// entry per response for the lifetime of the process; evicting the oldest entry degrades
+        /// that conversation's next follow-up rather than leaking memory.
+        /// </summary>
+        private const int MaxEntries = 50;
+
+        /// <summary>
+        /// The single slot every streaming conversation shares until SSE response ids can be
+        /// extracted. See the class remarks: this is a declared temporary partial fix.
+        /// </summary>
+        internal const string StreamingLegacySlotKey = "streaming-legacy";
+
         private int _requestCount;
 
         /// <summary>
@@ -1084,10 +1145,20 @@ public static class ChatClientFactory
         /// so it survives across resilience retry attempts and is committed by whichever attempt
         /// finally receives an authoritative response.
         /// </summary>
+        /// <remarks>
+        /// <see cref="BaseInput"/> and <see cref="TurnHistory"/> are always either both set or both
+        /// <see langword="null"/>. Both <see langword="null"/> means NOTHING was staged (the
+        /// request's <c>input</c> was not a JSON array), which is deliberately distinct from a
+        /// staged-but-empty history: the streaming commit is a no-op for the former and writes the
+        /// slot for the latter.
+        /// </remarks>
         private sealed class PendingConversationState
         {
             public JsonArray? BaseInput { get; init; }
             public List<JsonNode>? TurnHistory { get; init; }
+
+            /// <summary>Whether this request staged any state at all.</summary>
+            public bool HasStagedState => BaseInput is not null && TurnHistory is not null;
 
             /// <summary>Guards against committing the same staged state more than once.</summary>
             public bool Committed { get; set; }
@@ -1109,10 +1180,11 @@ public static class ChatClientFactory
         /// <para>
         /// The presence of this entry also serves as the idempotence marker. Without it a retry
         /// would see a body that no longer contains <c>previous_response_id</c> — because the first
-        /// attempt removed it — and would fall into the "first request" branch, overwriting
-        /// <see cref="_baseInput"/> with the fully expanded conversation and corrupting every later
-        /// reconstruction. <see cref="HttpRequestOptions"/> travels with the request instance and is
-        /// never sent over the wire, which makes it the right place for this attempt-scoped state.
+        /// attempt removed it — and would fall into the "first request" branch, staging the fully
+        /// expanded conversation as the base input and corrupting every later reconstruction built
+        /// on the entry this exchange commits. <see cref="HttpRequestOptions"/> travels with the
+        /// request instance and is never sent over the wire, which makes it the right place for
+        /// this attempt-scoped state.
         /// </para>
         /// </remarks>
         private static readonly HttpRequestOptionsKey<PendingConversationState> PendingStateKey =
@@ -1139,51 +1211,102 @@ public static class ChatClientFactory
                 var body = await request.Content!.ReadAsStringAsync(ct);
                 var json = JsonNode.Parse(body);
 
-                if (json is JsonObject obj && obj.ContainsKey("previous_response_id"))
+                if (json is JsonObject obj)
                 {
-                    obj.Remove("previous_response_id");
+                    // A request declares itself streaming through "stream": true. This governs
+                    // TRANSFORMATION and STAGING only; the commit is governed by the response's
+                    // content type. When the two disagree, the response's signal wins.
+                    var isStreamingRequest = obj["stream"] is JsonValue streamValue
+                        && streamValue.TryGetValue<bool>(out var streamFlag)
+                        && streamFlag;
 
-                    var combined = new JsonArray();
-
-                    // 1. Original system + user messages from the first request
-                    if (_baseInput is not null)
-                        foreach (var item in _baseInput)
-                            combined.Add(item!.DeepClone());
-
-                    // 2. All accumulated turn history (previous outputs + tool results)
-                    foreach (var item in _turnHistory)
-                        combined.Add(item.DeepClone());
-
-                    // 3. Current input (new tool results from FunctionInvokingChatClient)
-                    List<JsonNode>? stagedTurnHistory = null;
-                    if (obj["input"] is JsonArray currentInput)
+                    // STATE SELECTION.
+                    // 1. A present, valid, found previous_response_id resolves that conversation.
+                    // 2. A streaming request otherwise falls back to the shared legacy slot (see
+                    //    the class remarks: declared temporary partial fix).
+                    // 3. Neither resolves → degraded/fresh: first-request transformation.
+                    ConversationState? parent = null;
+                    var bodyWasRewritten = false;
+                    if (obj.ContainsKey("previous_response_id"))
                     {
-                        stagedTurnHistory = new List<JsonNode>(currentInput.Count);
-                        foreach (var item in currentInput)
-                        {
-                            var clone = item!.DeepClone();
-                            combined.Add(clone);
-                            // Staged, not committed: only an authoritative response promotes these.
-                            stagedTurnHistory.Add(item.DeepClone());
-                        }
+                        // The Copilot endpoint rejects the property outright, so it is always
+                        // stripped — whether or not it resolves to anything here.
+                        var previousId = ReadIdString(obj["previous_response_id"]);
+                        obj.Remove("previous_response_id");
+                        bodyWasRewritten = true;
+                        parent = TryResolveConversationState(previousId);
                     }
 
-                    obj["input"] = combined;
-                    body = obj.ToJsonString();
-                    request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                    if (parent is null && isStreamingRequest)
+                        parent = TryResolveConversationState(StreamingLegacySlotKey);
 
-                    pending = new PendingConversationState { TurnHistory = stagedTurnHistory };
-                    request.Options.Set(PendingStateKey, pending);
-                }
-                else if (json is JsonObject firstObj)
-                {
-                    // First request — stage the original input as the base context. Committing it
-                    // before the response would let a retry (which re-reads an already-expanded
-                    // body) overwrite it with the expanded conversation.
-                    pending = new PendingConversationState
+                    var currentInput = obj["input"] as JsonArray;
+
+                    if (parent is not null)
                     {
-                        BaseInput = firstObj["input"]?.DeepClone() as JsonArray,
-                    };
+                        // CONTINUATION: rebuild the conversation the API can no longer track for
+                        // us — the originating input, every accumulated turn, then this request's
+                        // input. The parent is already a private deep clone.
+                        var combined = new JsonArray();
+
+                        // 1. Original system + user messages from the originating request.
+                        foreach (var item in parent.BaseInput)
+                            combined.Add(item!.DeepClone());
+
+                        // 2. All accumulated turn history (previous outputs + tool results).
+                        foreach (var item in parent.TurnHistory)
+                            combined.Add(item.DeepClone());
+
+                        // 3. Current input (new tool results from FunctionInvokingChatClient).
+                        if (currentInput is not null)
+                            foreach (var item in currentInput)
+                                combined.Add(item!.DeepClone());
+
+                        obj["input"] = combined;
+                        bodyWasRewritten = true;
+                    }
+
+                    if (bodyWasRewritten)
+                    {
+                        // DEGRADED MODE: when the id resolved to nothing, this rewrite is only the
+                        // strip — the body keeps just the current input, exactly like a first
+                        // request. The property must go either way: the endpoint rejects it.
+                        body = obj.ToJsonString();
+                        request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                    }
+
+                    if (currentInput is not null)
+                    {
+                        // Staged, not committed: only an authoritative response promotes this.
+                        // CONTINUATION stages the parent's base plus the parent's history with the
+                        // current input APPENDED — never added to the base, so the input is stored
+                        // exactly once. FRESH stages the current input as the base with an EMPTY
+                        // (but present) history.
+                        var stagedBase = parent?.BaseInput ?? (JsonArray)currentInput.DeepClone();
+                        var stagedHistory = parent?.TurnHistory ?? new List<JsonNode>();
+
+                        if (parent is not null)
+                            foreach (var item in currentInput)
+                                stagedHistory.Add(item!.DeepClone());
+
+                        pending = new PendingConversationState
+                        {
+                            BaseInput = stagedBase,
+                            TurnHistory = stagedHistory,
+                        };
+                    }
+                    else
+                    {
+                        // NON-ARRAY INPUT: nothing is staged at all — neither base nor history,
+                        // even when a parent resolved for the transformation above. There is no
+                        // input array to record, and inventing one would corrupt the conversation.
+                        // "Nothing staged" is distinct from "staged with an empty history": the
+                        // streaming commit is a no-op for the former.
+                        pending = new PendingConversationState();
+                    }
+
+                    // Always staged, even when empty: its presence is the idempotence marker that
+                    // stops a retry from re-running the transformation on an already-rewritten body.
                     request.Options.Set(PendingStateKey, pending);
                 }
 
@@ -1238,10 +1361,15 @@ public static class ChatClientFactory
 
             // Successful streaming response: the SSE stream must be consumed directly by the
             // OpenAI SDK's streaming parser, so this is the last point at which the exchange can be
-            // treated as authoritative. Commit here, before handing the untouched stream back.
+            // treated as authoritative — and the response id is never observable here. Commit the
+            // staged state to the shared legacy slot, before handing the untouched stream back.
+            //
+            // ONE COMMIT RULE: every successful SSE response writes the slot, with NO response
+            // output appended (extracting it from the stream is follow-up work). A request that
+            // staged nothing (non-array input) is a no-op, so the slot's previous entry keeps.
             if (isStreaming)
             {
-                CommitConversationState(pending);
+                CommitStreamingState(pending);
                 return response;
             }
 
@@ -1302,13 +1430,14 @@ public static class ChatClientFactory
 
             // COMMIT — the final step. Everything fallible is done: the body is read, parsed,
             // structurally validated, materialized into detached clones, and the response content is
-            // replaced. Only now is durable state mutated. Request-side state goes in first so turn
-            // history stays in request→response order, then the already-materialized response
-            // output. Neither can fail part-way, and nothing after this point can throw.
-            CommitConversationState(pending);
-
-            if (responseOutput is not null)
-                _turnHistory.AddRange(responseOutput);
+            // replaced. Only now is durable state mutated. The entry is composed request-side first
+            // so turn history stays in request→response order, then the already-materialized
+            // response output. Neither can fail part-way, and nothing after this point can throw.
+            //
+            // A stream:true request whose response is NOT text/event-stream lands here too: the
+            // response's content-type signal governs the commit, so it takes this normal path,
+            // empty-base normalization and output append included.
+            CommitConversationState(pending, ReadIdString((respJson as JsonObject)?["id"]), responseOutput);
 
             return response;
         }
@@ -1326,26 +1455,162 @@ public static class ChatClientFactory
             static body => new StringContent(body, System.Text.Encoding.UTF8, "application/json");
 
         /// <summary>
-        /// Promotes state staged for this request into the durable conversation state. Called only
-        /// once an authoritative response has been received, and at most once per staged state.
+        /// Promotes state staged for this request into the durable per-conversation store, under
+        /// the response's own id. Called only once an authoritative non-streaming response has been
+        /// received, and at most once per staged state.
         /// </summary>
-        private void CommitConversationState(PendingConversationState? pending)
+        /// <param name="pending">The state staged during the request transformation.</param>
+        /// <param name="responseId">
+        /// The response's top-level <c>id</c> when it is a non-empty, non-whitespace JSON string;
+        /// otherwise <see langword="null"/>, in which case NO entry is written and any follow-up
+        /// naming that response degrades to a first-request transformation.
+        /// </param>
+        /// <param name="responseOutput">
+        /// The already-materialized, fully detached clones of the response's <c>output</c> items,
+        /// appended after the staged turn history so ordering stays request→response.
+        /// </param>
+        private void CommitConversationState(
+            PendingConversationState? pending, string? responseId, List<JsonNode>? responseOutput)
         {
             if (pending is null || pending.Committed) return;
             pending.Committed = true;
 
-            if (pending.BaseInput is not null)
-                _baseInput = pending.BaseInput;
+            if (responseId is null) return;
 
-            if (pending.TurnHistory is not null)
-                _turnHistory.AddRange(pending.TurnHistory);
+            // A request that staged nothing (non-array input) still produced an authoritative
+            // response, so the conversation exists and its output has to be recorded — with an
+            // empty base, since there was no input array to carry forward.
+            var baseInput = pending.BaseInput ?? new JsonArray();
+            var turnHistory = pending.TurnHistory ?? new List<JsonNode>();
+
+            if (responseOutput is not null)
+                turnHistory.AddRange(responseOutput);
+
+            StoreConversationState(responseId, baseInput, turnHistory);
         }
 
-        /// <summary>Test accessor: the committed base input, or <see langword="null"/> if none.</summary>
-        internal JsonArray? BaseInputForTest => _baseInput;
+        /// <summary>
+        /// Promotes state staged for a streaming request into the single shared legacy slot. See
+        /// the class remarks: a declared temporary partial fix, because an SSE response's id is not
+        /// observable here.
+        /// </summary>
+        /// <remarks>
+        /// No response output is appended — extracting it from the event stream is follow-up work.
+        /// A request that staged nothing (non-array input) leaves the slot's previous entry alone.
+        /// </remarks>
+        private void CommitStreamingState(PendingConversationState? pending)
+        {
+            if (pending is null || pending.Committed) return;
+            pending.Committed = true;
 
-        /// <summary>Test accessor: the committed turn history.</summary>
-        internal IReadOnlyList<JsonNode> TurnHistoryForTest => _turnHistory;
+            if (!pending.HasStagedState) return;
+
+            StoreConversationState(StreamingLegacySlotKey, pending.BaseInput!, pending.TurnHistory!);
+        }
+
+        /// <summary>
+        /// Writes one conversation entry, bounding the store to <see cref="MaxEntries"/> by
+        /// evicting the oldest key. A key that is already present is updated in place, without
+        /// adding a second insertion-order entry.
+        /// </summary>
+        private void StoreConversationState(string key, JsonArray baseInput, List<JsonNode> turnHistory)
+        {
+            lock (_storeLock)
+            {
+                if (!_store.ContainsKey(key))
+                {
+                    // Bounded FIFO: make room before adding a genuinely new key.
+                    while (_insertionOrder.Count >= MaxEntries)
+                    {
+                        var evicted = _insertionOrder.Dequeue();
+                        _store.Remove(evicted);
+                    }
+
+                    _insertionOrder.Enqueue(key);
+                }
+
+                _store[key] = new ConversationState
+                {
+                    BaseInput = baseInput,
+                    TurnHistory = turnHistory,
+                };
+            }
+        }
+
+        /// <summary>
+        /// Resolves the conversation state recorded under <paramref name="key"/>, as a private deep
+        /// clone so branching follow-ups can never observe each other's additions.
+        /// </summary>
+        /// <returns>
+        /// The cloned state, or <see langword="null"/> when the key is absent, empty or whitespace,
+        /// or simply not present in the store (never recorded, or already evicted) — the degraded
+        /// case, which falls back to a first-request transformation.
+        /// </returns>
+        private ConversationState? TryResolveConversationState(string? key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return null;
+
+            lock (_storeLock)
+            {
+                if (!_store.TryGetValue(key!, out var state)) return null;
+
+                var baseInput = (JsonArray)state.BaseInput.DeepClone();
+                var turnHistory = new List<JsonNode>(state.TurnHistory.Count);
+                foreach (var item in state.TurnHistory)
+                    turnHistory.Add(item.DeepClone());
+
+                return new ConversationState { BaseInput = baseInput, TurnHistory = turnHistory };
+            }
+        }
+
+        /// <summary>
+        /// THE UNIFORM ID RULE: an id is usable only when it is a non-empty, non-whitespace JSON
+        /// <b>string</b>. <see langword="null"/>, numbers, objects and arrays are all rejected —
+        /// never coerced, and never a throw.
+        /// </summary>
+        private static string? ReadIdString(JsonNode? node)
+        {
+            if (node is not JsonValue value) return null;
+            if (!value.TryGetValue<string>(out var text)) return null;
+            return string.IsNullOrWhiteSpace(text) ? null : text;
+        }
+
+        /// <summary>
+        /// Test accessor: resolves the conversation state recorded under <paramref name="responseId"/>.
+        /// </summary>
+        /// <returns>
+        /// <see langword="true"/> with deep clones of the entry on a hit; on a miss (a null, empty,
+        /// whitespace, never-recorded or evicted id) <see langword="false"/> with a
+        /// <see langword="null"/> <paramref name="baseInput"/> and an EMPTY
+        /// <paramref name="turnHistory"/>. Never throws.
+        /// </returns>
+        internal bool TryGetConversationStateForTest(
+            string? responseId, out JsonArray? baseInput, out IReadOnlyList<JsonNode> turnHistory)
+        {
+            var state = TryResolveConversationState(responseId);
+            if (state is null)
+            {
+                baseInput = null;
+                turnHistory = Array.Empty<JsonNode>();
+                return false;
+            }
+
+            baseInput = state.BaseInput;
+            turnHistory = state.TurnHistory;
+            return true;
+        }
+
+        /// <summary>Test accessor: the number of conversations currently retained.</summary>
+        internal int StoreCountForTest
+        {
+            get { lock (_storeLock) { return _store.Count; } }
+        }
+
+        /// <summary>Test accessor: the retained keys in insertion (eviction) order.</summary>
+        internal IReadOnlyList<string> InsertionOrderForTest
+        {
+            get { lock (_storeLock) { return _insertionOrder.ToArray(); } }
+        }
 
         /// <summary>
         /// Writes one side of a responses-API exchange to the diagnostics directory.
