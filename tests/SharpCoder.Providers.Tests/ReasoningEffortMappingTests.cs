@@ -1270,14 +1270,27 @@ public sealed class CopilotResponsesHandlerRetryTests
         ResponsesRequest(body);
 
     /// <summary>
+    /// A scripted SSE body that announces <paramref name="responseId"/> through a
+    /// <c>response.created</c> event — the ONLY way a streaming exchange can commit now that the
+    /// shared legacy slot is gone — and still ends with the <c>event: done</c> marker the
+    /// passthrough assertions look for.
+    /// </summary>
+    internal static string SseBodyWithId(string responseId) =>
+        "event: response.created\n" +
+        "data: {\"response\":{\"id\":\"" + responseId + "\"}}\n" +
+        "\n" +
+        "event: done\ndata: {}\n\n";
+
+    /// <summary>
     /// A first request that is retried must record the ORIGINAL input as the base context exactly
-    /// once. Before the fix, the retry re-read the (already-transformed) body and overwrote
-    /// <c>_baseInput</c>, corrupting every later conversation reconstruction.
+    /// once, under the response's own id. Before the fix, the retry re-read the (already-transformed)
+    /// body and staged the expanded conversation as the base, corrupting every later conversation
+    /// reconstruction.
     /// </summary>
     [Fact]
     public async Task FirstRequest_RetriedAfterTransientFailure_BaseInputNotCorrupted()
     {
-        var terminal = new FailThenSucceedHandler(failures: 2, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 2, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using var request = ResponsesRequest(
@@ -1287,11 +1300,14 @@ public sealed class CopilotResponsesHandlerRetryTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(3, terminal.Attempts);
 
-        // The committed base input must be exactly the caller's original single message.
-        var baseInput = handler.BaseInputForTest;
+        // The entry committed under the response id must hold exactly the caller's original message.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
+
+        // Exactly one conversation was recorded despite the three attempts.
+        Assert.Equal(1, handler.StoreCountForTest);
     }
 
     /// <summary>
@@ -1302,7 +1318,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task FollowUpRequest_RetriedAfterTransientFailure_TurnHistoryNotDuplicated()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         // Establish the base context with a clean first request.
@@ -1310,10 +1326,11 @@ public sealed class CopilotResponsesHandlerRetryTests
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         // Now a follow-up that fails twice before succeeding.
         terminal.ResetFailures(2);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (var response = await client.SendAsync(followUp, TestContext.Current.CancellationToken))
@@ -1322,8 +1339,9 @@ public sealed class CopilotResponsesHandlerRetryTests
         }
 
         // Exactly one new turn-history entry despite three attempts.
-        Assert.Equal(historyAfterFirst + 1, handler.TurnHistoryForTest.Count);
-        Assert.Equal("tool-result", handler.TurnHistoryForTest[^1]["output"]!.GetValue<string>());
+        Assert.True(handler.TryGetConversationStateForTest("resp_2", out _, out var historyAfterFollowUp));
+        Assert.Equal(historyAfterFirst.Count + 1, historyAfterFollowUp.Count);
+        Assert.Equal("tool-result", historyAfterFollowUp[^1]["output"]!.GetValue<string>());
     }
 
     /// <summary>
@@ -1333,7 +1351,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task RetriedFollowUp_BodyIsTransformedExactlyOnce()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out _);
 
         using (var first = ResponsesRequest(
@@ -1341,6 +1359,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
         terminal.ResetFailures(2);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (await client.SendAsync(followUp, TestContext.Current.CancellationToken)) { }
@@ -1366,7 +1385,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task AllAttemptsFail_NoConversationStateIsCommitted()
     {
-        var terminal = new FailThenSucceedHandler(failures: int.MaxValue, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: int.MaxValue, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var request = ResponsesRequest(
@@ -1376,8 +1395,10 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
+        Assert.Equal(0, handler.StoreCountForTest);
     }
 
     /// <summary>
@@ -1388,7 +1409,8 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task RetriedFirstRequest_LaterFollowUp_ReconstructsConversationCorrectly()
     {
-        var terminal = new FailThenSucceedHandler(failures: 2, """{"output":[{"type":"message","content":"answer"}]}""");
+        var terminal = new FailThenSucceedHandler(
+            failures: 2, """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""");
         using var client = CreateClient(terminal, out _);
 
         using (var first = ResponsesRequest(
@@ -1396,6 +1418,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
         terminal.ResetFailures(0);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (await client.SendAsync(followUp, TestContext.Current.CancellationToken)) { }
@@ -1416,7 +1439,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task RetriedRequest_ExtraHighStillMappedOnEveryAttempt()
     {
-        var terminal = new FailThenSucceedHandler(failures: 2, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 2, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out _);
 
         using var request = ResponsesRequest(
@@ -1431,14 +1454,15 @@ public sealed class CopilotResponsesHandlerRetryTests
     /// <summary>
     /// The exact corruption described in review: a retried FOLLOW-UP request. The first attempt
     /// strips <c>previous_response_id</c>; on retry the body no longer contains it, so an
-    /// unguarded handler falls into the "first request" branch and overwrites <c>_baseInput</c>
-    /// with the fully expanded conversation. This asserts the base input still holds only the
-    /// original message.
+    /// unguarded handler falls into the "first request" branch and stages the fully expanded
+    /// conversation as the base input. This asserts the entry committed under the follow-up's own
+    /// response id still holds only the original message as its base.
     /// </summary>
     [Fact]
     public async Task RetriedFollowUp_BaseInputIsNotOverwrittenWithExpandedConversation()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[{"type":"message","content":"answer"}]}""");
+        var terminal = new FailThenSucceedHandler(
+            failures: 0, """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
@@ -1446,12 +1470,13 @@ public sealed class CopilotResponsesHandlerRetryTests
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
         terminal.ResetFailures(2);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (await client.SendAsync(followUp, TestContext.Current.CancellationToken)) { }
 
-        // _baseInput must still be ONLY the original user message — not the expanded conversation.
-        var baseInput = handler.BaseInputForTest;
+        // The base input must still be ONLY the original user message — not the expanded conversation.
+        Assert.True(handler.TryGetConversationStateForTest("resp_2", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
@@ -1466,16 +1491,17 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task FollowUpWithAllAttemptsFailing_DoesNotCommitTurnHistory()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         terminal.ResetFailures(int.MaxValue);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"doomed-result"}]}"""))
         using (var response = await client.SendAsync(followUp, TestContext.Current.CancellationToken))
@@ -1483,9 +1509,14 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        // Nothing from the failed follow-up may have been recorded.
-        Assert.Equal(historyAfterFirst, handler.TurnHistoryForTest.Count);
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        // Nothing from the failed follow-up may have been recorded — neither a new entry nor an
+        // addition to the parent's.
+        Assert.False(handler.TryGetConversationStateForTest("resp_2", out _, out _));
+        Assert.Equal(1, handler.StoreCountForTest);
+
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
+        Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("doomed-result", StringComparison.Ordinal));
     }
 
@@ -1493,12 +1524,12 @@ public sealed class CopilotResponsesHandlerRetryTests
     /// A FIRST request whose every attempt fails with a <c>text/event-stream</c> content type must
     /// not commit conversation state. An error reply can carry the streaming content type (the API
     /// echoes the requested stream mode), and the streaming short-circuit previously ran before the
-    /// success check, so the failed attempt committed <c>_baseInput</c> anyway.
+    /// success check, so the failed attempt committed the base input anyway.
     /// </summary>
     [Fact]
     public async Task FailedSseResponse_DoesNotCommitBaseInput()
     {
-        var terminal = new FailThenSucceedHandler(failures: int.MaxValue, """{"output":[]}""")
+        var terminal = new FailThenSucceedHandler(failures: int.MaxValue, """{"id":"resp_1","output":[]}""")
         {
             FailuresUseSseContentType = true,
         };
@@ -1512,8 +1543,12 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
         }
 
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        // A failed exchange records nothing under any key — there is no streaming slot to check.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
     }
 
     /// <summary>
@@ -1523,14 +1558,14 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task FailedSseFollowUp_DoesNotCommitTurnHistory()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         terminal.ResetFailures(int.MaxValue);
         terminal.FailuresUseSseContentType = true;
@@ -1542,22 +1577,29 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        Assert.Equal(historyAfterFirst, handler.TurnHistoryForTest.Count);
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        // Nothing new was recorded, and the parent entry did not grow.
+        Assert.Equal(1, handler.StoreCountForTest);
+
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
+        Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("sse-doomed", StringComparison.Ordinal));
     }
 
     /// <summary>
     /// An SSE attempt that fails transiently and then SUCCEEDS as SSE must commit exactly once —
     /// the fix must not swing too far and drop state for genuinely successful streaming responses.
+    /// The stream announces its own id through <c>response.created</c>, so the entry lands under
+    /// that real response id, exactly like a non-streaming exchange.
     /// </summary>
     [Fact]
     public async Task FailedThenSuccessfulSseResponse_CommitsStateExactlyOnce()
     {
-        var terminal = new FailThenSucceedHandler(failures: 2, """{"output":[]}""")
+        var terminal = new FailThenSucceedHandler(failures: 2, """{"id":"resp_1","output":[]}""")
         {
             FailuresUseSseContentType = true,
             SuccessUsesSseContentType = true,
+            SuccessSseBody = SseBodyWithId("resp_stream"),
         };
         using var client = CreateClient(terminal, out var handler);
 
@@ -1575,10 +1617,14 @@ public sealed class CopilotResponsesHandlerRetryTests
 
         Assert.Equal(3, terminal.Attempts);
 
-        var baseInput = handler.BaseInputForTest;
+        Assert.True(handler.TryGetConversationStateForTest("resp_stream", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
+
+        // Exactly one entry — under the streamed id — despite the three attempts.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_stream" }, handler.InsertionOrderForTest);
     }
 
     /// <summary>
@@ -1588,18 +1634,19 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task SuccessfulSseFollowUpAfterFailures_CommitsTurnHistoryOnce()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         terminal.ResetFailures(2);
         terminal.FailuresUseSseContentType = true;
         terminal.SuccessUsesSseContentType = true;
+        terminal.SuccessSseBody = SseBodyWithId("resp_stream");
 
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","stream":true,"previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"sse-result"}]}"""))
@@ -1608,8 +1655,16 @@ public sealed class CopilotResponsesHandlerRetryTests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        Assert.Equal(historyAfterFirst + 1, handler.TurnHistoryForTest.Count);
-        Assert.Equal("sse-result", handler.TurnHistoryForTest[^1]["output"]!.GetValue<string>());
+        // The SSE follow-up's state lands under the streamed response id: the parent's base and
+        // history with its own input appended exactly once, despite the failed attempts before it.
+        Assert.True(handler.TryGetConversationStateForTest(
+            "resp_stream", out _, out var streamHistory));
+        Assert.Equal(historyAfterFirst.Count + 1, streamHistory.Count);
+        Assert.Equal("sse-result", streamHistory[^1]["output"]!.GetValue<string>());
+
+        // The parent is untouched by the streaming turn.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var parentHistory));
+        Assert.Equal(historyAfterFirst.Count, parentHistory.Count);
     }
 
     /// <summary>
@@ -1632,7 +1687,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [InlineData("Text/Event-Stream; charset=utf-8")]
     public async Task FailedSseResponse_IsNotReadToCompletion_SoRetriesProceed(string failureContentType)
     {
-        var terminal = new FailThenSucceedHandler(failures: 2, """{"output":[]}""")
+        var terminal = new FailThenSucceedHandler(failures: 2, """{"id":"resp_1","output":[]}""")
         {
             FailuresUseSseContentType = true,
             UseUnboundedFailureStream = true,
@@ -1653,10 +1708,13 @@ public sealed class CopilotResponsesHandlerRetryTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(3, terminal.Attempts);
 
-        // The successful attempt still committed exactly once.
-        var baseInput = handler.BaseInputForTest;
+        // The successful attempt still committed exactly once. Its response is NOT
+        // text/event-stream, so — the response's signal governing the commit — it takes the normal
+        // non-streaming id-keyed path rather than the SSE parser.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
+        Assert.Equal(1, handler.StoreCountForTest);
     }
 
     /// <summary>
@@ -1680,13 +1738,17 @@ public sealed class CopilotResponsesHandlerRetryTests
         using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
     }
 
     /// <summary>
     /// A SUCCESSFUL SSE response of any casing must still be recognized as streaming: it must be
-    /// handed back unconsumed for the SDK's parser and must commit exactly once.
+    /// handed back unconsumed for the SDK's parser and must commit exactly once, under the id the
+    /// stream itself announces.
     /// </summary>
     [Theory]
     [InlineData("Text/Event-Stream")]
@@ -1697,6 +1759,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         {
             SuccessUsesSseContentType = true,
             SuccessContentType = successContentType,
+            SuccessSseBody = SseBodyWithId("resp_stream"),
         };
         using var client = CreateClient(terminal, out var handler);
 
@@ -1713,7 +1776,7 @@ public sealed class CopilotResponsesHandlerRetryTests
             await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken),
             StringComparison.Ordinal);
 
-        var baseInput = handler.BaseInputForTest;
+        Assert.True(handler.TryGetConversationStateForTest("resp_stream", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
     }
@@ -1735,8 +1798,10 @@ public sealed class CopilotResponsesHandlerRetryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.SendAsync(request, TestContext.Current.CancellationToken));
 
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
     }
 
     /// <summary>
@@ -1745,14 +1810,14 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task MalformedSuccessBodyOnFollowUp_DoesNotCommitTurnHistory()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         terminal.SuccessBody = """{"output":[ ,,, truncated""";
 
@@ -1762,8 +1827,11 @@ public sealed class CopilotResponsesHandlerRetryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.SendAsync(followUp, TestContext.Current.CancellationToken));
 
-        Assert.Equal(historyAfterFirst, handler.TurnHistoryForTest.Count);
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        // No new entry, and the parent entry is untouched.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
+        Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("malformed-doomed", StringComparison.Ordinal));
     }
 
@@ -1775,9 +1843,9 @@ public sealed class CopilotResponsesHandlerRetryTests
     /// state.
     /// </summary>
     [Theory]
-    [InlineData("""{"output":[null]}""")]
-    [InlineData("""{"output":[{"type":"message","content":"ok"},null]}""")]
-    [InlineData("""{"output":[null,{"type":"message","content":"ok"}]}""")]
+    [InlineData("""{"id":"resp_1","output":[null]}""")]
+    [InlineData("""{"id":"resp_1","output":[{"type":"message","content":"ok"},null]}""")]
+    [InlineData("""{"id":"resp_1","output":[null,{"type":"message","content":"ok"}]}""")]
     public async Task StructurallyInvalidSuccessBody_DoesNotCommitConversationState(string successBody)
     {
         var terminal = new FailThenSucceedHandler(failures: 0, successBody);
@@ -1789,8 +1857,10 @@ public sealed class CopilotResponsesHandlerRetryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.SendAsync(request, TestContext.Current.CancellationToken));
 
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
     }
 
     /// <summary>
@@ -1802,18 +1872,18 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task StructurallyInvalidSuccessBodyOnFollowUp_DoesNotPartiallyCommit()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
         // A well-formed leading item followed by a null: the old loop committed the first item
         // before throwing on the second.
-        terminal.SuccessBody = """{"output":[{"type":"message","content":"leaked"},null]}""";
+        terminal.SuccessBody = """{"id":"resp_2","output":[{"type":"message","content":"leaked"},null]}""";
 
         using var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"structural-doomed"}]}""");
@@ -1821,10 +1891,15 @@ public sealed class CopilotResponsesHandlerRetryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.SendAsync(followUp, TestContext.Current.CancellationToken));
 
-        Assert.Equal(historyAfterFirst, handler.TurnHistoryForTest.Count);
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        // No entry at all for the failed exchange, and the parent's is unchanged.
+        Assert.False(handler.TryGetConversationStateForTest("resp_2", out _, out _));
+        Assert.Equal(1, handler.StoreCountForTest);
+
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
+        Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("structural-doomed", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("leaked", StringComparison.Ordinal));
     }
 
@@ -1835,7 +1910,7 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task AfterStructuralFailure_LaterRequestReconstructsCorrectly()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[null]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_0","output":[null]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var doomed = ResponsesRequest(
@@ -1845,15 +1920,16 @@ public sealed class CopilotResponsesHandlerRetryTests
                 () => client.SendAsync(doomed, TestContext.Current.CancellationToken));
         }
 
-        Assert.Null(handler.BaseInputForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_0", out _, out _));
 
         // A fresh, well-formed first request establishes the base context cleanly.
-        terminal.SuccessBody = """{"output":[{"type":"message","content":"answer"}]}""";
+        terminal.SuccessBody = """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""";
         using (var good = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"real-first"}]}"""))
         using (await client.SendAsync(good, TestContext.Current.CancellationToken)) { }
 
-        var baseInput = handler.BaseInputForTest;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out _));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("real-first", baseInput[0]!["content"]!.GetValue<string>());
@@ -1861,6 +1937,7 @@ public sealed class CopilotResponsesHandlerRetryTests
         // And the follow-up reconstructs base + response output + current input, with no residue
         // from the structurally invalid exchange.
         terminal.ResetFailures(0);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var followUp = ResponsesRequest(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (await client.SendAsync(followUp, TestContext.Current.CancellationToken)) { }
@@ -1884,7 +1961,8 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task ResponseContentReplacementThrows_DoesNotCommitConversationState()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[{"type":"message","content":"answer"}]}""");
+        var terminal = new FailThenSucceedHandler(
+            failures: 0, """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""");
         using var client = CreateClient(terminal, out var handler);
 
         handler.ResponseContentFactory = _ => throw new InvalidOperationException("content replacement failed");
@@ -1897,8 +1975,10 @@ public sealed class CopilotResponsesHandlerRetryTests
         Assert.Equal("content replacement failed", ex.Message);
 
         // Neither the staged request state nor the accumulated response output may be present.
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
     }
 
     /// <summary>
@@ -1908,16 +1988,17 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task ResponseContentReplacementThrowsOnFollowUp_DoesNotCommitTurnHistory()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[]}""");
+        var terminal = new FailThenSucceedHandler(failures: 0, """{"id":"resp_1","output":[]}""");
         using var client = CreateClient(terminal, out var handler);
 
         using (var first = ResponsesRequest(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        var historyAfterFirst = handler.TurnHistoryForTest.Count;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFirst));
 
-        terminal.SuccessBody = """{"output":[{"type":"message","content":"replacement-leaked"}]}""";
+        terminal.SuccessBody =
+            """{"id":"resp_2","output":[{"type":"message","content":"replacement-leaked"}]}""";
         handler.ResponseContentFactory = _ => throw new InvalidOperationException("content replacement failed");
 
         using var followUp = ResponsesRequest(
@@ -1926,10 +2007,14 @@ public sealed class CopilotResponsesHandlerRetryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.SendAsync(followUp, TestContext.Current.CancellationToken));
 
-        Assert.Equal(historyAfterFirst, handler.TurnHistoryForTest.Count);
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        Assert.False(handler.TryGetConversationStateForTest("resp_2", out _, out _));
+        Assert.Equal(1, handler.StoreCountForTest);
+
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out _, out var historyAfterFailure));
+        Assert.Equal(historyAfterFirst.Count, historyAfterFailure.Count);
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("replacement-doomed", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.TurnHistoryForTest,
+        Assert.DoesNotContain(historyAfterFailure,
             n => n.ToJsonString().Contains("replacement-leaked", StringComparison.Ordinal));
     }
 
@@ -1941,17 +2026,21 @@ public sealed class CopilotResponsesHandlerRetryTests
     [Fact]
     public async Task CommitHappensAfterResponseContentReplacement()
     {
-        var terminal = new FailThenSucceedHandler(failures: 0, """{"output":[{"type":"message","content":"answer"}]}""");
+        var terminal = new FailThenSucceedHandler(
+            failures: 0, """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""");
         using var client = CreateClient(terminal, out var handler);
 
+        int? storeCountAtReplacement = null;
         int? baseInputCountAtReplacement = null;
         int? turnHistoryCountAtReplacement = null;
 
         var realFactory = handler.ResponseContentFactory;
         handler.ResponseContentFactory = body =>
         {
-            baseInputCountAtReplacement = handler.BaseInputForTest?.Count ?? -1;
-            turnHistoryCountAtReplacement = handler.TurnHistoryForTest.Count;
+            storeCountAtReplacement = handler.StoreCountForTest;
+            handler.TryGetConversationStateForTest("resp_1", out var atReplacement, out var historyAtReplacement);
+            baseInputCountAtReplacement = atReplacement?.Count ?? -1;
+            turnHistoryCountAtReplacement = historyAtReplacement.Count;
             return realFactory(body);
         };
 
@@ -1962,16 +2051,18 @@ public sealed class CopilotResponsesHandlerRetryTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         // Replacement ran, and at that point nothing had been committed yet.
+        Assert.Equal(0, storeCountAtReplacement);
         Assert.Equal(-1, baseInputCountAtReplacement);
         Assert.Equal(0, turnHistoryCountAtReplacement);
 
         // After the exchange completes, the commit has happened exactly once.
-        var baseInput = handler.BaseInputForTest;
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
         Assert.NotNull(baseInput);
         Assert.Single(baseInput);
         Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
-        Assert.Single(handler.TurnHistoryForTest);
-        Assert.Equal("answer", handler.TurnHistoryForTest[0]["content"]!.GetValue<string>());
+        Assert.Single(turnHistory);
+        Assert.Equal("answer", turnHistory[0]["content"]!.GetValue<string>());
+        Assert.Equal(1, handler.StoreCountForTest);
 
         // The body still reached the caller intact.
         Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
@@ -2005,6 +2096,13 @@ public sealed class CopilotResponsesHandlerRetryTests
 
         /// <summary>When set, the success response is returned as an SSE stream.</summary>
         public bool SuccessUsesSseContentType { get; set; }
+
+        /// <summary>
+        /// The SSE body returned when <see cref="SuccessUsesSseContentType"/> is set. The default
+        /// announces no response id at all, so a stream using it commits NOTHING; tests that want
+        /// a real-id commit script a <c>response.created</c> event here.
+        /// </summary>
+        public string SuccessSseBody { get; set; } = "event: done\ndata: {}\n\n";
 
         /// <summary>
         /// When set alongside <see cref="FailuresUseSseContentType"/>, failure bodies are backed by a
@@ -2066,7 +2164,7 @@ public sealed class CopilotResponsesHandlerRetryTests
             {
                 RequestMessage = request,
                 Content = SuccessUsesSseContentType
-                    ? SseStringContent("event: done\ndata: {}\n\n", SuccessContentType)
+                    ? SseStringContent(SuccessSseBody, SuccessContentType)
                     : new StringContent(SuccessBody, Encoding.UTF8, "application/json"),
             };
         }
@@ -2617,7 +2715,7 @@ public sealed class ReasoningEffortRetry2IntegrationTests
     public async Task MultiTurnConversation_RetryOnFirstRequest_SecondTurnReconstructsCorrectly()
     {
         var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
-            failures: 2, """{"output":[{"type":"message","content":"answer1"}]}""");
+            failures: 2, """{"id":"resp_1","output":[{"type":"message","content":"answer1"}]}""");
 
         var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(
             terminal, out var handler);
@@ -2627,17 +2725,19 @@ public sealed class ReasoningEffortRetry2IntegrationTests
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(first, TestContext.Current.CancellationToken)) { }
 
-        // Verify base input was committed correctly despite the retry.
-        Assert.NotNull(handler.BaseInputForTest);
-        Assert.Single(handler.BaseInputForTest);
-        Assert.Equal("first", handler.BaseInputForTest![0]!["content"]!.GetValue<string>());
+        // Verify base input was committed correctly under the response id despite the retry.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.NotNull(baseInput);
+        Assert.Single(baseInput);
+        Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
 
         // The response output "answer1" should have been committed to turn history.
-        Assert.Contains(handler.TurnHistoryForTest,
+        Assert.Contains(turnHistory,
             n => n.ToJsonString().Contains("answer1", StringComparison.Ordinal));
 
         // Second request: no failures, must reconstruct conversation correctly.
         terminal.ResetFailures(0);
+        terminal.SuccessBody = """{"id":"resp_2","output":[]}""";
         using (var second = CopilotResponsesHandlerRetryTests.ResponsesRequestForExternalUse(
             """{"model":"gpt-5","previous_response_id":"resp_1","input":[{"type":"function_call_output","output":"tool-result"}]}"""))
         using (await client.SendAsync(second, TestContext.Current.CancellationToken)) { }
@@ -2675,7 +2775,7 @@ public sealed class ReasoningEffortRetry3IntegrationTests
     public async Task FailedSseFirstRequest_SecondCleanRequest_BaseInputFromSecondOnly()
     {
         var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
-            failures: int.MaxValue, """{"output":[]}""")
+            failures: int.MaxValue, """{"id":"resp_1","output":[]}""")
         {
             FailuresUseSseContentType = true,
         };
@@ -2690,9 +2790,10 @@ public sealed class ReasoningEffortRetry3IntegrationTests
             Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         }
 
-        // No state should have been committed from the failed first request.
-        Assert.Null(handler.BaseInputForTest);
-        Assert.Empty(handler.TurnHistoryForTest);
+        // No state should have been committed from the failed first request — nothing under any
+        // key, since a failed exchange never reaches the streaming parser at all.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
 
         // Second request: succeeds cleanly (non-SSE).
         terminal.ResetFailures(0);
@@ -2701,10 +2802,12 @@ public sealed class ReasoningEffortRetry3IntegrationTests
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"clean-second"}]}"""))
         using (await client.SendAsync(second, TestContext.Current.CancellationToken)) { }
 
-        // Base input must be from the second request only.
-        Assert.NotNull(handler.BaseInputForTest);
-        Assert.Single(handler.BaseInputForTest);
-        Assert.Equal("clean-second", handler.BaseInputForTest![0]!["content"]!.GetValue<string>());
+        // The only recorded entry is the second request's, keyed by its response id.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out _));
+        Assert.NotNull(baseInput);
+        Assert.Single(baseInput);
+        Assert.Equal("clean-second", baseInput[0]!["content"]!.GetValue<string>());
+        Assert.Equal(1, handler.StoreCountForTest);
 
         client.Dispose();
     }
@@ -2774,22 +2877,24 @@ public sealed class ReasoningEffortRetry4IntegrationTests
     public async Task WellFormedNonSseSuccess_CommitsBaseInputAndTurnHistoryExactlyOnce()
     {
         var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
-            failures: 0, """{"output":[{"type":"message","content":"answer"}]}""");
+            failures: 0, """{"id":"resp_1","output":[{"type":"message","content":"answer"}]}""");
         var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(terminal, out var handler);
 
         using (var request = CopilotResponsesHandlerRetryTests.ResponsesRequestForExternalUse(
             """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}"""))
         using (await client.SendAsync(request, TestContext.Current.CancellationToken)) { }
 
-        // Base input committed from the request.
-        Assert.NotNull(handler.BaseInputForTest);
-        Assert.Single(handler.BaseInputForTest);
-        Assert.Equal("first", handler.BaseInputForTest![0]!["content"]!.GetValue<string>());
+        // Base input committed from the request, under the response's own id.
+        Assert.True(handler.TryGetConversationStateForTest("resp_1", out var baseInput, out var turnHistory));
+        Assert.NotNull(baseInput);
+        Assert.Single(baseInput);
+        Assert.Equal("first", baseInput[0]!["content"]!.GetValue<string>());
 
         // Response output committed to turn history (the "answer" message).
-        Assert.Contains(handler.TurnHistoryForTest,
+        Assert.Contains(turnHistory,
             n => n.ToJsonString().Contains("answer", StringComparison.Ordinal));
-        Assert.Single(handler.TurnHistoryForTest);
+        Assert.Single(turnHistory);
+        Assert.Equal(1, handler.StoreCountForTest);
 
         client.Dispose();
     }
@@ -2856,5 +2961,1912 @@ public sealed class ReasoningEffortRetry4IntegrationTests
         // Only one invocation happened, and it returned no Think, so max was injected.
         Assert.Equal(1, call);
         Assert.Equal("max", JsonNode.Parse(terminal.LastBody!)!["think"]!.GetValue<string>());
+    }
+}
+
+/// <summary>
+/// Spec-driven tests for <see cref="ChatClientFactory.CopilotResponsesHandler"/>'s
+/// per-conversation state store: the FRESH/CONTINUATION/non-array staging rules, the id-keyed
+/// commit (streaming and non-streaming alike), deep-clone isolation, the bounded FIFO and the
+/// uniform id validation.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Everything is asserted through the internal seams (<c>TryGetConversationStateForTest</c>,
+/// <c>StoreCountForTest</c>, <c>InsertionOrderForTest</c>) plus the bodies the terminal handler
+/// actually received, so each test pins a specific entry's exact contents, order and multiplicity
+/// rather than merely "something was recorded".
+/// </para>
+/// <para>
+/// Concurrency is forced with an async barrier, never with <c>Task.Delay</c>: the gated terminal
+/// holds every participant inside the handler until all of them have arrived, so the interleaving
+/// is deterministic and a state-bleeding implementation cannot pass by luck.
+/// </para>
+/// </remarks>
+public sealed class CopilotResponsesHandlerConversationStoreTests
+{
+    // ── Shared plumbing ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reduces a conversation item to the single string that identifies it in these tests, so
+    /// assertions can compare exact sequences (which items, in what order, how many times).
+    /// </summary>
+    private static string MarkerOf(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            if (obj["content"] is JsonValue content && content.TryGetValue<string>(out var contentText))
+                return contentText;
+            if (obj["output"] is JsonValue output && output.TryGetValue<string>(out var outputText))
+                return outputText;
+        }
+
+        return node?.ToJsonString() ?? "<null>";
+    }
+
+    private static string[] ArrayMarkers(JsonArray? array)
+        => array is null ? Array.Empty<string>() : array.Select(MarkerOf).ToArray();
+
+    private static string[] ListMarkers(IReadOnlyList<JsonNode> items)
+        => items.Select(n => MarkerOf(n)).ToArray();
+
+    /// <summary>The <c>BaseInput</c> of the entry under <paramref name="id"/>, as markers.</summary>
+    private static string[] BaseMarkers(ChatClientFactory.CopilotResponsesHandler handler, string id)
+    {
+        Assert.True(handler.TryGetConversationStateForTest(id, out var baseInput, out _),
+            $"expected an entry under '{id}'");
+        return ArrayMarkers(baseInput);
+    }
+
+    /// <summary>The <c>TurnHistory</c> of the entry under <paramref name="id"/>, as markers.</summary>
+    private static string[] HistoryMarkers(ChatClientFactory.CopilotResponsesHandler handler, string id)
+    {
+        Assert.True(handler.TryGetConversationStateForTest(id, out _, out var history),
+            $"expected an entry under '{id}'");
+        return ListMarkers(history);
+    }
+
+    /// <summary>How often <paramref name="marker"/> occurs across the WHOLE entry (base + history).</summary>
+    private static int OccurrencesIn(ChatClientFactory.CopilotResponsesHandler handler, string id, string marker)
+        => BaseMarkers(handler, id).Concat(HistoryMarkers(handler, id)).Count(m => m == marker);
+
+    /// <summary>The <c>input</c> array of a request body, as markers.</summary>
+    private static string[] SentInputMarkers(string body)
+        => ArrayMarkers(JsonNode.Parse(body)!["input"] as JsonArray);
+
+    /// <summary>Sends one responses-API request and requires it to succeed.</summary>
+    private static async Task SendAsync(HttpClient client, string body)
+    {
+        using var request = CopilotResponsesHandlerRetryTests.ResponsesRequestForExternalUse(body);
+        using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static string UserInput(string marker)
+        => "[{\"type\":\"message\",\"role\":\"user\",\"content\":\"" + marker + "\"}]";
+
+    private static string ToolInput(string marker)
+        => "[{\"type\":\"function_call_output\",\"output\":\"" + marker + "\"}]";
+
+    /// <summary>Builds a responses-API request body with the given raw <c>input</c> JSON.</summary>
+    private static string Request(string rawInput, string? previousResponseId = null, bool stream = false)
+    {
+        var previous = previousResponseId is null
+            ? string.Empty
+            : "\"previous_response_id\":" + previousResponseId + ",";
+        var streaming = stream ? "\"stream\":true," : string.Empty;
+        return "{\"model\":\"gpt-5\"," + streaming + previous + "\"input\":" + rawInput + "}";
+    }
+
+    /// <summary>A well-formed JSON response body with a valid id and the given output markers.</summary>
+    private static string JsonReply(string id, params string[] outputMarkers)
+    {
+        var outputs = string.Join(",",
+            outputMarkers.Select(m => "{\"type\":\"message\",\"content\":\"" + m + "\"}"));
+        return "{\"id\":\"" + id + "\",\"output\":[" + outputs + "]}";
+    }
+
+    /// <summary>
+    /// A well-formed SSE body: a <c>response.created</c> event carrying <paramref name="id"/> —
+    /// the sole id source for a streaming exchange — one
+    /// <c>response.output_item.done</c> event per output marker, and a terminal
+    /// <c>response.completed</c> event that triggers the amendment.
+    /// </summary>
+    private static string SseReply(string id, params string[] outputMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in outputMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        sb.Append("event: response.completed\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Terminal handler driven by an explicit script of replies. An unscripted request throws
+    /// rather than falling back to a default, so a test that sends more (or fewer) requests than it
+    /// intended fails loudly instead of silently asserting against the wrong exchange.
+    /// </summary>
+    private sealed class ScriptedTerminal : HttpMessageHandler
+    {
+        private readonly object _lock = new();
+        private readonly Queue<KeyValuePair<string, string>> _replies = new();
+
+        public List<string> Bodies { get; } = new();
+
+        public string LastBody
+        {
+            get { lock (_lock) { return Bodies[^1]; } }
+        }
+
+        public ScriptedTerminal Json(string body)
+        {
+            lock (_lock) { _replies.Enqueue(new KeyValuePair<string, string>(body, "application/json")); }
+            return this;
+        }
+
+        public ScriptedTerminal Sse(string body = "event: done\ndata: {}\n\n")
+        {
+            lock (_lock) { _replies.Enqueue(new KeyValuePair<string, string>(body, "text/event-stream")); }
+            return this;
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var requestBody = request.Content is null
+                ? string.Empty
+                : await request.Content.ReadAsStringAsync(ct);
+
+            KeyValuePair<string, string> reply;
+            lock (_lock)
+            {
+                Bodies.Add(requestBody);
+                if (_replies.Count == 0)
+                    throw new InvalidOperationException(
+                        $"ScriptedTerminal received an unscripted request #{Bodies.Count}: {requestBody}");
+                reply = _replies.Dequeue();
+            }
+
+            var content = new StringContent(reply.Key, Encoding.UTF8);
+            content.Headers.ContentType =
+                System.Net.Http.Headers.MediaTypeHeaderValue.Parse(reply.Value);
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = content,
+            };
+        }
+    }
+
+    private static HttpClient CreateClient(
+        ScriptedTerminal terminal, out ChatClientFactory.CopilotResponsesHandler handler)
+        => CopilotResponsesHandlerRetryTests.GetClientForExternalUse(terminal, out handler);
+
+    // ── (a) New conversation ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// A first request with array input plus a valid response id creates a FRESH entry: the request
+    /// input becomes the <c>BaseInput</c> exactly once, the staged history is EMPTY, and only the
+    /// response's <c>output</c> items land in the turn history.
+    /// </summary>
+    /// <remarks>
+    /// The "the input is not ALSO in the history" assertion is what distinguishes FRESH staging
+    /// from CONTINUATION staging: staging the input into the history as well would make the history
+    /// two items long and would duplicate the input inside the entry.
+    /// </remarks>
+    [Fact]
+    public async Task FirstRequest_WithValidResponseId_StagesInputAsBaseOnlyAndAppendsOutput()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_a", "answer"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        // Exactly one conversation, keyed by the response's own id.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_a" }, handler.InsertionOrderForTest);
+
+        // The request input is the base — once — and the staged history was empty, so the history
+        // holds only the response output.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_a", "first"));
+    }
+
+    /// <summary>
+    /// Every response <c>output</c> item is appended, in order, after the (empty) staged history.
+    /// </summary>
+    [Fact]
+    public async Task FirstRequest_AppendsEveryOutputItemInOrder()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_a", "out1", "out2", "out3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "out1", "out2", "out3" }, HistoryMarkers(handler, "resp_a"));
+    }
+
+    // ── (b) The FRESH / CONTINUATION distinction ─────────────────────────────
+
+    /// <summary>
+    /// A follow-up naming its parent's response id composes the new entry as the parent's base +
+    /// the parent's history + the CURRENT input appended once + the new response's output. The base
+    /// must not grow, and the current input must occur exactly once in the whole entry.
+    /// </summary>
+    [Fact]
+    public async Task FollowUp_AppendsCurrentInputToHistoryExactlyOnce_AndLeavesBaseUnchanged()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_b", "answer2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\""));
+
+        // The sent body carries the reconstruction, with the id stripped and nothing duplicated.
+        Assert.Null(JsonNode.Parse(terminal.LastBody)!["previous_response_id"]);
+        Assert.Equal(new[] { "first", "answer", "tool-result" }, SentInputMarkers(terminal.LastBody));
+
+        // The base did NOT grow: the current input goes to the history, never to the base.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "answer", "tool-result", "answer2" }, HistoryMarkers(handler, "resp_b"));
+
+        // Stored exactly once across the entire entry — not once in the base and once in history.
+        Assert.Equal(1, OccurrencesIn(handler, "resp_b", "tool-result"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_b", "first"));
+
+        // Both conversations coexist; the parent keeps its own key.
+        Assert.Equal(2, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_a", "resp_b" }, handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// A three-turn chain accumulates every turn exactly once, in request→response order, with the
+    /// base still holding only the originating input.
+    /// </summary>
+    [Fact]
+    public async Task MultiTurnChain_AccumulatesEachTurnExactlyOnce()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_1", "out1"))
+            .Json(JsonReply("resp_2", "out2"))
+            .Json(JsonReply("resp_3", "out3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request(ToolInput("tool1"), previousResponseId: "\"resp_1\""));
+        await SendAsync(client, Request(ToolInput("tool2"), previousResponseId: "\"resp_2\""));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_3"));
+        Assert.Equal(new[] { "out1", "tool1", "out2", "tool2", "out3" }, HistoryMarkers(handler, "resp_3"));
+
+        foreach (var marker in new[] { "first", "out1", "tool1", "out2", "tool2", "out3" })
+            Assert.Equal(1, OccurrencesIn(handler, "resp_3", marker));
+    }
+
+    // ── (c) The non-array-input normalization ────────────────────────────────
+
+    /// <summary>
+    /// A request whose <c>input</c> is not a JSON array stages NOTHING, so a valid response id
+    /// commits an EMPTY <c>BaseInput</c> with only the response output as the history.
+    /// </summary>
+    [Theory]
+    [InlineData("\"just a string\"")]
+    [InlineData("{\"role\":\"user\"}")]
+    [InlineData("42")]
+    [InlineData("null")]
+    public async Task NonArrayInput_StagesNothing_AndCommitsEmptyBaseWithOutputOnly(string rawInput)
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_c", "c-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        var requestBody = Request(rawInput);
+        await SendAsync(client, requestBody);
+
+        // The request still went through, unchanged: no id to strip and no parent to inline.
+        Assert.Equal(JsonNode.Parse(requestBody)!.ToJsonString(),
+            JsonNode.Parse(terminal.LastBody)!.ToJsonString());
+
+        // An entry still exists (the exchange was authoritative), with an EMPTY base.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Empty(BaseMarkers(handler, "resp_c"));
+        Assert.Equal(new[] { "c-out" }, HistoryMarkers(handler, "resp_c"));
+    }
+
+    /// <summary>
+    /// The non-array rule is a BLANKET rule: even when a parent state resolved — and was inlined
+    /// into the request body — nothing is staged, so the committed entry still has an empty base
+    /// and carries no trace of the parent conversation.
+    /// </summary>
+    [Fact]
+    public async Task NonArrayInput_WithResolvingParent_StillStagesNothing_ThoughRequestIsReconstructed()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_c", "c-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request("\"a bare string\"", previousResponseId: "\"resp_a\""));
+
+        // TRANSFORMED NORMALLY: the id is stripped and the parent IS reconstructed in the body.
+        Assert.Null(JsonNode.Parse(terminal.LastBody)!["previous_response_id"]);
+        Assert.Equal(new[] { "first", "answer" }, SentInputMarkers(terminal.LastBody));
+
+        // ...yet NOTHING was staged, so the entry is the empty-base normalization, carrying neither
+        // the parent's base nor the parent's history.
+        Assert.Empty(BaseMarkers(handler, "resp_c"));
+        Assert.Equal(new[] { "c-out" }, HistoryMarkers(handler, "resp_c"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_c", "first"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_c", "answer"));
+
+        // The parent entry is untouched.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+    }
+
+    // ── (d) Isolation, branching and concurrency ─────────────────────────────
+
+    /// <summary>
+    /// A HIT returns a deep clone: mutating what the seam handed back — the base array, its
+    /// elements, or a history node — must leave the stored entry untouched.
+    /// </summary>
+    [Fact]
+    public async Task SeamHit_ReturnsDeepClone_MutatingItDoesNotAffectTheStore()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_a", "answer"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        Assert.True(handler.TryGetConversationStateForTest("resp_a", out var baseInput, out var history));
+
+        // Mutate every part of the returned graph: element values and the collection itself.
+        baseInput![0]!["content"] = "MUTATED-BASE";
+        baseInput.Add(JsonNode.Parse("{\"type\":\"message\",\"content\":\"INJECTED\"}"));
+        history[0]["content"] = "MUTATED-HISTORY";
+
+        // A second read must show the original, unmutated entry.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+
+        // Two independent reads never alias each other either.
+        Assert.True(handler.TryGetConversationStateForTest("resp_a", out var firstRead, out _));
+        Assert.True(handler.TryGetConversationStateForTest("resp_a", out var secondRead, out _));
+        firstRead![0]!["content"] = "MUTATED-AGAIN";
+        Assert.Equal("first", MarkerOf(secondRead![0]));
+    }
+
+    /// <summary>
+    /// Resolving a parent during a follow-up must not mutate the parent's stored entry. Without the
+    /// deep clone on read, the follow-up's staging appends the current input straight onto the
+    /// parent's own history list, retroactively corrupting the parent conversation.
+    /// </summary>
+    [Fact]
+    public async Task FollowUp_DoesNotMutateTheParentEntry()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_b", "answer2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\""));
+
+        // The parent still holds exactly what it held before the follow-up ran.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_a", "tool-result"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_a", "answer2"));
+    }
+
+    /// <summary>
+    /// Two follow-ups branching from the SAME parent get fully independent entries: neither branch
+    /// may observe the other's input or output, and the shared parent stays pristine.
+    /// </summary>
+    /// <remarks>
+    /// Without deep-clone-on-read both branches would stage onto one shared history list, so the
+    /// second branch would inherit the first branch's tool result.
+    /// </remarks>
+    [Fact]
+    public async Task BranchingFollowUps_FromSameParent_AreIndependent()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_b1", "out1"))
+            .Json(JsonReply("resp_b2", "out2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request(ToolInput("branch1-input"), previousResponseId: "\"resp_a\""));
+        await SendAsync(client, Request(ToolInput("branch2-input"), previousResponseId: "\"resp_a\""));
+
+        // Each branch continues from the parent, and ONLY from the parent.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b1"));
+        Assert.Equal(new[] { "answer", "branch1-input", "out1" }, HistoryMarkers(handler, "resp_b1"));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b2"));
+        Assert.Equal(new[] { "answer", "branch2-input", "out2" }, HistoryMarkers(handler, "resp_b2"));
+
+        // Explicit cross-contamination checks in both directions.
+        Assert.Equal(0, OccurrencesIn(handler, "resp_b1", "branch2-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_b1", "out2"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_b2", "branch1-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_b2", "out1"));
+
+        // The second branch's reconstruction never saw the first branch's turn either.
+        Assert.Equal(new[] { "first", "answer", "branch2-input" }, SentInputMarkers(terminal.LastBody));
+
+        // The parent is still pristine.
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+        Assert.Equal(3, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// A reusable async barrier: every participant's task completes only once ALL participants have
+    /// arrived, and the barrier then re-arms for the next round. Purely signal-driven — no sleeping
+    /// and no polling anywhere, so the forced interleaving is deterministic.
+    /// </summary>
+    private sealed class AsyncBarrier
+    {
+        private readonly int _participants;
+        private readonly object _lock = new();
+        private int _waiting;
+        private TaskCompletionSource _current = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public AsyncBarrier(int participants) => _participants = participants;
+
+        public Task SignalAndWaitAsync()
+        {
+            TaskCompletionSource release;
+            lock (_lock)
+            {
+                release = _current;
+                if (++_waiting == _participants)
+                {
+                    _waiting = 0;
+                    _current = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    release.TrySetResult();
+                }
+            }
+
+            return release.Task;
+        }
+    }
+
+    /// <summary>
+    /// Terminal handler that holds every request inside the handler until all participants of the
+    /// current round have arrived, then answers each one from a body-driven responder.
+    /// </summary>
+    private sealed class GatedTerminal : HttpMessageHandler
+    {
+        private readonly AsyncBarrier _barrier;
+        private readonly Func<string, string> _responder;
+        private readonly object _lock = new();
+
+        public GatedTerminal(int participants, Func<string, string> responder)
+        {
+            _barrier = new AsyncBarrier(participants);
+            _responder = responder;
+        }
+
+        public List<string> Bodies { get; } = new();
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var body = request.Content is null ? string.Empty : await request.Content.ReadAsStringAsync(ct);
+            lock (_lock) { Bodies.Add(body); }
+
+            // Every participant of this round is now inside the handler simultaneously.
+            await _barrier.SignalAndWaitAsync();
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(_responder(body), Encoding.UTF8, "application/json"),
+            };
+        }
+    }
+
+    /// <summary>
+    /// Two conversations driven CONCURRENTLY through one handler instance must not bleed into each
+    /// other: each response id gets its own correct entry, across two interleaved rounds.
+    /// </summary>
+    /// <remarks>
+    /// This is the scenario the shared-instance-field implementation could not satisfy at all: with
+    /// one <c>_baseInput</c>/<c>_turnHistory</c> pair, the two in-flight conversations overwrite and
+    /// append to the same state.
+    /// </remarks>
+    [Fact]
+    public async Task ConcurrentConversations_ThroughOneHandler_DoNotBleedIntoEachOther()
+    {
+        static string Reply(string body)
+        {
+            // Follow-up bodies also contain the first turn's markers (they are reconstructed), so
+            // the later-turn markers have to be tested first.
+            if (body.Contains("A-tool", StringComparison.Ordinal)) return JsonReply("resp_A2", "A-out2");
+            if (body.Contains("B-tool", StringComparison.Ordinal)) return JsonReply("resp_B2", "B-out2");
+            if (body.Contains("A-first", StringComparison.Ordinal)) return JsonReply("resp_A", "A-out");
+            if (body.Contains("B-first", StringComparison.Ordinal)) return JsonReply("resp_B", "B-out");
+            throw new InvalidOperationException($"unscripted request: {body}");
+        }
+
+        var terminal = new GatedTerminal(participants: 2, Reply);
+        using var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(terminal, out var handler);
+
+        // Round 1: both first requests are in flight at the same time.
+        await Task.WhenAll(
+            SendAsync(client, Request(UserInput("A-first"))),
+            SendAsync(client, Request(UserInput("B-first"))));
+
+        Assert.Equal(2, handler.StoreCountForTest);
+        Assert.Equal(new[] { "A-first" }, BaseMarkers(handler, "resp_A"));
+        Assert.Equal(new[] { "A-out" }, HistoryMarkers(handler, "resp_A"));
+        Assert.Equal(new[] { "B-first" }, BaseMarkers(handler, "resp_B"));
+        Assert.Equal(new[] { "B-out" }, HistoryMarkers(handler, "resp_B"));
+
+        // Round 2: both follow-ups are in flight at the same time, each naming its own parent.
+        await Task.WhenAll(
+            SendAsync(client, Request(ToolInput("A-tool"), previousResponseId: "\"resp_A\"")),
+            SendAsync(client, Request(ToolInput("B-tool"), previousResponseId: "\"resp_B\"")));
+
+        Assert.Equal(4, handler.StoreCountForTest);
+
+        Assert.Equal(new[] { "A-first" }, BaseMarkers(handler, "resp_A2"));
+        Assert.Equal(new[] { "A-out", "A-tool", "A-out2" }, HistoryMarkers(handler, "resp_A2"));
+
+        Assert.Equal(new[] { "B-first" }, BaseMarkers(handler, "resp_B2"));
+        Assert.Equal(new[] { "B-out", "B-tool", "B-out2" }, HistoryMarkers(handler, "resp_B2"));
+
+        // Not one item of either conversation reached the other.
+        foreach (var foreignMarker in new[] { "B-first", "B-out", "B-tool", "B-out2" })
+            Assert.Equal(0, OccurrencesIn(handler, "resp_A2", foreignMarker));
+
+        foreach (var foreignMarker in new[] { "A-first", "A-out", "A-tool", "A-out2" })
+            Assert.Equal(0, OccurrencesIn(handler, "resp_B2", foreignMarker));
+    }
+
+    // ── (e) Degraded mode ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A <c>previous_response_id</c> that does not resolve — never committed, or an invalid value
+    /// (empty / whitespace / null / non-string) — degrades to the FIRST-REQUEST transformation: the
+    /// id is stripped, only the current input is inlined (no parent reconstruction), and the
+    /// resulting entry is a FRESH one.
+    /// </summary>
+    [Theory]
+    [InlineData("\"resp_never_committed\"")]
+    [InlineData("\"\"")]
+    [InlineData("\"   \"")]
+    [InlineData("null")]
+    [InlineData("1234")]
+    [InlineData("{}")]
+    [InlineData("[]")]
+    public async Task UnresolvablePreviousResponseId_DegradesToFirstRequestTransformation(string rawId)
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_d", "d-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // A real conversation exists in the store — degrading must NOT reach for it.
+        await SendAsync(client, Request(UserInput("first")));
+
+        await SendAsync(client, Request(ToolInput("degraded-input"), previousResponseId: rawId));
+
+        // Stripped, and NOT reconstructed: only the current input was inlined.
+        Assert.Null(JsonNode.Parse(terminal.LastBody)!["previous_response_id"]);
+        Assert.Equal(new[] { "degraded-input" }, SentInputMarkers(terminal.LastBody));
+        Assert.DoesNotContain("first", terminal.LastBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("answer", terminal.LastBody, StringComparison.Ordinal);
+
+        // The committed entry is FRESH: the current input as the base, only the output in history.
+        Assert.Equal(new[] { "degraded-input" }, BaseMarkers(handler, "resp_d"));
+        Assert.Equal(new[] { "d-out" }, HistoryMarkers(handler, "resp_d"));
+
+        // The unrelated conversation was neither read from nor written to.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+    }
+
+    /// <summary>
+    /// The degradation is per-request, not sticky: after a degraded follow-up, a later follow-up
+    /// naming a still-present id reconstructs normally again.
+    /// </summary>
+    [Fact]
+    public async Task AfterADegradedFollowUp_ALaterValidFollowUpStillReconstructs()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_a", "answer"))
+            .Json(JsonReply("resp_d", "d-out"))
+            .Json(JsonReply("resp_b", "answer2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client, Request(ToolInput("degraded-input"), previousResponseId: "\"nope\""));
+        await SendAsync(client, Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\""));
+
+        Assert.Equal(new[] { "first", "answer", "tool-result" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "answer", "tool-result", "answer2" }, HistoryMarkers(handler, "resp_b"));
+
+        // The degraded exchange left its own independent entry, with no cross-talk.
+        Assert.Equal(new[] { "degraded-input" }, BaseMarkers(handler, "resp_d"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_b", "degraded-input"));
+    }
+
+    // ── (f) Bounded FIFO and in-place duplicates ─────────────────────────────
+
+    /// <summary>
+    /// The store is bounded at <c>MaxEntries</c> (50): once full, each genuinely new key evicts the
+    /// OLDEST key, in insertion order, and the count never grows past the bound.
+    /// </summary>
+    [Fact]
+    public async Task Store_IsBoundedAtFiftyEntries_EvictingOldestFirst()
+    {
+        var terminal = new ScriptedTerminal();
+        for (var i = 1; i <= 55; i++)
+            terminal.Json(JsonReply($"resp_{i}", $"out-{i}"));
+
+        using var client = CreateClient(terminal, out var handler);
+
+        for (var i = 1; i <= 55; i++)
+            await SendAsync(client, Request(UserInput($"in-{i}")));
+
+        // Bounded, and holding exactly the newest 50 keys in insertion order.
+        Assert.Equal(50, handler.StoreCountForTest);
+        Assert.Equal(Enumerable.Range(6, 50).Select(i => $"resp_{i}").ToArray(), handler.InsertionOrderForTest);
+
+        // The five oldest were evicted...
+        for (var i = 1; i <= 5; i++)
+            Assert.False(handler.TryGetConversationStateForTest($"resp_{i}", out _, out _));
+
+        // ...and the surviving boundary entries still hold their own correct content.
+        Assert.Equal(new[] { "in-6" }, BaseMarkers(handler, "resp_6"));
+        Assert.Equal(new[] { "out-6" }, HistoryMarkers(handler, "resp_6"));
+        Assert.Equal(new[] { "in-55" }, BaseMarkers(handler, "resp_55"));
+        Assert.Equal(new[] { "out-55" }, HistoryMarkers(handler, "resp_55"));
+    }
+
+    /// <summary>
+    /// Exactly at the bound the store is full but nothing has been evicted yet — proving the
+    /// eviction test above is not passing because of an off-by-one that drops entries early.
+    /// </summary>
+    [Fact]
+    public async Task Store_AtExactlyFiftyEntries_HasEvictedNothing()
+    {
+        var terminal = new ScriptedTerminal();
+        for (var i = 1; i <= 50; i++)
+            terminal.Json(JsonReply($"resp_{i}", $"out-{i}"));
+
+        using var client = CreateClient(terminal, out var handler);
+
+        for (var i = 1; i <= 50; i++)
+            await SendAsync(client, Request(UserInput($"in-{i}")));
+
+        Assert.Equal(50, handler.StoreCountForTest);
+        Assert.Equal(Enumerable.Range(1, 50).Select(i => $"resp_{i}").ToArray(), handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "in-1" }, BaseMarkers(handler, "resp_1"));
+    }
+
+    /// <summary>
+    /// A follow-up naming an EVICTED parent degrades exactly like a missing one: no reconstruction,
+    /// and a FRESH entry.
+    /// </summary>
+    [Fact]
+    public async Task FollowUpNamingAnEvictedParent_Degrades()
+    {
+        var terminal = new ScriptedTerminal();
+        for (var i = 1; i <= 51; i++)
+            terminal.Json(JsonReply($"resp_{i}", $"out-{i}"));
+        terminal.Json(JsonReply("resp_after", "after-out"));
+
+        using var client = CreateClient(terminal, out var handler);
+
+        for (var i = 1; i <= 51; i++)
+            await SendAsync(client, Request(UserInput($"in-{i}")));
+
+        // resp_1 was pushed out by resp_51.
+        Assert.False(handler.TryGetConversationStateForTest("resp_1", out _, out _));
+
+        await SendAsync(client, Request(ToolInput("post-eviction"), previousResponseId: "\"resp_1\""));
+
+        Assert.Equal(new[] { "post-eviction" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "post-eviction" }, BaseMarkers(handler, "resp_after"));
+        Assert.Equal(new[] { "after-out" }, HistoryMarkers(handler, "resp_after"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_after", "in-1"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_after", "out-1"));
+    }
+
+    /// <summary>
+    /// Re-committing an id that is already present UPDATES IT IN PLACE: the entry's contents are
+    /// replaced, but the insertion order keeps its original sequence and position and the store
+    /// does not grow. A second queue entry would both mis-order eviction and leak a key.
+    /// </summary>
+    [Fact]
+    public async Task RecommittingAnExistingId_UpdatesInPlace_WithoutGrowingOrReorderingTheQueue()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_dup", "v1-out"))
+            .Json(JsonReply("resp_other1", "o1-out"))
+            .Json(JsonReply("resp_other2", "o2-out"))
+            .Json(JsonReply("resp_dup", "v2-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("v1-in")));
+        await SendAsync(client, Request(UserInput("o1-in")));
+        await SendAsync(client, Request(UserInput("o2-in")));
+
+        Assert.Equal(new[] { "resp_dup", "resp_other1", "resp_other2" }, handler.InsertionOrderForTest);
+
+        // The duplicate commit.
+        await SendAsync(client, Request(UserInput("v2-in")));
+
+        // No growth and no re-queueing: the key keeps its ORIGINAL position at the head.
+        Assert.Equal(3, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_dup", "resp_other1", "resp_other2" }, handler.InsertionOrderForTest);
+
+        // The entry itself was replaced, not merged or appended to.
+        Assert.Equal(new[] { "v2-in" }, BaseMarkers(handler, "resp_dup"));
+        Assert.Equal(new[] { "v2-out" }, HistoryMarkers(handler, "resp_dup"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "v1-in"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "v1-out"));
+
+        // The other entries are untouched.
+        Assert.Equal(new[] { "o1-in" }, BaseMarkers(handler, "resp_other1"));
+        Assert.Equal(new[] { "o2-in" }, BaseMarkers(handler, "resp_other2"));
+    }
+
+    /// <summary>
+    /// Streamed entries participate in the store like any other key: re-committing the SAME
+    /// streamed id updates it in place, so repeated streaming turns never grow the queue or
+    /// displace other conversations.
+    /// </summary>
+    [Fact]
+    public async Task ARecommittedStreamedId_IsUpdatedInPlaceAcrossTurns()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn2"), previousResponseId: "\"resp_s\"", stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn3"), previousResponseId: "\"resp_s\"", stream: true));
+
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2", "turn3" }, HistoryMarkers(handler, "resp_s"));
+    }
+
+    // ── (g) Uniform id validation and the seam miss contract ─────────────────
+
+    /// <summary>
+    /// THE UNIFORM ID RULE: a response id is usable only when it is a non-empty, non-whitespace
+    /// JSON STRING. Every other shape — null, numeric, boolean, object, array, empty, whitespace —
+    /// writes NO entry at all.
+    /// </summary>
+    [Theory]
+    [InlineData("null")]
+    [InlineData("123")]
+    [InlineData("12.5")]
+    [InlineData("true")]
+    [InlineData("{}")]
+    [InlineData("[]")]
+    [InlineData("\"\"")]
+    [InlineData("\"   \"")]
+    [InlineData("\"\\t\"")]
+    public async Task ResponseWithoutAValidStringId_WritesNoEntry(string rawId)
+    {
+        var terminal = new ScriptedTerminal().Json(
+            "{\"id\":" + rawId + ",\"output\":[{\"type\":\"message\",\"content\":\"x\"}]}");
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        // The exchange succeeded, but nothing durable was recorded under any key.
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>A response with no <c>id</c> property at all writes no entry either.</summary>
+    [Fact]
+    public async Task ResponseWithNoIdProperty_WritesNoEntry()
+    {
+        var terminal = new ScriptedTerminal().Json("{\"output\":[{\"type\":\"message\",\"content\":\"x\"}]}");
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// A valid string id IS committed — proving the id-matrix test above is not passing merely
+    /// because commits never happen — while an invalid-id response leaves nothing to continue from,
+    /// so a follow-up naming it degrades.
+    /// </summary>
+    [Fact]
+    public async Task ValidStringId_IsCommitted_WhileAnInvalidIdResponseLeavesNothingToContinueFrom()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_valid", "answer"))
+            .Json("{\"id\":123,\"output\":[{\"type\":\"message\",\"content\":\"ignored\"}]}")
+            .Json(JsonReply("resp_next", "next-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_valid"));
+
+        // The numeric-id response adds nothing.
+        await SendAsync(client, Request(ToolInput("orphan"), previousResponseId: "\"resp_valid\""));
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_valid" }, handler.InsertionOrderForTest);
+
+        // So a follow-up naming "123" has nothing to continue from and degrades.
+        await SendAsync(client, Request(ToolInput("after-orphan"), previousResponseId: "\"123\""));
+        Assert.Equal(new[] { "after-orphan" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "after-orphan" }, BaseMarkers(handler, "resp_next"));
+    }
+
+    /// <summary>
+    /// THE SEAM MISS CONTRACT: a null, empty, whitespace-only or simply absent id returns
+    /// <see langword="false"/> with a null base and an EMPTY history, and never throws — even while
+    /// the store holds other entries, and without disturbing them.
+    /// </summary>
+    [Fact]
+    public async Task SeamMiss_ReturnsFalseNullBaseAndEmptyHistory_WithoutThrowing()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_ok", "answer"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        foreach (var probe in new string?[] { null, "", "   ", "\t", "\r\n", "resp_absent", "RESP_OK" })
+        {
+            Assert.False(handler.TryGetConversationStateForTest(probe, out var baseInput, out var turnHistory));
+            Assert.Null(baseInput);
+            Assert.NotNull(turnHistory);
+            Assert.Empty(turnHistory);
+        }
+
+        // The probes disturbed nothing.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_ok"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_ok"));
+    }
+
+    /// <summary>The miss contract holds on a completely empty store too, without throwing.</summary>
+    [Fact]
+    public void SeamMiss_OnAnEmptyStore_ReturnsFalseWithoutThrowing()
+    {
+        var terminal = new ScriptedTerminal();
+        using var client = CreateClient(terminal, out var handler);
+
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+
+        Assert.False(handler.TryGetConversationStateForTest(null, out var baseInput, out var turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
+
+        Assert.False(handler.TryGetConversationStateForTest("anything", out baseInput, out turnHistory));
+        Assert.Null(baseInput);
+        Assert.Empty(turnHistory);
+    }
+
+    // ── (h) The streaming algorithm ──────────────────────────────────────────
+
+    /// <summary>
+    /// STREAMING SELECTION, case 2 — no resolving <c>previous_response_id</c>: FRESH staging. The
+    /// entry lands under the id the STREAM announces, with the current input as its base and an
+    /// EMPTY history.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRequest_WithNoResolvingId_CommitsFreshStateUnderTheStreamedId()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_s"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("fresh-input"), stream: true));
+
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "fresh-input" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
+    }
+
+    /// <summary>
+    /// STREAMING SELECTION, case 2 in detail — an absent, or present-but-unresolvable,
+    /// <c>previous_response_id</c> stages FRESH and DEGRADES: there is no shared fallback to
+    /// inherit from any more, so an unrelated earlier streaming conversation contributes nothing
+    /// to either the reconstruction or the new entry.
+    /// </summary>
+    /// <remarks>
+    /// This is the direct replacement for the old shared-slot fallback: the very inputs that used
+    /// to resolve to the slot now resolve to nothing at all.
+    /// </remarks>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("\"resp_unknown\"")]
+    [InlineData("\"\"")]
+    [InlineData("null")]
+    public async Task StreamingRequest_StagesFreshAndDegrades_WhenTheIdDoesNotResolve(string? rawId)
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_first"))
+            .Sse(SseReply("resp_second"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // An earlier, unrelated streaming conversation.
+        await SendAsync(client, Request(UserInput("earlier-base"), stream: true));
+
+        // Second streaming turn, naming nothing resolvable.
+        await SendAsync(client, Request(ToolInput("degraded-input"), previousResponseId: rawId, stream: true));
+
+        // FRESH: the current input became the base and the history is empty.
+        Assert.Equal(new[] { "degraded-input" }, BaseMarkers(handler, "resp_second"));
+        Assert.Empty(HistoryMarkers(handler, "resp_second"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_second", "earlier-base"));
+
+        // The reconstruction the server saw carried nothing forward either.
+        Assert.Equal(new[] { "degraded-input" }, SentInputMarkers(terminal.LastBody));
+
+        // Two independent, id-keyed conversations — no shared key between them.
+        Assert.Equal(new[] { "resp_first", "resp_second" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "earlier-base" }, BaseMarkers(handler, "resp_first"));
+    }
+
+    /// <summary>
+    /// A NON-streaming request never inherits a streamed conversation either: with a streamed
+    /// entry present but no resolving id, its selection is parent-or-fresh only.
+    /// </summary>
+    [Fact]
+    public async Task NonStreamingRequest_NeverInheritsAStreamedConversation()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_s"))
+            .Json(JsonReply("resp_plain", "plain-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // A streamed conversation.
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
+
+        // A non-streaming request with no previous_response_id at all.
+        await SendAsync(client, Request(UserInput("plain-input")));
+
+        // FRESH — not a continuation of the streamed entry.
+        Assert.Equal(new[] { "plain-input" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "plain-input" }, BaseMarkers(handler, "resp_plain"));
+        Assert.Equal(new[] { "plain-out" }, HistoryMarkers(handler, "resp_plain"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_plain", "stream-base"));
+
+        // The streamed entry itself is untouched by the non-streaming exchange.
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
+    }
+
+    /// <summary>
+    /// STREAMING SELECTION, case 1 — a valid, present, FOUND <c>previous_response_id</c> continues
+    /// that exact parent, and the continuation is committed under the streamed response id.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRequest_WithResolvingId_ContinuesTheRealParent()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_other"))            // an unrelated streaming conversation
+            .Json(JsonReply("resp_a", "answer"))    // the real parent
+            .Sse(SseReply("resp_s"));               // the streaming follow-up under test
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("other-base"), stream: true));
+        await SendAsync(client, Request(UserInput("first")));
+
+        await SendAsync(client,
+            Request(ToolInput("stream-input"), previousResponseId: "\"resp_a\"", stream: true));
+
+        // The REAL parent's base and history were continued — nothing from the other conversation.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "answer", "stream-input" }, HistoryMarkers(handler, "resp_s"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_s", "other-base"));
+
+        // The request body proves the same selection.
+        Assert.Equal(new[] { "first", "answer", "stream-input" }, SentInputMarkers(terminal.LastBody));
+
+        // The parent's own entry is untouched by the streaming turn.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+
+        // And the unrelated streaming conversation kept its own, separate entry.
+        Assert.Equal(new[] { "other-base" }, BaseMarkers(handler, "resp_other"));
+    }
+
+    /// <summary>
+    /// A successful SSE response commits the staged base + staged history under the id from the
+    /// stream's own <c>response.created</c> event, and <c>response.completed</c> is a TERMINAL
+    /// MARKER ONLY: its payload is never mined for output items.
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulSse_CommitsUnderTheStreamedId_WithoutMiningResponseCompleted()
+    {
+        // A completed payload an output-extracting implementation would happily mine.
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_sse\"}}\n\n" +
+            "event: response.completed\n" +
+            "data: {\"response\":{\"id\":\"resp_sse\",\"output\":[{\"type\":\"message\",\"content\":\"sse-output\"}]}}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-first"), stream: true));
+
+        // Committed under the stream's own id — the only key written.
+        Assert.Equal(new[] { "resp_sse" }, handler.InsertionOrderForTest);
+
+        // Staged base + staged history exactly, with nothing mined from response.completed.
+        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, "resp_sse"));
+        Assert.Empty(HistoryMarkers(handler, "resp_sse"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_sse", "sse-output"));
+    }
+
+    /// <summary>
+    /// <c>response.output_item.done</c> is the SOLE authoritative output source: its items amend
+    /// the committed entry, in arrival order, on <c>response.completed</c> — composing exactly
+    /// like a non-streaming entry (staged base + staged history + output).
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulSse_AmendsTheEntryWithTheStreamedOutputItems()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_a", "out1", "out2"))
+            .Sse(SseReply("resp_b", "out3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first"), stream: true));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "out1", "out2" }, HistoryMarkers(handler, "resp_a"));
+
+        // A streaming follow-up continues from the amended entry.
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\"", stream: true));
+
+        Assert.Equal(new[] { "first", "out1", "out2", "tool-result" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "out1", "out2", "tool-result", "out3" }, HistoryMarkers(handler, "resp_b"));
+    }
+
+    /// <summary>
+    /// NO FALLBACK KEY: a stream that never announces a usable id writes NO entry under any key.
+    /// The staged state is abandoned and the next follow-up degrades.
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulSseWithoutAResponseCreatedEvent_WritesNoEntryAtAll()
+    {
+        var terminal = new ScriptedTerminal().Sse();
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-first"), stream: true));
+
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// THE NON-ARRAY STREAMING NO-OP: a <c>stream:true</c> request whose input is not an array
+    /// stages nothing, so a successful SSE response writes NO entry — not even under the id the
+    /// stream announces — and every previous entry stays exactly as it was.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRequestWithNonArrayInput_WritesNoEntryAndLeavesPreviousOnesUntouched()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_s"))
+            .Sse(SseReply("resp_noop"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // Build an entry with both a base and a history so any overwrite is visible.
+        await SendAsync(client, Request(UserInput("stream-base"), stream: true));
+        await SendAsync(client,
+            Request(ToolInput("turn2"), previousResponseId: "\"resp_s\"", stream: true));
+
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2" }, HistoryMarkers(handler, "resp_s"));
+
+        // The no-op request: its stream announces resp_noop, but nothing was staged.
+        await SendAsync(client, Request("\"not-an-array\"", stream: true));
+
+        Assert.False(handler.TryGetConversationStateForTest("resp_noop", out _, out _));
+
+        // Exactly the same entry, and still exactly one key in the store.
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_s"));
+        Assert.Equal(new[] { "turn2" }, HistoryMarkers(handler, "resp_s"));
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// The same no-op with an EMPTY store: a non-array streaming request creates no entry at all —
+    /// "nothing staged" must not be normalized into an empty-base write under the streamed id.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRequestWithNonArrayInput_OnAnEmptyStore_WritesNoEntry()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_noop"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request("\"not-an-array\"", stream: true));
+
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_noop", out _, out _));
+    }
+
+    /// <summary>
+    /// THE <c>stream:true</c> + NON-SSE RESPONSE CASE: the response's Content-Type governs the
+    /// commit, so this routes through the NORMAL non-streaming id-keyed path — output append
+    /// included — and the SSE parser is never involved.
+    /// </summary>
+    [Fact]
+    public async Task StreamTrueRequestWithJsonResponse_CommitsUnderTheResponseId()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_json", "json-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-json"), stream: true));
+
+        // Normal id-keyed commit, with the response output appended.
+        Assert.Equal(new[] { "resp_json" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "stream-json" }, BaseMarkers(handler, "resp_json"));
+        Assert.Equal(new[] { "json-out" }, HistoryMarkers(handler, "resp_json"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// The same case with NON-ARRAY input: it still takes the normal path, including the EMPTY-base
+    /// normalization and the output append.
+    /// </summary>
+    [Fact]
+    public async Task StreamTrueRequestWithNonArrayInputAndJsonResponse_UsesEmptyBaseNormalization()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_json", "json-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request("\"not-an-array\"", stream: true));
+
+        Assert.Equal(new[] { "resp_json" }, handler.InsertionOrderForTest);
+        Assert.Empty(BaseMarkers(handler, "resp_json"));
+        Assert.Equal(new[] { "json-out" }, HistoryMarkers(handler, "resp_json"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// A <c>stream:true</c> FOLLOW-UP whose response is JSON continues its parent normally and lands
+    /// under the response id — an unrelated streamed conversation stays exactly as it was.
+    /// </summary>
+    [Fact]
+    public async Task StreamTrueFollowUpWithJsonResponse_DoesNotDisturbOtherConversations()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_other"))            // an unrelated streamed conversation
+            .Json(JsonReply("resp_a", "answer"))    // the parent
+            .Json(JsonReply("resp_b", "answer2"));  // stream:true request, JSON response
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("other-base"), stream: true));
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\"", stream: true));
+
+        // Id-keyed, with the full continuation.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "answer", "tool-result", "answer2" }, HistoryMarkers(handler, "resp_b"));
+
+        // The unrelated streamed conversation never moved.
+        Assert.Equal(new[] { "other-base" }, BaseMarkers(handler, "resp_other"));
+        Assert.Empty(HistoryMarkers(handler, "resp_other"));
+    }
+
+    // ── (i) Retry-safe staging, migrated semantics ───────────────────────────
+
+    /// <summary>
+    /// A transient failure followed by success commits EXACTLY ONCE under the response id, on both
+    /// a first request and a follow-up: no duplicated base, history or output from the extra
+    /// attempts, and no staging lost by the attempt that finally succeeded.
+    /// </summary>
+    [Fact]
+    public async Task RetriedRequests_CommitExactlyOncePerResponseId()
+    {
+        var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
+            failures: 2, JsonReply("resp_a", "answer"));
+        using var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(
+            terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        Assert.Equal(3, terminal.Attempts);
+
+        // One entry, one base item, one history item — not three of each.
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_a" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_a"));
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+
+        // A retried FOLLOW-UP: its input must be appended exactly once despite three attempts.
+        terminal.ResetFailures(2);
+        terminal.SuccessBody = JsonReply("resp_b", "answer2");
+        await SendAsync(client, Request(ToolInput("tool-result"), previousResponseId: "\"resp_a\""));
+        Assert.Equal(3, terminal.Attempts);
+
+        Assert.Equal(2, handler.StoreCountForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_b"));
+        Assert.Equal(new[] { "answer", "tool-result", "answer2" }, HistoryMarkers(handler, "resp_b"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_b", "tool-result"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_b", "answer2"));
+
+        // Every attempt sent an identical body: the transformation ran exactly once.
+        Assert.Single(terminal.Bodies.Distinct());
+
+        // And the parent was not mutated by any of the follow-up's attempts.
+        Assert.Equal(new[] { "answer" }, HistoryMarkers(handler, "resp_a"));
+    }
+
+    /// <summary>
+    /// A retried STREAMING exchange commits exactly once too: the failed attempts leave no partial
+    /// state and the successful one does not double-append under the streamed id.
+    /// </summary>
+    [Fact]
+    public async Task RetriedStreamingRequest_CommitsUnderTheStreamedIdExactlyOnce()
+    {
+        var terminal = new CopilotResponsesHandlerRetryTests.FailThenSucceedHandler(
+            failures: 2, JsonReply("unused", "unused"))
+        {
+            FailuresUseSseContentType = true,
+            SuccessUsesSseContentType = true,
+            SuccessSseBody = SseReply("resp_s"),
+        };
+        using var client = CopilotResponsesHandlerRetryTests.GetClientForExternalUse(
+            terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("stream-first"), stream: true));
+
+        Assert.Equal(3, terminal.Attempts);
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "resp_s" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "stream-first" }, BaseMarkers(handler, "resp_s"));
+        Assert.Empty(HistoryMarkers(handler, "resp_s"));
+    }
+
+    // ── (j) The streaming commit, amendment and generation safety ────────────
+
+    /// <summary>
+    /// A scripted SSE body carrying <c>response.output_item.done</c> items AND a
+    /// <c>response.completed</c> marker whose payload also lists output — the marker's items must
+    /// NEVER reach the entry.
+    /// </summary>
+    /// <remarks>
+    /// The two sources are marked differently on purpose: <paramref name="doneMarkers"/> are the
+    /// authoritative items, <paramref name="markerPayloadMarkers"/> are decoys embedded in the
+    /// terminal marker's own payload.
+    /// </remarks>
+    private static string SseReplyWithDecoyCompleted(
+        string id, string[] doneMarkers, string[] markerPayloadMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in doneMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        var decoys = string.Join(",",
+            markerPayloadMarkers.Select(m => "{\"type\":\"message\",\"content\":\"" + m + "\"}"));
+
+        sb.Append("event: response.completed\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id)
+          .Append("\",\"output\":[").Append(decoys).Append("]}}\n\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// An SSE body that ends WITHOUT a <c>response.completed</c> event: the id is announced and
+    /// output items arrive, but the stream is truncated before the terminal marker.
+    /// </summary>
+    private static string TruncatedSseReply(string id, params string[] outputMarkers)
+    {
+        var sb = new StringBuilder();
+        sb.Append("event: response.created\n")
+          .Append("data: {\"response\":{\"id\":\"").Append(id).Append("\"}}\n\n");
+
+        foreach (var marker in outputMarkers)
+        {
+            sb.Append("event: response.output_item.done\n")
+              .Append("data: {\"item\":{\"type\":\"message\",\"content\":\"").Append(marker).Append("\"}}\n\n");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// THE COMMIT IS OBSERVABLE THROUGH THE PUBLIC SEAM the moment the stream has been consumed:
+    /// the entry sits under the STREAM'S OWN id with the staged composition, and no other key was
+    /// written — the id came from the first <c>response.created</c> payload, not from anywhere else.
+    /// </summary>
+    [Fact]
+    public async Task StreamingCommit_LandsUnderTheIdFromTheCreatedEvent()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReply("resp_created"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("commit-input"), stream: true));
+
+        Assert.Equal(new[] { "resp_created" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "commit-input" }, BaseMarkers(handler, "resp_created"));
+        Assert.Empty(HistoryMarkers(handler, "resp_created"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// THE FIRST-EVENT-DECIDES RULE: a MALFORMED first <c>response.created</c> permanently settles
+    /// this response's fate. A later, perfectly valid <c>response.created</c> is never considered,
+    /// so NO entry is written under either id — the staged state is abandoned for good.
+    /// </summary>
+    /// <remarks>
+    /// This is the direct mutation target for "consider a later response.created": that
+    /// implementation writes an entry under <c>resp_late</c> and fails here.
+    /// </remarks>
+    [Fact]
+    public async Task MalformedFirstCreatedEvent_PermanentlyDecidesTheFallback_IgnoringLaterValidOnes()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\": broken json\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_late\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"late-out\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("doomed-input"), stream: true));
+
+        // Nothing under the later id, and nothing under any other key either.
+        Assert.False(handler.TryGetConversationStateForTest("resp_late", out _, out _));
+        Assert.Equal(0, handler.StoreCountForTest);
+        Assert.Empty(handler.InsertionOrderForTest);
+    }
+
+    /// <summary>
+    /// The same permanence for an INVALID (rather than unparseable) id in the first event: a blank
+    /// id is as decisive as malformed JSON, and the later valid event changes nothing.
+    /// </summary>
+    [Fact]
+    public async Task BlankIdInTheFirstCreatedEvent_PermanentlyDecidesTheFallback()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"   \"}}\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_late\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("doomed-input"), stream: true));
+
+        Assert.False(handler.TryGetConversationStateForTest("resp_late", out _, out _));
+        Assert.Equal(0, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// FIRST-EVENT-DECIDES ON THE SUCCESS PATH TOO: when the FIRST <c>response.created</c> carries
+    /// a VALID id, a second valid one later in the same stream is ignored as well. Exactly one
+    /// entry exists — under the FIRST id — and the second id was never written, so the staged
+    /// state is committed once and once only.
+    /// </summary>
+    /// <remarks>
+    /// The malformed-first variants above are masked for an implementation that merely re-arms on
+    /// FAILURE; this one pins the rule on the path where a re-arming parser would produce a real,
+    /// duplicate entry.
+    /// </remarks>
+    [Fact]
+    public async Task SecondValidCreatedEvent_IsIgnored_LeavingExactlyOneEntryUnderTheFirstId()
+    {
+        const string sseBody =
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_first\"}}\n\n" +
+            "event: response.created\n" +
+            "data: {\"response\":{\"id\":\"resp_second\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"only-out\"}}\n\n" +
+            "event: response.completed\ndata: {}\n\n";
+
+        var terminal = new ScriptedTerminal().Sse(sseBody);
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("once-input"), stream: true));
+
+        // Exactly ONE entry, under the FIRST id — the second id was never written.
+        Assert.Equal(new[] { "resp_first" }, handler.InsertionOrderForTest);
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.False(handler.TryGetConversationStateForTest("resp_second", out _, out _));
+
+        // …and it carries the staged input exactly once, amended with the streamed output.
+        Assert.Equal(new[] { "once-input" }, BaseMarkers(handler, "resp_first"));
+        Assert.Equal(new[] { "only-out" }, HistoryMarkers(handler, "resp_first"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_first", "once-input"));
+    }
+
+    /// <summary>
+    /// NO FALLBACK KEY: a stream that never announces a usable id writes nothing under ANY key —
+    /// the store is exactly as large after the exchange as before it, so no shared or synthesized
+    /// key absorbed the staged state.
+    /// </summary>
+    [Fact]
+    public async Task StreamWithoutAUsableId_WritesNothingUnderAnyKey()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_existing", "existing-out"))
+            .Sse("event: response.output_item.done\ndata: {\"item\":{\"content\":\"orphan\"}}\n\n"
+                 + "event: response.completed\ndata: {}\n\n");
+        using var client = CreateClient(terminal, out var handler);
+
+        // A pre-existing conversation, so "the store is unchanged" is a meaningful claim.
+        await SendAsync(client, Request(UserInput("existing-input")));
+        var before = handler.InsertionOrderForTest;
+        Assert.Equal(new[] { "resp_existing" }, before);
+
+        await SendAsync(client, Request(UserInput("id-less-input"), stream: true));
+
+        // Nothing was added, and the existing entry was not repurposed.
+        Assert.Equal(before, handler.InsertionOrderForTest);
+        Assert.Equal(1, handler.StoreCountForTest);
+        Assert.Equal(new[] { "existing-input" }, BaseMarkers(handler, "resp_existing"));
+        Assert.Equal(new[] { "existing-out" }, HistoryMarkers(handler, "resp_existing"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_existing", "id-less-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_existing", "orphan"));
+    }
+
+    /// <summary>
+    /// <c>response.output_item.done</c> IS THE SOLE OUTPUT SOURCE: with both real items and a
+    /// <c>response.completed</c> marker whose own payload lists decoy output, each done-item
+    /// appears EXACTLY ONCE and no decoy appears at all.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_TakesItemsOnlyFromOutputItemDone_NeverFromTheCompletedMarker()
+    {
+        var terminal = new ScriptedTerminal().Sse(SseReplyWithDecoyCompleted(
+            "resp_src",
+            doneMarkers: new[] { "real-1", "real-2" },
+            markerPayloadMarkers: new[] { "decoy-1", "decoy-2" }));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("src-input"), stream: true));
+
+        // Exactly the done-items, in arrival order, each exactly once.
+        Assert.Equal(new[] { "real-1", "real-2" }, HistoryMarkers(handler, "resp_src"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_src", "real-1"));
+        Assert.Equal(1, OccurrencesIn(handler, "resp_src", "real-2"));
+
+        // The terminal marker's payload was never mined.
+        Assert.Equal(0, OccurrencesIn(handler, "resp_src", "decoy-1"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_src", "decoy-2"));
+    }
+
+    /// <summary>
+    /// THE ONE-BATCH FLUSH: every buffered item lands together, on <c>response.completed</c>, in
+    /// arrival order and after the staged history — composing exactly like a non-streaming entry
+    /// (staged base + staged history + output).
+    /// </summary>
+    [Fact]
+    public async Task Amendment_FlushesEveryBufferedItemAsOneBatchOnCompleted()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(SseReply("resp_batch", "b1", "b2", "b3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // Staged base + staged history + the whole output batch, in order.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_batch"));
+        Assert.Equal(
+            new[] { "parent-out", "tool-result", "b1", "b2", "b3" },
+            HistoryMarkers(handler, "resp_batch"));
+    }
+
+    /// <summary>
+    /// THE FLUSH IS ATOMIC — ONE store operation, not a per-item drip. The amendment seam reports
+    /// every applied write from INSIDE the store lock, so this counts OPERATIONS rather than
+    /// merely inspecting the settled result: exactly one write occurs, and the single count it
+    /// reports is the FULL post-amendment history length.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The final-state assertion in the test above is satisfied by an implementation that appends
+    /// item-by-item under separate lock acquisitions — three items, three writes, three moments at
+    /// which a concurrent reader could observe a half-amended entry. That is exactly the
+    /// implementation this test excludes: a per-item amendment reports three invocations with
+    /// counts 3, 4, 5 instead of one invocation with count 5.
+    /// </para>
+    /// <para>
+    /// Because the seam fires inside the lock, the counts it reports ARE the sequence of states
+    /// the store ever published. Asserting that the sequence has exactly one element, and that the
+    /// element is the complete history, is therefore the same as asserting no partially amended
+    /// state was ever observable.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_AppliesExactlyOneStoreOperation_NeverAPartialState()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(SseReply("resp_atomic", "a1", "a2", "a3"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // Every amendment write, in order, as (key, resulting history count).
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        await SendAsync(client, Request(UserInput("first")));
+
+        // The non-streaming exchange amends nothing — amendments are the streaming path's alone.
+        Assert.Empty(writes);
+
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // EXACTLY ONE write, against the streamed entry.
+        var write = Assert.Single(writes);
+        Assert.Equal("resp_atomic", write.Key);
+
+        // …and that single write already carried the COMPLETE history: staged history (2) plus
+        // all three output items. A per-item implementation would have reported 3, then 4, then 5.
+        Assert.Equal(5, write.HistoryCount);
+
+        // The settled entry agrees, so the one write is genuinely the whole amendment.
+        Assert.Equal(
+            new[] { "parent-out", "tool-result", "a1", "a2", "a3" },
+            HistoryMarkers(handler, "resp_atomic"));
+    }
+
+    /// <summary>
+    /// A DROPPED amendment performs NO store operation at all: when the entry has been replaced in
+    /// the interim, the generation check rejects the flush before any write happens — it is not
+    /// applied and then undone.
+    /// </summary>
+    /// <remarks>
+    /// This is the seam's complement to the generation-safety test: that one proves the resulting
+    /// CONTENT is untouched, this one proves the store was never written to in the first place, so
+    /// no reader could observe a momentarily-grafted state.
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_WhenTheEntryWasReplaced_PerformsNoStoreOperation()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        // The streaming commit under resp_dup, with an item buffered but not yet flushed.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        // A second commit replaces the entry under the same id.
+        var replacement = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"replacement-base\"}")), new List<JsonNode>());
+        replacement.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n"));
+
+        // The first stream now completes: its flush targets a generation that is gone.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        // No amendment write was ever performed — not one that was later corrected.
+        Assert.Empty(writes);
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+        Assert.Empty(HistoryMarkers(handler, "resp_dup"));
+
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A TRUNCATED stream performs NO store operation either: without <c>response.completed</c>
+    /// the buffered items are dropped, so the seam records nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_WhenTheStreamIsTruncated_PerformsNoStoreOperation()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(TruncatedSseReply("resp_trunc_ops", "never-flushed"));
+        using var client = CreateClient(terminal, out var handler);
+
+        var writes = new List<(string Key, int HistoryCount)>();
+        handler.OnAmendmentForTest = (key, count) => writes.Add((key, count));
+
+        await SendAsync(client, Request(UserInput("trunc-input"), stream: true));
+
+        // The commit happened, but no amendment write ever did.
+        Assert.Equal(new[] { "trunc-input" }, BaseMarkers(handler, "resp_trunc_ops"));
+        Assert.Empty(HistoryMarkers(handler, "resp_trunc_ops"));
+        Assert.Empty(writes);
+    }
+
+    /// <summary>
+    /// GENERATION SAFETY: after the streaming commit under id X, a NON-streaming exchange replaces
+    /// the entry under that very same id X — a new generation. The stream's later
+    /// <c>response.completed</c> flush is then SILENTLY DROPPED, and the replacement's content
+    /// survives intact.
+    /// </summary>
+    /// <remarks>
+    /// The two phases are separated by a gate in the terminal: the streaming response's bytes are
+    /// released only AFTER the replacing exchange has committed, so the interleaving is
+    /// deterministic rather than timing-dependent. Removing the generation check makes the stale
+    /// flush graft <c>stream-out</c> onto the replacement and fails this test.
+    /// </remarks>
+    [Fact]
+    public async Task Amendment_WithAReplacedEntry_IsSilentlyDropped()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+
+        // Phase 1: the streaming commit under resp_dup, with one item buffered but NOT yet flushed.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        Assert.Equal("resp_dup", parser.CommittedIdForTest);
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_dup"));
+
+        // Phase 2: a SECOND commit replaces the entry under the same id — a new generation.
+        var replacement = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"replacement-base\"}")), new List<JsonNode>());
+        replacement.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_dup\"}}\n\n"));
+
+        Assert.NotEqual(parser.CommittedGenerationForTest, replacement.CommittedGenerationForTest);
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+
+        // Phase 3: the FIRST stream completes. Its flush targets a generation that is gone.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        Assert.True(parser.TerminatedForTest);
+
+        // The replacement survived untouched: the stale batch was dropped, not grafted on.
+        Assert.Equal(new[] { "replacement-base" }, BaseMarkers(handler, "resp_dup"));
+        Assert.Empty(HistoryMarkers(handler, "resp_dup"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "stream-out"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_dup", "stream-base"));
+        Assert.Equal(1, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// THE MATCHING GENERATION STILL FLUSHES — the complement that proves the test above is not
+    /// passing merely because amendments never land: with no interleaving replacement, the same
+    /// buffered item DOES reach the entry.
+    /// </summary>
+    [Fact]
+    public async Task Amendment_WithAnUnchangedEntry_IsApplied()
+    {
+        var handler = new ChatClientFactory.CopilotResponsesHandler();
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"content\":\"stream-base\"}")), new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_same\"}}\n\n" +
+            "event: response.output_item.done\ndata: {\"item\":{\"content\":\"stream-out\"}}\n\n"));
+
+        Assert.Empty(HistoryMarkers(handler, "resp_same"));
+
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+
+        Assert.Equal(new[] { "stream-base" }, BaseMarkers(handler, "resp_same"));
+        Assert.Equal(new[] { "stream-out" }, HistoryMarkers(handler, "resp_same"));
+
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// TRUNCATION: a stream that ends WITHOUT <c>response.completed</c> keeps its committed entry
+    /// but DROPS the buffered items — the entry holds exactly the un-amended staged composition.
+    /// Degraded context, never incorrect context.
+    /// </summary>
+    [Fact]
+    public async Task TruncatedStream_KeepsTheCommitButDropsTheBufferedItems()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_parent", "parent-out"))
+            .Sse(TruncatedSseReply("resp_trunc", "never-flushed-1", "never-flushed-2"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("first")));
+        await SendAsync(client,
+            Request(ToolInput("tool-result"), previousResponseId: "\"resp_parent\"", stream: true));
+
+        // The commit survived…
+        Assert.Equal(new[] { "resp_parent", "resp_trunc" }, handler.InsertionOrderForTest);
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_trunc"));
+
+        // …with EXACTLY the staged composition: parent history + this turn's input, no output.
+        Assert.Equal(new[] { "parent-out", "tool-result" }, HistoryMarkers(handler, "resp_trunc"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_trunc", "never-flushed-1"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_trunc", "never-flushed-2"));
+    }
+
+    /// <summary>
+    /// THE RACING FOLLOW-UP LIMITATION, pinned exactly as documented: a follow-up that resolves
+    /// the streamed id AFTER the commit but BEFORE the amendment observes the UN-AMENDED entry —
+    /// it reconstructs from the staged base and history only, and the output items that arrive
+    /// later are not in what it sent.
+    /// </summary>
+    /// <remarks>
+    /// The window is driven deterministically by feeding the stream in two halves around the
+    /// follow-up, rather than by racing threads. In production the SDK consumes the stream
+    /// synchronously before any follow-up can be issued, which is precisely why this is documented
+    /// as theoretical — this test pins the behaviour rather than endorsing it.
+    /// </remarks>
+    [Fact]
+    public async Task RacingFollowUp_BetweenCommitAndAmendment_ObservesTheUnAmendedEntry()
+    {
+        var terminal = new ScriptedTerminal().Json(JsonReply("resp_after_race", "after-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        // The streaming exchange commits and buffers, but has not completed yet.
+        var parser = handler.CreateStreamingParserForTest(
+            new JsonArray(JsonNode.Parse("{\"type\":\"message\",\"role\":\"user\",\"content\":\"race-base\"}")),
+            new List<JsonNode>());
+
+        parser.Append(Encoding.UTF8.GetBytes(
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_race\"}}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"type\":\"message\",\"content\":\"amended-later\"}}\n\n"));
+
+        Assert.Equal("resp_race", parser.CommittedIdForTest);
+        Assert.Equal(1, parser.BufferedOutputCountForTest);
+
+        // THE RACE: a follow-up resolves the id inside the window.
+        await SendAsync(client, Request(ToolInput("racing-input"), previousResponseId: "\"resp_race\""));
+
+        // It reconstructed from the UN-AMENDED entry: base + this input, WITHOUT the pending item.
+        Assert.Equal(new[] { "race-base", "racing-input" }, SentInputMarkers(terminal.LastBody));
+        Assert.Equal(new[] { "race-base" }, BaseMarkers(handler, "resp_after_race"));
+        Assert.Equal(new[] { "racing-input", "after-out" }, HistoryMarkers(handler, "resp_after_race"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_after_race", "amended-later"));
+
+        // The amendment then lands on the streaming entry, which the racer never saw.
+        parser.Append(Encoding.UTF8.GetBytes("event: response.completed\ndata: {}\n\n"));
+        Assert.Equal(new[] { "amended-later" }, HistoryMarkers(handler, "resp_race"));
+    }
+
+    // ── (k) Cross-mode isolation, end to end ─────────────────────────────────
+
+    /// <summary>
+    /// THE MIXED FIXTURE, end to end: a NON-STREAMING first response, a STREAMING follow-up that
+    /// continues that real entry — landing under the STREAM'S own id with the continuation
+    /// composition and amended by its <c>output_item.done</c> items — and a THIRD follow-up naming
+    /// the streaming id, which continues the AMENDED entry.
+    /// </summary>
+    /// <remarks>
+    /// This is the whole isolation story in one test: three distinct id-keyed entries, no shared
+    /// key anywhere, and every hand-off carrying exactly the right context across the
+    /// streaming/non-streaming boundary in both directions.
+    /// </remarks>
+    [Fact]
+    public async Task MixedFixture_NonStreamingThenStreamingThenFollowUp_ChainsAcrossModes()
+    {
+        var terminal = new ScriptedTerminal()
+            .Json(JsonReply("resp_one", "one-out"))                    // 1. non-streaming first
+            .Sse(SseReply("resp_two", "two-out-a", "two-out-b"))       // 2. streaming follow-up
+            .Json(JsonReply("resp_three", "three-out"));               // 3. follow-up on the stream
+        using var client = CreateClient(terminal, out var handler);
+
+        // 1. NON-STREAMING FIRST.
+        await SendAsync(client, Request(UserInput("first")));
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_one"));
+        Assert.Equal(new[] { "one-out" }, HistoryMarkers(handler, "resp_one"));
+
+        // 2. STREAMING FOLLOW-UP continuing the REAL entry.
+        await SendAsync(client,
+            Request(ToolInput("stream-input"), previousResponseId: "\"resp_one\"", stream: true));
+
+        // It reconstructed the non-streaming conversation…
+        Assert.Equal(new[] { "first", "one-out", "stream-input" }, SentInputMarkers(terminal.LastBody));
+
+        // …and committed under its OWN streamed id, with the continuation composition amended by
+        // the streamed output items.
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_two"));
+        Assert.Equal(
+            new[] { "one-out", "stream-input", "two-out-a", "two-out-b" },
+            HistoryMarkers(handler, "resp_two"));
+
+        // The parent is untouched by the streaming turn.
+        Assert.Equal(new[] { "one-out" }, HistoryMarkers(handler, "resp_one"));
+
+        // 3. A THIRD FOLLOW-UP naming the STREAMING id continues the AMENDED entry.
+        await SendAsync(client,
+            Request(ToolInput("third-input"), previousResponseId: "\"resp_two\""));
+
+        Assert.Equal(
+            new[] { "first", "one-out", "stream-input", "two-out-a", "two-out-b", "third-input" },
+            SentInputMarkers(terminal.LastBody));
+
+        Assert.Equal(new[] { "first" }, BaseMarkers(handler, "resp_three"));
+        Assert.Equal(
+            new[] { "one-out", "stream-input", "two-out-a", "two-out-b", "third-input", "three-out" },
+            HistoryMarkers(handler, "resp_three"));
+
+        // Three independent, id-keyed conversations — and no fourth, shared key anywhere.
+        Assert.Equal(new[] { "resp_one", "resp_two", "resp_three" }, handler.InsertionOrderForTest);
+        Assert.Equal(3, handler.StoreCountForTest);
+    }
+
+    /// <summary>
+    /// SLOT REMOVAL, proven by exhaustion: two CONCURRENT streaming conversations, each announcing
+    /// its own id, are fully isolated — every entry is asserted directly by its real id, the store
+    /// holds exactly those two keys, and neither conversation's content appears in the other.
+    /// </summary>
+    /// <remarks>
+    /// Under the removed shared slot these two exchanges collided on one key, and the second
+    /// overwrote (or inherited from) the first. Here the store's key set IS the assertion.
+    /// </remarks>
+    [Fact]
+    public async Task TwoStreamingConversations_AreFullyIsolatedUnderTheirOwnIds()
+    {
+        var terminal = new ScriptedTerminal()
+            .Sse(SseReply("resp_alpha", "alpha-out"))
+            .Sse(SseReply("resp_beta", "beta-out"));
+        using var client = CreateClient(terminal, out var handler);
+
+        await SendAsync(client, Request(UserInput("alpha-input"), stream: true));
+        await SendAsync(client, Request(UserInput("beta-input"), stream: true));
+
+        // Exactly two keys — both real ids, no shared third.
+        Assert.Equal(new[] { "resp_alpha", "resp_beta" }, handler.InsertionOrderForTest);
+        Assert.Equal(2, handler.StoreCountForTest);
+
+        // Each holds exactly its own content…
+        Assert.Equal(new[] { "alpha-input" }, BaseMarkers(handler, "resp_alpha"));
+        Assert.Equal(new[] { "alpha-out" }, HistoryMarkers(handler, "resp_alpha"));
+        Assert.Equal(new[] { "beta-input" }, BaseMarkers(handler, "resp_beta"));
+        Assert.Equal(new[] { "beta-out" }, HistoryMarkers(handler, "resp_beta"));
+
+        // …and none of the other's.
+        Assert.Equal(0, OccurrencesIn(handler, "resp_alpha", "beta-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_alpha", "beta-out"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_beta", "alpha-input"));
+        Assert.Equal(0, OccurrencesIn(handler, "resp_beta", "alpha-out"));
     }
 }

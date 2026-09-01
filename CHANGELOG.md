@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.19.0] — 2026-09-01
+
+### Fixed
+
+- **Per-conversation state isolation in `CopilotResponsesHandler`** — the shared instance-level `_baseInput`/`_turnHistory` fields (which caused cross-conversation state bleed and an unsynchronized race when one client serves multiple concurrent conversations, such as the parent agent plus sub-agents) are replaced by a response-ID-keyed store with deep-cloned snapshots (branching independence, no aliasing), a bounded 50-entry FIFO with eviction-aware degradation, and a lock held only for bookkeeping and cloning — never during I/O. Fresh-vs-continuation staging stores the request input exactly once; non-array inputs normalize statelessly; missing/evicted/invalid ids degrade gracefully (a fresh base, the id stripped); responses without a valid id commit no entry. The retry-safe per-request staging is preserved. This resolves the cross-conversation state isolation issue in the Copilot Responses handler. (`sharpcoder-fix-responses-handler-state`)
+
+### Added
+
+- **The streaming tee** — `TeeStreamContent` plus an internal tee stream wrap successful SSE responses' content with a byte-exact, chunk-lazy passthrough across all read paths (`ReadAsStream`, `ReadAsStreamAsync`, `CreateContentReadStream`, `SerializeToStreamAsync`), full header preservation, lazy stream acquisition, enumerated disposal/post-disposal contracts (the tee content disposes the original exactly once; the tee stream never disposes the wrapped stream; idempotent repeats are safe), and an `OnChunk` per-chunk observer seam with observer-exception containment. (`sharpcoder-streaming-conversation-ids`)
+- **Streaming conversation ids, SSE parser, and output amendment** — real per-response ids are extracted from the SSE `response.created` event (first-event-decides; no fallback key — an invalid first id permanently means no entry), parsed by a bounded incremental SSE parser (LF/CRLF line endings, multi-line `data:` concatenation, UTF-8 chunk-boundary safety, an 8 KB malformed-line discard policy, exact 64 KB/2 MB cap accounting with inclusive-boundary rules). Output extraction listens only to `response.output_item.done` events (the `response.completed` terminal marker — no duplication), and a generation-safe batch amendment applies buffered items once. Racing-follow-up and truncation degradations are documented. The `"streaming-legacy"` shared slot is REMOVED — streaming conversations are fully isolated, matching the non-streaming path. (`sharpcoder-streaming-parser-amendment`)
+
+### Changed
+
+- **Test skill recipe** — the coverage collector is no longer part of the default test command (opt-in only, with the known-collector-failure caveat: never gate on a single coverage run); a targeted-subset `--filter` section documents the pre-commit self-check; the `copilot-instructions.md` examples are aligned. (`sharpcoder-fast-test-skill`)
+
 ## [0.18.1] — 2026-08-31
 
 ### Changed
