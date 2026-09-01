@@ -1369,6 +1369,16 @@ public static class ChatClientFactory
             // staged nothing (non-array input) is a no-op, so the slot's previous entry keeps.
             if (isStreaming)
             {
+                // TRANSPORT TEE: the content is wrapped so that every byte the SDK's streaming
+                // parser reads can also be observed here, WITHOUT changing what the SDK sees. The
+                // wrapper acquires the underlying stream lazily — on the first ACTUAL read, not
+                // when the stream handle is requested — so the response still leaves this handler
+                // completely unconsumed and unacquired, exactly as before. The per-chunk observer
+                // is left unset for now: plugging the SSE parser (and with it the per-conversation
+                // id commit) into this seam is the follow-up work.
+                if (response.Content is not null)
+                    response.Content = new TeeStreamContent(response.Content, onChunk: null);
+
                 CommitStreamingState(pending);
                 return response;
             }
@@ -1634,6 +1644,562 @@ public static class ChatClientFactory
                 File.WriteAllText(Path.Combine(dir, fileName), content);
             }
             catch { /* best-effort logging */ }
+        }
+
+        /// <summary>
+        /// Transport-level tee for a successful <c>text/event-stream</c> response: wraps the
+        /// original <see cref="HttpContent"/> and hands out a stream that passes every byte
+        /// through verbatim while offering each chunk to an optional observer.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// PASSTHROUGH IS SACRED. The SDK's streaming parser must see exactly the bytes the server
+        /// sent, in exactly the chunks the transport produced — nothing is coalesced, split,
+        /// buffered ahead or rewritten. The observer is a pure side channel.
+        /// </para>
+        /// <para>
+        /// LAZY ACQUISITION. The underlying stream is obtained on the first ACTUAL READ of the tee
+        /// stream — not in the constructor, and not when the stream handle is handed out by
+        /// <c>ReadAsStream</c>/<c>ReadAsStreamAsync</c>/<c>SerializeToStreamAsync</c>. Wrapping the
+        /// content inside the handler therefore leaves the response completely unconsumed AND
+        /// unacquired when it is handed back — which is exactly what an eager wrap would destroy: a
+        /// stream pulled, or drained, before the caller ever saw it.
+        /// </para>
+        /// <para>
+        /// ALL content reads observe the tee: the SDK's <c>ReadAsStream</c>/<c>ReadAsStreamAsync</c>
+        /// path goes through <see cref="CreateContentReadStream(CancellationToken)"/>, and
+        /// buffering consumption (<c>CopyToAsync</c>, <c>ReadAsByteArrayAsync</c>,
+        /// <c>ReadAsStringAsync</c>) is routed through the same tee stream by
+        /// <see cref="SerializeToStreamAsync(Stream, System.Net.TransportContext?, CancellationToken)"/>.
+        /// </para>
+        /// <para>
+        /// DISPOSAL. <see cref="HttpContent"/> exposes only the synchronous
+        /// <see cref="IDisposable"/> contract — there is no <c>DisposeAsync</c> to override — so
+        /// disposal flows linearly: disposing this content disposes the captured ORIGINAL content
+        /// exactly once, and the original owns (and therefore disposes) the underlying stream.
+        /// </para>
+        /// </remarks>
+        internal sealed class TeeStreamContent : HttpContent
+        {
+            /// <summary>The captured original content; the sole owner of the underlying stream.</summary>
+            private readonly HttpContent _original;
+
+            /// <summary>Guards lazy tee creation and the once-only disposal of the original.</summary>
+            private readonly object _gate = new();
+
+            /// <summary>The tee stream, created on the first read — never at construction.</summary>
+            private TeeStream? _tee;
+
+            private bool _disposed;
+
+            /// <summary>
+            /// Parser seam: invoked synchronously with each chunk BEFORE that chunk is returned to
+            /// the reader. <see langword="null"/> (the default) means no observer at all — a pure
+            /// passthrough. The follow-up work plugs the SSE parser in here.
+            /// </summary>
+            /// <remarks>
+            /// The observer never throws out of the tee: an exception from it is caught and the
+            /// observer is disabled, so a broken parser can never break the response stream.
+            /// </remarks>
+            internal Action<ReadOnlyMemory<byte>>? OnChunk { get; set; }
+
+            public TeeStreamContent(HttpContent original, Action<ReadOnlyMemory<byte>>? onChunk = null)
+            {
+                _original = original ?? throw new ArgumentNullException(nameof(original));
+                OnChunk = onChunk;
+
+                // Every original content header is carried over unvalidated, so the response the
+                // caller sees is indistinguishable from the one the server sent (content type and
+                // charset included — the SSE media type must survive this wrap).
+                foreach (var header in original.Headers)
+                    Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+
+            /// <summary>The original content this instance wraps. Test/diagnostic accessor.</summary>
+            internal HttpContent OriginalContent => _original;
+
+            /// <summary>
+            /// Offers a chunk to the observer, absorbing any failure. A throwing observer is
+            /// disabled rather than propagated: the passthrough must never break.
+            /// </summary>
+            internal void NotifyChunk(ReadOnlyMemory<byte> chunk)
+            {
+                var observer = OnChunk;
+                if (observer is null) return;
+
+                try
+                {
+                    observer(chunk);
+                }
+                catch
+                {
+                    // The side channel failed; drop it and keep streaming.
+                    OnChunk = null;
+                }
+            }
+
+            /// <summary>
+            /// Returns the tee stream, creating it on first use. Creating the tee performs NO
+            /// access at all on the original content: the wrapped stream is pulled by the tee
+            /// itself, on its first actual read.
+            /// </summary>
+            private TeeStream EnsureTee()
+            {
+                lock (_gate)
+                {
+                    return _tee ??= new TeeStream(this);
+                }
+            }
+
+            /// <summary>
+            /// Acquires the original content's stream synchronously. Called by the tee, from its
+            /// first actual read, and never before.
+            /// </summary>
+            internal Stream AcquireSourceStream(CancellationToken ct) => _original.ReadAsStream(ct);
+
+            /// <summary>
+            /// Acquires the original content's stream asynchronously. Called by the tee, from its
+            /// first actual read, and never before.
+            /// </summary>
+            internal Task<Stream> AcquireSourceStreamAsync(CancellationToken ct)
+                => _original.ReadAsStreamAsync(ct);
+
+            protected override Stream CreateContentReadStream(CancellationToken cancellationToken)
+                => EnsureTee();
+
+            protected override Task<Stream> CreateContentReadStreamAsync()
+                => CreateContentReadStreamAsync(CancellationToken.None);
+
+            protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+                => Task.FromResult<Stream>(EnsureTee());
+
+            protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context)
+                => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+            protected override Task SerializeToStreamAsync(
+                Stream stream, System.Net.TransportContext? context, CancellationToken cancellationToken)
+                => EnsureTee().CopyToAsync(stream, 81920, cancellationToken);
+
+            protected override void SerializeToStream(
+                Stream stream, System.Net.TransportContext? context, CancellationToken cancellationToken)
+                => EnsureTee().CopyTo(stream, 81920);
+
+            protected override bool TryComputeLength(out long length)
+            {
+                var contentLength = _original.Headers.ContentLength;
+                if (contentLength.HasValue)
+                {
+                    length = contentLength.Value;
+                    return true;
+                }
+
+                length = 0;
+                return false;
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    bool alreadyDisposed;
+                    TeeStream? tee;
+                    lock (_gate)
+                    {
+                        alreadyDisposed = _disposed;
+                        _disposed = true;
+                        tee = _tee;
+                    }
+
+                    if (!alreadyDisposed)
+                    {
+                        // The tee only finalizes its own state; the underlying stream belongs to
+                        // the original content, which is disposed exactly once, right here.
+                        tee?.Dispose();
+                        _original.Dispose();
+                    }
+                }
+
+                base.Dispose(disposing);
+            }
+
+            /// <summary>
+            /// The tee itself: a read-only passthrough over the response's content stream that
+            /// offers every chunk it returns to <see cref="TeeStreamContent.OnChunk"/> first.
+            /// </summary>
+            /// <remarks>
+            /// <para>
+            /// Byte-exact and chunk-lazy: every read overload forwards a single read to the
+            /// wrapped stream, offers exactly what that read produced, and returns it verbatim.
+            /// Nothing is read ahead, coalesced or split.
+            /// </para>
+            /// <para>
+            /// This stream does NOT dispose the wrapped stream — its ownership stays with the
+            /// original <see cref="HttpContent"/>. Disposal only finalizes this wrapper's own
+            /// state, and is idempotent in both the synchronous and asynchronous form.
+            /// </para>
+            /// <para>
+            /// ACQUISITION IS DEFERRED TO THE FIRST ACTUAL READ. Constructing this stream — and
+            /// handing it out from <c>ReadAsStream</c>/<c>ReadAsStreamAsync</c> — touches the
+            /// original content not at all. The wrapped stream is pulled exactly once, by
+            /// whichever of the four read overloads runs first, and cached for every read after
+            /// that; a sync-first caller and an async-first caller both work.
+            /// </para>
+            /// </remarks>
+            internal sealed class TeeStream : Stream, IAsyncDisposable
+            {
+                private readonly TeeStreamContent _owner;
+
+                /// <summary>
+                /// THE SINGLE ACQUISITION AUTHORITY: the one and only attempt to pull the original
+                /// content's stream, or <see langword="null"/> while no attempt is in flight.
+                /// </summary>
+                /// <remarks>
+                /// <para>
+                /// Published exactly once with <see cref="Interlocked.CompareExchange{T}(ref T, T, T)"/>,
+                /// BEFORE the pull begins, so every racing reader — synchronous and asynchronous
+                /// alike — converges on the winner's single attempt instead of starting its own.
+                /// A design that merely re-checked a field after awaiting would let two first
+                /// readers both observe "not acquired yet" and pull the original twice, retaining
+                /// one stream and leaking the other.
+                /// </para>
+                /// <para>
+                /// This deliberately does NOT assume that concurrent
+                /// <see cref="HttpContent.ReadAsStreamAsync(CancellationToken)"/> calls hand back
+                /// the same instance: custom content is under no obligation to do so, which is
+                /// precisely why the second pull has to be prevented rather than tolerated.
+                /// </para>
+                /// <para>
+                /// FAILURE SEMANTICS — RETRY, NOT POISON. Everyone waiting on a failed attempt
+                /// (including one cancelled through the acquiring caller's token) observes that
+                /// failure, but the slot is cleared first, so a LATER read starts a fresh attempt.
+                /// A single cancelled reader therefore cannot permanently break the response for
+                /// everyone else, and a failed attempt can never leave a half-published stream
+                /// behind: the slot is only ever completed with a stream that was actually
+                /// acquired. Whether that fresh attempt then SUCCEEDS is the original content's
+                /// business — <see cref="HttpContent"/> caches its own content-read task, so a
+                /// content that faulted once may well fault the same way again. The guarantee
+                /// here is that the tee keeps asking rather than latching a failure of its own.
+                /// </para>
+                /// </remarks>
+                private Task<Stream>? _acquisition;
+
+                private volatile bool _disposed;
+
+                internal TeeStream(TeeStreamContent owner)
+                {
+                    _owner = owner ?? throw new ArgumentNullException(nameof(owner));
+                }
+
+                /// <summary>
+                /// The wrapped stream if it has already been acquired SUCCESSFULLY, else
+                /// <see langword="null"/>.
+                /// </summary>
+                /// <remarks>
+                /// Never acquires and never blocks — an acquisition still in flight reads as "not
+                /// acquired", so the delegation members answer their documented pre-acquisition
+                /// defaults rather than waiting on (or deadlocking behind) another reader's pull.
+                /// </remarks>
+                private Stream? AcquiredStream
+                {
+                    get
+                    {
+                        var acquisition = Volatile.Read(ref _acquisition);
+                        return acquisition is { IsCompletedSuccessfully: true } ? acquisition.Result : null;
+                    }
+                }
+
+                /// <summary>
+                /// Publishes this caller as the acquisition authority, or returns the attempt that
+                /// is already in flight (or already finished).
+                /// </summary>
+                /// <param name="attempt">
+                /// The caller's own slot to complete when it wins; only meaningful when this
+                /// method returns <see langword="null"/>.
+                /// </param>
+                /// <returns>
+                /// <see langword="null"/> when the caller WON and must therefore perform the one
+                /// pull, otherwise the winning attempt to converge on.
+                /// </returns>
+                private Task<Stream>? TryBecomeAcquisitionAuthority(out TaskCompletionSource<Stream> attempt)
+                {
+                    // Continuations run asynchronously so that completing the attempt can never
+                    // inline a waiter's continuation onto the acquiring thread.
+                    attempt = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    return Interlocked.CompareExchange(ref _acquisition, attempt.Task, null);
+                }
+
+                /// <summary>Completes the winning attempt with the stream it pulled.</summary>
+                private Stream PublishAcquired(TaskCompletionSource<Stream> attempt, Stream source)
+                {
+                    attempt.SetResult(source);
+                    return source;
+                }
+
+                /// <summary>
+                /// Retires a failed attempt: the slot is cleared FIRST — so the next read starts a
+                /// clean attempt rather than re-observing the failure — and only then is the
+                /// failure handed to whoever is waiting on it.
+                /// </summary>
+                private void FailAcquisition(TaskCompletionSource<Stream> attempt, Exception error)
+                {
+                    Interlocked.CompareExchange(ref _acquisition, null, attempt.Task);
+                    attempt.SetException(error);
+
+                    // The winner rethrows the original exception itself, so nothing necessarily
+                    // awaits this task; reading Exception marks it observed and keeps a failed
+                    // acquisition from surfacing as an unobserved task exception.
+                    _ = attempt.Task.Exception;
+                }
+
+                /// <summary>
+                /// Returns the wrapped stream, acquiring it synchronously on first use. The
+                /// acquisition happens exactly once: a second caller — of any overload, sync or
+                /// async — converges on the first caller's single pull.
+                /// </summary>
+                /// <remarks>
+                /// When an asynchronous reader is already acquiring, this synchronous caller
+                /// blocks on that one attempt rather than starting a competing pull of its own.
+                /// </remarks>
+                private Stream EnsureAcquired(CancellationToken ct)
+                {
+                    var inFlight = Volatile.Read(ref _acquisition);
+                    if (inFlight is not null) return inFlight.GetAwaiter().GetResult();
+
+                    var winner = TryBecomeAcquisitionAuthority(out var attempt);
+                    if (winner is not null) return winner.GetAwaiter().GetResult();
+
+                    try
+                    {
+                        return PublishAcquired(attempt, _owner.AcquireSourceStream(ct));
+                    }
+                    catch (Exception ex)
+                    {
+                        FailAcquisition(attempt, ex);
+                        throw;
+                    }
+                }
+
+                /// <summary>
+                /// Returns the wrapped stream, acquiring it asynchronously on first use — under
+                /// the same single-authority rule as <see cref="EnsureAcquired"/>, so competing
+                /// first reads of any mix perform exactly one pull between them.
+                /// </summary>
+                private ValueTask<Stream> EnsureAcquiredAsync(CancellationToken ct)
+                {
+                    // The overwhelmingly common case — already acquired — stays allocation-free
+                    // and completes synchronously.
+                    var acquired = AcquiredStream;
+                    return acquired is not null
+                        ? new ValueTask<Stream>(acquired)
+                        : new ValueTask<Stream>(AcquireAsync(ct));
+                }
+
+                private async Task<Stream> AcquireAsync(CancellationToken ct)
+                {
+                    var inFlight = Volatile.Read(ref _acquisition);
+                    if (inFlight is not null) return await inFlight.ConfigureAwait(false);
+
+                    var winner = TryBecomeAcquisitionAuthority(out var attempt);
+                    if (winner is not null) return await winner.ConfigureAwait(false);
+
+                    try
+                    {
+                        return PublishAcquired(
+                            attempt, await _owner.AcquireSourceStreamAsync(ct).ConfigureAwait(false));
+                    }
+                    catch (Exception ex)
+                    {
+                        FailAcquisition(attempt, ex);
+                        throw;
+                    }
+                }
+
+                // A disposed tee reports no capability at all; an alive one mirrors the source,
+                // except on the write side, which an SSE response stream never supports.
+                //
+                // PRE-ACQUISITION SEMANTICS: querying a capability must never pull the wrapped
+                // stream — that would defeat the deferral this class exists to provide. Before the
+                // first read the answers are therefore the deliberate, deterministic defaults
+                // below: CanRead is TRUE (this is a readable stream; its data is simply not
+                // fetched yet), and CanSeek is FALSE (an unacquired SSE stream is not seekable,
+                // and claiming otherwise would invite a Seek that has nothing to seek on).
+                public override bool CanRead => !_disposed && (AcquiredStream?.CanRead ?? true);
+                public override bool CanSeek => !_disposed && (AcquiredStream?.CanSeek ?? false);
+                public override bool CanWrite => false;
+
+                /// <summary>
+                /// The wrapped stream's length once acquired.
+                /// </summary>
+                /// <remarks>
+                /// PRE-ACQUISITION: throws <see cref="NotSupportedException"/> rather than pulling
+                /// the stream — the length of a response body nobody has started reading is not
+                /// knowable here, and reporting a fabricated 0 would be worse than refusing.
+                /// </remarks>
+                public override long Length
+                {
+                    get
+                    {
+                        ThrowIfDisposed();
+                        var inner = AcquiredStream
+                            ?? throw new NotSupportedException(
+                                "The SSE response tee stream has no length before its first read.");
+                        return inner.Length;
+                    }
+                }
+
+                /// <summary>
+                /// The wrapped stream's position once acquired.
+                /// </summary>
+                /// <remarks>
+                /// PRE-ACQUISITION: the getter reports 0 — nothing has been read, so nothing has
+                /// been consumed — and the setter throws <see cref="NotSupportedException"/>,
+                /// since there is no stream to position and acquiring one to satisfy a seek would
+                /// break the deferral.
+                /// </remarks>
+                public override long Position
+                {
+                    get
+                    {
+                        ThrowIfDisposed();
+                        return AcquiredStream?.Position ?? 0L;
+                    }
+                    set
+                    {
+                        ThrowIfDisposed();
+                        var inner = AcquiredStream
+                            ?? throw new NotSupportedException(
+                                "The SSE response tee stream cannot be positioned before its first read.");
+                        inner.Position = value;
+                    }
+                }
+
+                /// <summary>
+                /// Seeks the wrapped stream once acquired; before that, throws
+                /// <see cref="NotSupportedException"/> — see <see cref="Position"/>.
+                /// </summary>
+                public override long Seek(long offset, SeekOrigin origin)
+                {
+                    ThrowIfDisposed();
+                    var inner = AcquiredStream
+                        ?? throw new NotSupportedException(
+                            "The SSE response tee stream cannot seek before its first read.");
+                    return inner.Seek(offset, origin);
+                }
+
+                public override void Flush()
+                {
+                    // Nothing is buffered here, and the write side is unsupported.
+                }
+
+                public override void SetLength(long value)
+                    => throw new NotSupportedException("The SSE response tee stream is read-only.");
+
+                public override void Write(byte[] buffer, int offset, int count)
+                    => throw new NotSupportedException("The SSE response tee stream is read-only.");
+
+                public override void Write(ReadOnlySpan<byte> buffer)
+                    => throw new NotSupportedException("The SSE response tee stream is read-only.");
+
+                public override Task WriteAsync(
+                    byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                    => throw new NotSupportedException("The SSE response tee stream is read-only.");
+
+                public override ValueTask WriteAsync(
+                    ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+                    => throw new NotSupportedException("The SSE response tee stream is read-only.");
+
+                public override int Read(byte[] buffer, int offset, int count)
+                {
+                    ThrowIfDisposed();
+                    var inner = EnsureAcquired(CancellationToken.None);
+                    var read = inner.Read(buffer, offset, count);
+                    if (read > 0) _owner.NotifyChunk(new ReadOnlyMemory<byte>(buffer, offset, read));
+                    return read;
+                }
+
+                public override int Read(Span<byte> buffer)
+                {
+                    ThrowIfDisposed();
+                    var inner = EnsureAcquired(CancellationToken.None);
+                    var read = inner.Read(buffer);
+                    if (read > 0) NotifySpan(buffer.Slice(0, read));
+                    return read;
+                }
+
+                public override async Task<int> ReadAsync(
+                    byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                {
+                    ThrowIfDisposed();
+                    var inner = await EnsureAcquiredAsync(cancellationToken).ConfigureAwait(false);
+                    var read = await inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+                    if (read > 0) _owner.NotifyChunk(new ReadOnlyMemory<byte>(buffer, offset, read));
+                    return read;
+                }
+
+                public override async ValueTask<int> ReadAsync(
+                    Memory<byte> buffer, CancellationToken cancellationToken = default)
+                {
+                    ThrowIfDisposed();
+                    var inner = await EnsureAcquiredAsync(cancellationToken).ConfigureAwait(false);
+                    var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    if (read > 0) _owner.NotifyChunk(buffer.Slice(0, read));
+                    return read;
+                }
+
+                public override void CopyTo(Stream destination, int bufferSize)
+                {
+                    ThrowIfDisposed();
+                    base.CopyTo(destination, bufferSize);
+                }
+
+                public override Task CopyToAsync(
+                    Stream destination, int bufferSize, CancellationToken cancellationToken)
+                {
+                    ThrowIfDisposed();
+                    return base.CopyToAsync(destination, bufferSize, cancellationToken);
+                }
+
+                /// <summary>
+                /// Offers a span-shaped chunk to the observer. A span cannot be handed over as
+                /// memory, so — and only when an observer is actually attached — the chunk is
+                /// copied into a pooled buffer for the duration of the synchronous call.
+                /// </summary>
+                private void NotifySpan(ReadOnlySpan<byte> chunk)
+                {
+                    if (_owner.OnChunk is null) return;
+
+                    var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(chunk.Length);
+                    try
+                    {
+                        chunk.CopyTo(rented);
+                        _owner.NotifyChunk(new ReadOnlyMemory<byte>(rented, 0, chunk.Length));
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+                    }
+                }
+
+                private void ThrowIfDisposed()
+                {
+                    if (_disposed) throw new ObjectDisposedException(nameof(TeeStream));
+                }
+
+                protected override void Dispose(bool disposing)
+                {
+                    // Idempotent, and deliberately NOT a disposal of the wrapped stream: that one
+                    // belongs to the original HttpContent.
+                    _disposed = true;
+                    base.Dispose(disposing);
+                }
+
+                public override ValueTask DisposeAsync()
+                {
+                    _disposed = true;
+                    GC.SuppressFinalize(this);
+                    return default;
+                }
+            }
         }
     }
 }
