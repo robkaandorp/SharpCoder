@@ -478,6 +478,7 @@ public static class ChatClientFactory
     public static bool RequiresResponsesEndpoint(string model)
     {
         return model.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)
+            || model.StartsWith("gpt-6", StringComparison.OrdinalIgnoreCase)
             || model.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
             || model.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
     }

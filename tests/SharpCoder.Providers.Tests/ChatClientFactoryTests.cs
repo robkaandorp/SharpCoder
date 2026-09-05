@@ -4266,4 +4266,48 @@ public sealed class CopilotClientSeamTokenIndependenceTests : IDisposable
 
         Assert.IsType<ChatClientFactory.OwnedCopilotChatClient>(client);
     }
+
+    // ── RequiresResponsesEndpoint — endpoint classification ──────────────────
+
+    /// <summary>
+    /// Models in the gpt-6 family, including the case-insensitive form,
+    /// must be classified as requiring the /responses endpoint.
+    /// </summary>
+    [Fact]
+    public void RequiresResponsesEndpoint_Gpt6Family_RoutedToResponses()
+    {
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-6-astra"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-6"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("GPT-6-ASTRA"));
+    }
+
+    /// <summary>
+    /// The pre-existing model families (gpt-5 and the o-series) must remain
+    /// classified as requiring the /responses endpoint.
+    /// </summary>
+    [Fact]
+    public void RequiresResponsesEndpoint_LegacyFamilies_RoutedToResponses()
+    {
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-5"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-5.4"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-5-mini"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("o3"));
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("o4-mini"));
+    }
+
+    /// <summary>
+    /// The prefix rule's intended boundary behavior: any gpt-6* name matches
+    /// (the same family form gpt-5 exhibits with gpt-5.4), while models from
+    /// other families do not.
+    /// </summary>
+    [Fact]
+    public void RequiresResponsesEndpoint_PrefixBoundary_TheIntendedMatches()
+    {
+        Assert.True(ChatClientFactory.RequiresResponsesEndpoint("gpt-60"));
+
+        Assert.False(ChatClientFactory.RequiresResponsesEndpoint("gpt-4"));
+        Assert.False(ChatClientFactory.RequiresResponsesEndpoint("gpt-4o"));
+        Assert.False(ChatClientFactory.RequiresResponsesEndpoint("claude-opus"));
+        Assert.False(ChatClientFactory.RequiresResponsesEndpoint("llama-3"));
+    }
 }

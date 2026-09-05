@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.19.1] — 2026-09-05
+
+### Fixed
+
+- **gpt-6 family Responses routing** — `ChatClientFactory.RequiresResponsesEndpoint` now classifies the `gpt-6` prefix for the Responses endpoint (the same family rule as `gpt-5`, `o3`, and `o4`), fixing the `HTTP 400: unsupported_api_for_model` error when selecting gpt-6 models (e.g. `gpt-6-astra`) through the Copilot provider: the model fell through to the `/chat/completions` endpoint, which the gpt-6 family does not support. The classification also gains its first direct test coverage: the gpt-6 family (with case-insensitivity), the legacy families' pinned truth, and the prefix boundary (a `gpt-6` prefix match is the intended family rule — `gpt-60` and any future `gpt-6*` variant route to Responses, like `gpt-5` matching `gpt-5.4-premium`). (`fix-gpt6-responses-routing`)
+
 ## [0.19.0] — 2026-09-01
 
 ### Fixed
