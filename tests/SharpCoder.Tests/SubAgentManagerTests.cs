@@ -401,14 +401,9 @@ public class SubAgentManagerTests
             new SubAgentManager(options, new CapturingClient(), ParentOptions()));
     }
 
-    [Fact]
-    public void Constructor_NonPositive_MaxSummaryChars_Throws()
-    {
-        var options = DefaultOptions();
-        options.MaxSummaryChars = 0;
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new SubAgentManager(options, new CapturingClient(), ParentOptions()));
-    }
+    // NOTE: SubAgentOptions.MaxSummaryChars was removed intentionally (public breaking
+    // change): successful sub-agent results are now preserved verbatim with no cap, and
+    // the former nonpositive-limit constructor validation no longer exists.
 
     [Fact]
     public void Constructor_NonPositive_DefaultTimeout_Throws()
@@ -757,17 +752,55 @@ public class SubAgentManagerTests
     }
 
     // ========================================================================
-    // 10. Truncation tests
+    // 10. Full-summary preservation tests
+    //
+    // SubAgentOptions.MaxSummaryChars was deleted: a successful sub-agent's final
+    // message is stored VERBATIM as Summary. Assertions are exact ordinal equality —
+    // never length-only or marker-presence-only.
     // ========================================================================
 
-    [Fact]
-    public async Task Summary_Truncation_At_MaxSummaryChars()
+    [Theory]
+    [InlineData(7999)]
+    [InlineData(8000)]
+    [InlineData(8001)]
+    public async Task Summary_OldBoundary_Lengths_Preserved_Verbatim(int length)
     {
-        var options = DefaultOptions();
-        options.MaxSummaryChars = 10;
-        var longResponse = new string('x', 100);
+        // Former clamp boundary: payloads of 7999/8000/8001 units all pass through
+        // byte-identically now that the cap is gone.
+        var payload = new string('x', length);
+        var client = new CapturingClient(payload);
+        await using var manager = CreateManager(parentClient: client);
+
+        var info = await manager.StartAsync(new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id },
+            TestContext.Current.CancellationToken);
+
+        Assert.Single(results);
+        var final = results[0];
+        Assert.Equal(SubAgentStatus.Completed, final.Status);
+        Assert.Equal(payload, final.Summary);
+    }
+
+    [Fact]
+    public async Task Summary_Long_Multiline_With_Ellipsis_Whitespace_And_SurrogatePair_Preserved()
+    {
+        // A substantially longer multiline payload containing a literal ellipsis,
+        // trailing whitespace variants, and a surrogate pair that straddles the
+        // former 8000-unit cutoff (the pair's high surrogate sits at index 7998 so
+        // the old clamp would have split it).
+        const string trailingEvidence = "UNIQUE-TRAILING-EVIDENCE-9f3c1e";
+        var leading = "line-1\nline-2\ttabbed\n\nline-4 with \u2026 literal ellipsis\r\n";
+
+        // Build the middle so the payload is > 8000 units and the straddling pair
+        // lands exactly at 7998..7999 (the former 8000 cap would have split it).
+        var prefix = leading + new string('m', 8000 - leading.Length - 2);
+        Assert.Equal(7998, prefix.Length);
+        var straddlingPair = "\U0001F600"; // U+1F600 (surrogate pair: 2 .NET units)
+        var longResponse = prefix + straddlingPair + "\n" + trailingEvidence + "   \t\n";
+
         var client = new CapturingClient(longResponse);
-        await using var manager = CreateManager(options, client);
+        await using var manager = CreateManager(parentClient: client);
 
         var info = await manager.StartAsync(new SubAgentRequest { Task = "work" },
             TestContext.Current.CancellationToken);
@@ -776,9 +809,38 @@ public class SubAgentManagerTests
 
         Assert.Single(results);
         var summary = results[0].Summary!;
-        Assert.Equal(10, summary.Length);
-        Assert.EndsWith("\u2026", summary);
-        Assert.Equal(longResponse.Substring(0, 9), summary.Substring(0, 9));
+        // Exact ordinal equality — the whole payload, including the literal "…",
+        // trailing spaces/tabs/newlines and the surrogate pair, must survive.
+        Assert.Equal(longResponse, summary);
+
+        // The pair survives intact: it appears as a single code point, not as
+        // isolated surrogates (which would mean it was split or re-encoded).
+        var pairIndex = summary.IndexOf(straddlingPair, StringComparison.Ordinal);
+        Assert.True(pairIndex >= 0, "The surrogate pair must be present.");
+        Assert.Equal(0x1F600, char.ConvertToUtf32(summary, pairIndex));
+        Assert.Equal(longResponse.Length, summary.Length);
+        Assert.EndsWith(trailingEvidence + "   \t\n", summary, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("\t\n ")]
+    public async Task Summary_Empty_And_Whitespace_Results_Preserved_Verbatim(string response)
+    {
+        // Empty/whitespace final messages are stored exactly as produced by the child
+        // execution boundary; no normalization or fallback substitution occurs here.
+        var client = new CapturingClient(response);
+        await using var manager = CreateManager(parentClient: client);
+
+        var info = await manager.StartAsync(new SubAgentRequest { Task = "work" },
+            TestContext.Current.CancellationToken);
+        var results = await manager.AwaitAsync(new[] { info.Id },
+            TestContext.Current.CancellationToken);
+
+        Assert.Single(results);
+        Assert.Equal(SubAgentStatus.Completed, results[0].Status);
+        Assert.Equal(response, results[0].Summary);
     }
 
     [Fact]

@@ -123,7 +123,9 @@ Images count toward `AgentSession.EstimatedContextTokens` with a flat per-attach
 
 ## Sub-agents
 
-Delegate self-contained subtasks — codebase analysis, large-text summarization, and parallel research — to background sub-sessions. Only their summaries and status metadata return to the main session, never full transcripts.
+Delegate self-contained subtasks — codebase analysis, large-text summarization, and parallel research — to background sub-sessions. Only their summaries and status metadata return to the main session, never full transcripts. Successful sub-agents retain their complete final response text verbatim as the summary through the `await_sub_agents` and `get_sub_agent_status` handoff; child conversation and tool transcripts are still not forwarded.
+
+**v0.20.0 breaking migration:** `SubAgentOptions.MaxSummaryChars` and its plumbing were removed with no replacement or compatibility alias. Remove property assignments and dependent assertions, rebuild consuming applications against the updated packages, and keep `SharpCoder` and `SharpCoder.Providers` versions aligned when used together.
 
 ```csharp
 using Microsoft.Extensions.AI;
@@ -141,7 +143,6 @@ var agent = new CodingAgent(mainClient, new AgentOptions
         MaxConcurrentSubAgents = 4,
         DefaultTimeout = TimeSpan.FromMinutes(10),
         MaxTimeout = TimeSpan.FromMinutes(30),
-        MaxSummaryChars = 8_000,
         AvailableModels =
         {
             new SubAgentModelInfo("llama3.2", "Fast summarizer", 128_000),
@@ -166,7 +167,6 @@ await agent.DisposeAsync();
 | `MaxConcurrentSubAgents` | 4 | Maximum concurrently running sub-agents |
 | `DefaultTimeout` | 10 min | Per-sub-agent timeout if not overridden |
 | `MaxTimeout` | 30 min | Upper bound for per-request timeouts; larger values clamped |
-| `MaxSummaryChars` | 8,000 | Maximum characters retained from a sub-agent summary |
 | `DefaultEnableBash` | false | Default bash tool flag for sub-agents |
 | `DefaultEnableFileOps` | true | Default file-ops tool flag for sub-agents |
 | `DefaultEnableFileWrites` | false | Default file-writes tool flag for sub-agents |
@@ -209,7 +209,6 @@ var agent = new CodingAgent(mainClient, new AgentOptions
         MaxConcurrentSubAgents = 4,
         DefaultTimeout = TimeSpan.FromMinutes(10),
         MaxTimeout = TimeSpan.FromMinutes(30),
-        MaxSummaryChars = 8_000,
         AvailableModels =
         {
             new SubAgentModelInfo("llama3.2-vision", "Vision-capable analyzer", 128_000)
@@ -321,6 +320,15 @@ var options = new AgentOptions
 | `glob` | Find files by pattern (e.g. `src/**/*.cs`) | `EnableFileOps` |
 | `grep` | Search file contents with regex | `EnableFileOps` |
 | `execute_bash_command` | Run shell commands | `EnableBash` |
+
+`execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Nonpositive values are rejected before process launch, and each invocation starts a fresh shell process. A valid tool call is:
+
+```json
+{"command":"dotnet test --configuration Release", "timeout_ms":900000}
+```
+
+This per-invocation budget selection does not add an `AgentOptions` command-timeout setting. Existing direct shell callers remain compatible separately from the breaking sub-agent property removal. The timeout feature does not provide reliable process-tree cleanup, corrected cancellation classification, captured timeout diagnostics or exit-status reporting, a managed background-job API, or a guaranteed bound on the whole tool call including pipe drains.
+
 | `list_skills` / `load_skill` | Discover and load project skills | `EnableSkills` |
 
 ## Agent Result

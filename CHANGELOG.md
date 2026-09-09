@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.20.0] — 2026-09-09
+
+### Added
+
+- **Per-invocation bash timeout** — `execute_bash_command` accepts an optional `timeout_ms` positive integer in milliseconds. When omitted or `null`, the instance-configured default applies (normally 120000 ms); nonpositive values are rejected before process launch, and each invocation starts a fresh shell process. The original C# caller signature remains as a forwarding entry point, so existing direct callers are unaffected.
+- **Complete sub-agent result retention** — Successful sub-agent final response text is stored verbatim as `Summary` and preserved through the `await_sub_agents` and `get_sub_agent_status` handoff and `SubAgentChanged` event snapshots.
+
+### Breaking / Removed
+
+- **`SubAgentOptions.MaxSummaryChars` removed** — The public property and its plumbing were deleted with no replacement or compatibility alias. Migration: remove property assignments and dependent assertions, rebuild consuming applications against the updated packages, and keep `SharpCoder` and `SharpCoder.Providers` versions aligned where used together.
+
 ## [0.19.1] — 2026-09-05
 
 ### Fixed

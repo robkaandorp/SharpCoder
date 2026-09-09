@@ -72,7 +72,6 @@ public sealed class CodingAgent : IAsyncDisposable
                 MaxConcurrentSubAgents = source.MaxConcurrentSubAgents,
                 DefaultTimeout = source.DefaultTimeout,
                 MaxTimeout = source.MaxTimeout,
-                MaxSummaryChars = source.MaxSummaryChars,
                 ClientFactory = source.ClientFactory,
                 DefaultClient = source.DefaultClient,
                 DefaultEnableBash = source.DefaultEnableBash,
@@ -695,7 +694,10 @@ public sealed class CodingAgent : IAsyncDisposable
                 logger: _logger,
                 shellPathOverride: _options.BashShellPath,
                 shellArgsFormat: _options.BashShellArgsFormat);
-            chatOptions.Tools.Add(AIFunctionFactory.Create(bashTools.execute_bash_command));
+            // Register the timeout-aware overload explicitly: the LLM-facing schema exposes the
+            // optional timeout_ms parameter (the CancellationToken is injected, not part of the schema).
+            Func<string, CancellationToken, int?, Task<string>> bashInvoke = bashTools.execute_bash_command;
+            chatOptions.Tools.Add(AIFunctionFactory.Create(bashInvoke));
         }
 
         if (_options.EnableFileOps)
