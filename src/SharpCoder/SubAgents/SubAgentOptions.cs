@@ -16,9 +16,6 @@ public sealed class SubAgentOptions
     /// <summary>Upper bound for per-request timeouts; larger values are clamped.</summary>
     public TimeSpan MaxTimeout { get; set; } = TimeSpan.FromMinutes(30);
 
-    /// <summary>Maximum number of characters retained from a sub-agent summary.</summary>
-    public int MaxSummaryChars { get; set; } = 8_000;
-
     /// <summary>Host-provided catalog of models available to sub-agents.</summary>
     public IList<SubAgentModelInfo> AvailableModels { get; } = new List<SubAgentModelInfo>();
 

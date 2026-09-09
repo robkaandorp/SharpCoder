@@ -40,7 +40,6 @@ public sealed class SubAgentManager : IAsyncDisposable
         /// <summary>Client created by the manager's ClientFactory and owned by the manager, if any.</summary>
         public IChatClient? OwnedClientForDisposal;
         public int MaxSteps;
-        public int MaxSummaryChars;
 
         // Parent-agent configuration, captured at acceptance time so later mutation of the
         // parent AgentOptions cannot affect an already-started sub-agent.
@@ -189,8 +188,6 @@ public sealed class SubAgentManager : IAsyncDisposable
 
         if (options.MaxConcurrentSubAgents < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxConcurrentSubAgents must be at least 1.");
-        if (options.MaxSummaryChars < 1)
-            throw new ArgumentOutOfRangeException(nameof(options), "MaxSummaryChars must be at least 1.");
         if (options.DefaultTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(options), "DefaultTimeout must be positive.");
         if (options.MaxTimeout <= TimeSpan.Zero)
@@ -350,7 +347,6 @@ public sealed class SubAgentManager : IAsyncDisposable
                 Client = client,
                 OwnedClientForDisposal = ownedClient,
                 MaxSteps = _options.MaxSteps,
-                MaxSummaryChars = _options.MaxSummaryChars,
                 WorkDirectory = _workDirectorySnapshot,
                 MaxContextTokens = _parentOptions.MaxContextTokens,
                 CompactionClient = _parentOptions.CompactionClient,
@@ -544,7 +540,11 @@ public sealed class SubAgentManager : IAsyncDisposable
             else
             {
                 status = SubAgentStatus.Completed;
-                summary = SubAgentInfo.Truncate(result.Message ?? string.Empty, spec.MaxSummaryChars);
+
+                // Preserve the successful sub-agent's final message verbatim: no
+                // truncation, trimming or normalization. The parent receives the
+                // complete text via AwaitAsync / await_sub_agents.
+                summary = result.Message ?? string.Empty;
                 error = null;
                 usage = result.Usage;
             }

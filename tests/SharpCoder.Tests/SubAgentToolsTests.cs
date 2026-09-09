@@ -134,21 +134,59 @@ public class SubAgentToolsTests
     /// <summary>
     /// Parent chat client that replays a script of rounds, records every ChatOptions it receives
     /// and every tool result it observes in the incoming message list.
+    /// <para>
+    /// Results are ALSO recorded with the identity of the tool that produced them: the client
+    /// mints every call id itself, so mapping call id → tool name lets a test attribute a captured
+    /// <see cref="FunctionResultContent"/> to a specific tool instead of guessing from the payload
+    /// shape (two different tools can emit similar-looking JSON).
+    /// </para>
     /// </summary>
     private sealed class ScriptedClient : IChatClient
     {
         private readonly IReadOnlyList<Round> _rounds;
         private readonly Action<int>? _beforeRound;
+        private readonly Dictionary<string, string> _callIdToTool = new(StringComparer.Ordinal);
         private int _index;
 
         public ChatOptions? LastOptions { get; private set; }
         public List<IList<ChatMessage>> ReceivedMessages { get; } = [];
         public List<string> ToolResults { get; } = [];
 
+        /// <summary>
+        /// Every observed tool result paired with the name of the tool that produced it,
+        /// in observation order. Same entries as <see cref="ToolResults"/>, attributed.
+        /// </summary>
+        public List<(string Tool, string Result)> AttributedToolResults { get; } = [];
+
+        /// <summary>
+        /// The distinct results produced by <paramref name="toolName"/>, in first-observation
+        /// order. A result the parent never received for that tool yields an empty list, so a
+        /// missing or empty payload cannot be masked by another tool's output.
+        /// </summary>
+        public IReadOnlyList<string> ResultsFor(string toolName)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var results = new List<string>();
+            foreach (var (tool, result) in AttributedToolResults)
+            {
+                if (!string.Equals(tool, toolName, StringComparison.Ordinal)) continue;
+                if (seen.Add(result)) results.Add(result);
+            }
+            return results;
+        }
+
         public ScriptedClient(IReadOnlyList<Round> rounds, Action<int>? beforeRound = null)
         {
             _rounds = rounds;
             _beforeRound = beforeRound;
+        }
+
+        /// <summary>Mints a call id and remembers which tool it belongs to.</summary>
+        private string NewCallId(string toolName)
+        {
+            var callId = "call_" + Guid.NewGuid().ToString("N");
+            _callIdToTool[callId] = toolName;
+            return callId;
         }
 
         private Round Next(IEnumerable<ChatMessage> messages, ChatOptions? options)
@@ -158,7 +196,12 @@ public class SubAgentToolsTests
             LastOptions = options;
 
             foreach (var content in list.SelectMany(m => m.Contents).OfType<FunctionResultContent>())
-                ToolResults.Add(ResultToString(content.Result));
+            {
+                var text = ResultToString(content.Result);
+                ToolResults.Add(text);
+                AttributedToolResults.Add(
+                    (_callIdToTool.TryGetValue(content.CallId, out var tool) ? tool : "<unknown>", text));
+            }
 
             var i = _index++;
             _beforeRound?.Invoke(i);
@@ -173,7 +216,7 @@ public class SubAgentToolsTests
             if (round.ToolName is not null)
             {
                 var msg = new ChatMessage(ChatRole.Assistant,
-                    new AIContent[] { new FunctionCallContent("call_" + Guid.NewGuid().ToString("N"), round.ToolName, round.ToolArgs) });
+                    new AIContent[] { new FunctionCallContent(NewCallId(round.ToolName), round.ToolName, round.ToolArgs) });
                 return Task.FromResult(new ChatResponse(msg) { FinishReason = ChatFinishReason.ToolCalls });
             }
 
@@ -195,7 +238,7 @@ public class SubAgentToolsTests
                 yield return new ChatResponseUpdate
                 {
                     Role = ChatRole.Assistant,
-                    Contents = [new FunctionCallContent("call_" + Guid.NewGuid().ToString("N"), round.ToolName, round.ToolArgs)]
+                    Contents = [new FunctionCallContent(NewCallId(round.ToolName), round.ToolName, round.ToolArgs)]
                 };
                 yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.ToolCalls };
                 yield break;
@@ -925,6 +968,138 @@ public class SubAgentToolsTests
         Assert.Equal("finished", result.Message);
         Assert.Contains(script.ToolResults, r => r.Contains("the sub-agent summary"));
         Assert.Contains(script.ToolResults, r => r.Contains("\"status\":\"Running\""));
+    }
+
+    // ========================================================================
+    // Full-summary preservation, end to end
+    //
+    // MaxSummaryChars was deleted: the child's complete final message must reach
+    // the parent verbatim. These tests run the REAL chain — real child execution
+    // (OptionsCapturingClient) → SubAgentManager completion → the registered
+    // await_sub_agents / get_sub_agent_status tools → the parent-captured function
+    // result (ScriptedClient.ToolResults) — and compare the full summary after JSON
+    // parsing, so JSON escaping is not mistaken for changed content.
+    // ========================================================================
+
+    /// <summary>
+    /// Builds the long multiline payload used by the end-to-end preservation tests:
+    /// a literal ellipsis, trailing spaces/tabs/newlines, unique trailing evidence,
+    /// and a surrogate pair straddling the former 8000-unit cutoff (the old clamp
+    /// would have split the pair at exactly this point).
+    /// </summary>
+    private static string BuildLongEndToEndPayload()
+    {
+        const string trailingEvidence = "E2E-TRAILING-EVIDENCE-b7a41d";
+        var leading = "report line 1\nreport line 2\twith tab\n\nline 4 has a \u2026 literal ellipsis\r\n";
+
+        // Position the surrogate pair's high surrogate at index 7998 so it straddles
+        // the former 8000-unit cutoff exactly.
+        var prefix = leading + new string('r', 8000 - leading.Length - 2);
+        Assert.Equal(7998, prefix.Length);
+        return prefix + "\U0001F600" + "\n" + trailingEvidence + "   \t\n";
+    }
+
+    [Fact]
+    public async Task EndToEnd_LongSummary_Preserved_Verbatim_Through_Await_Tool_And_Parent_Result()
+    {
+        var payload = BuildLongEndToEndPayload();
+        var parent = ParentOptions();
+        parent.SubAgents = new SubAgentOptions
+        {
+            DefaultClient = new OptionsCapturingClient(payload)
+        };
+
+        var script = new ScriptedClient(
+        [
+            Round.Call("start_sub_agent", new Dictionary<string, object?> { ["task"] = "produce a long report" }),
+            Round.Call("await_sub_agents", new Dictionary<string, object?>()),
+            Round.Call("get_sub_agent_status", new Dictionary<string, object?> { ["id"] = "sub-1" }),
+            Round.Say("collected"),
+        ]);
+
+        var agent = new CodingAgent(script, parent);
+        var result = await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Success", result.Status);
+
+        // ---- await_sub_agents, attributed to that tool specifically ----
+        //
+        // Selecting by payload shape alone is not attributable: get_sub_agent_status also
+        // returns a JSON array containing a "summary" property, so a broken/empty await
+        // payload could otherwise be masked by the intact status payload. The scripted
+        // client mints every call id, so results are matched back to the tool that produced
+        // them. The await-only schema (input_tokens/output_tokens, which the status tool
+        // never emits) is additionally required.
+        var awaitResults = script.ResultsFor("await_sub_agents");
+        var awaitJson = Assert.Single(awaitResults);
+        using (var doc = JsonDocument.Parse(awaitJson))
+        {
+            Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
+            // A returned "[]" (or any array lacking the single sub-agent) fails here.
+            var item = Assert.Single(doc.RootElement.EnumerateArray());
+            // Await-only schema: proves this payload really is the await tool's output.
+            Assert.True(item.TryGetProperty("input_tokens", out _),
+                "The await_sub_agents payload must contain input_tokens.");
+            Assert.True(item.TryGetProperty("output_tokens", out _),
+                "The await_sub_agents payload must contain output_tokens.");
+            Assert.Equal("sub-1", item.GetProperty("id").GetString());
+            Assert.Equal("Completed", item.GetProperty("status").GetString());
+            // A missing/null "summary" fails here rather than passing via another payload.
+            Assert.True(item.TryGetProperty("summary", out var summaryProp),
+                "The await_sub_agents payload must contain summary.");
+            Assert.Equal(JsonValueKind.String, summaryProp.ValueKind);
+            Assert.Equal(payload, summaryProp.GetString());
+        }
+
+        // ---- get_sub_agent_status, asserted SEPARATELY and attributed too ----
+        var statusResults = script.ResultsFor("get_sub_agent_status");
+        var statusJson = Assert.Single(statusResults);
+        Assert.NotEqual(awaitJson, statusJson); // provably two distinct payloads
+        using (var doc = JsonDocument.Parse(statusJson))
+        {
+            Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
+            var item = Assert.Single(doc.RootElement.EnumerateArray());
+            Assert.Equal("sub-1", item.GetProperty("id").GetString());
+            Assert.Equal("Completed", item.GetProperty("status").GetString());
+            Assert.True(item.TryGetProperty("started_at", out _));
+            Assert.Equal(payload, item.GetProperty("summary").GetString());
+        }
+
+        // And the raw parent-captured result contains the unique trailing evidence,
+        // proving the whole string (not a truncated prefix) was handed off.
+        Assert.Contains(script.ToolResults, r => r.Contains("E2E-TRAILING-EVIDENCE-b7a41d"));
+        Assert.DoesNotContain(script.ToolResults, r => r.Contains('\u2026') && r.Contains("sub-agent summary was truncated"));
+    }
+
+    [Fact]
+    public async Task EndToEnd_WhitespaceSummary_Preserved_With_Unchanged_SDK_Fallback()
+    {
+        // A whitespace-only child message passes through verbatim. (A fully empty child
+        // message maps to the SDK's existing "No text response." response.Text fallback,
+        // which is intentionally NOT changed by this goal.)
+        const string whitespace = "  \t\n ";
+        var parent = ParentOptions();
+        parent.SubAgents = new SubAgentOptions
+        {
+            DefaultClient = new OptionsCapturingClient(whitespace)
+        };
+
+        var script = new ScriptedClient(
+        [
+            Round.Call("start_sub_agent", new Dictionary<string, object?> { ["task"] = "work" }),
+            Round.Call("await_sub_agents", new Dictionary<string, object?>()),
+            Round.Say("collected"),
+        ]);
+
+        var agent = new CodingAgent(script, parent);
+        var result = await agent.ExecuteAsync("delegate", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Success", result.Status);
+        var awaitJson = Assert.Single(script.ToolResults, r => r.StartsWith('['));
+        using var doc = JsonDocument.Parse(awaitJson);
+        var item = doc.RootElement[0];
+        Assert.Equal("Completed", item.GetProperty("status").GetString());
+        Assert.Equal(whitespace, item.GetProperty("summary").GetString());
     }
 
     // ========================================================================

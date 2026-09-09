@@ -72,7 +72,6 @@ public sealed class CodingAgent : IAsyncDisposable
                 MaxConcurrentSubAgents = source.MaxConcurrentSubAgents,
                 DefaultTimeout = source.DefaultTimeout,
                 MaxTimeout = source.MaxTimeout,
-                MaxSummaryChars = source.MaxSummaryChars,
                 ClientFactory = source.ClientFactory,
                 DefaultClient = source.DefaultClient,
                 DefaultEnableBash = source.DefaultEnableBash,
