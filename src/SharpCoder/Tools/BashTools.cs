@@ -36,11 +36,39 @@ public sealed class BashTools
         _shellArgsFormat = shellArgsFormat;
     }
 
-    [Description("Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.")]
+    /// <summary>
+    /// Internal timing seam so tests can observe the effective per-call timeout without
+    /// actually waiting for it. Defaults to <see cref="Task.Delay(int, CancellationToken)"/>.
+    /// </summary>
+    internal Func<int, CancellationToken, Task> DelayFactory { get; set; } =
+        static (timeoutMs, token) => Task.Delay(timeoutMs, token);
+
+    /// <summary>
+    /// Compatibility entry point preserving the original two-parameter signature.
+    /// Forwards to the timeout-aware overload using the instance default timeout.
+    /// This overload is intentionally not the one registered as an LLM tool.
+    /// </summary>
+    public Task<string> execute_bash_command(
+        string command,
+        CancellationToken ct = default)
+        => execute_bash_command(command, ct, null);
+
+    [Description("Executes a given bash command. Each invocation starts a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected.")]
     public async Task<string> execute_bash_command(
         [Description("The command to execute")] string command,
-        CancellationToken ct = default)
+        CancellationToken ct,
+        [Description("Optional timeout for this invocation only, in milliseconds. Omit to use the configured default timeout (normally 120000 ms). Must be greater than zero; pass a longer budget such as 900000 for a known multi-minute validation run.")] int? timeout_ms = null)
     {
+        if (timeout_ms.HasValue && timeout_ms.Value <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(timeout_ms),
+                timeout_ms.Value,
+                "timeout_ms must be greater than zero when specified.");
+        }
+
+        var effectiveTimeoutMs = timeout_ms ?? _timeoutMs;
+
         Process? process = null;
         try
         {
@@ -93,14 +121,14 @@ public sealed class BashTools
                 processCompletionSource.TrySetResult(true);
             }
 
-            var timeoutTask = Task.Delay(_timeoutMs, cts.Token);
+            var timeoutTask = DelayFactory(effectiveTimeoutMs, cts.Token);
             var completedTask = await Task.WhenAny(processCompletionSource.Task, timeoutTask);
 
             if (completedTask == timeoutTask)
             {
-                _logger.LogWarning("Command timed out after {TimeoutMs}ms: {Command}", _timeoutMs, command);
+                _logger.LogWarning("Command timed out after {TimeoutMs}ms: {Command}", effectiveTimeoutMs, command);
                 KillProcess(process);
-                return $"Command timed out after {_timeoutMs}ms.";
+                return $"Command timed out after {effectiveTimeoutMs}ms.";
             }
 
             cts.Cancel();
