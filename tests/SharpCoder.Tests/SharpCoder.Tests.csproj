@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -28,5 +28,40 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpCoder\SharpCoder.csproj" />
   </ItemGroup>
+
+  <!--
+    Test-fixture wiring only. The process fixture is a console app, not a library: it is built
+    together with this test project but its assembly is deliberately NOT referenced. Its complete
+    runtime asset set (apphost, dll, deps/runtimeconfig json) is copied to a stable, discoverable
+    location — $(OutDir)ProcessFixture — so lifecycle tests can launch real process trees.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\SharpCoder.ProcessFixture\SharpCoder.ProcessFixture.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <ProcessFixtureSubdirectory>ProcessFixture</ProcessFixtureSubdirectory>
+    <ProcessFixtureOutputDir>$(MSBuildThisFileDirectory)..\SharpCoder.ProcessFixture\bin\$(Configuration)\net10.0\</ProcessFixtureOutputDir>
+  </PropertyGroup>
+
+  <!--
+    The ProjectReference above guarantees the fixture is built first; this target then copies its
+    complete runtime asset set (items are globbed at execution time, so a clean build works).
+  -->
+  <Target Name="CopyProcessFixtureAssets" AfterTargets="Build">
+    <ItemGroup>
+      <_ProcessFixtureAsset Include="$(ProcessFixtureOutputDir)**\*" />
+    </ItemGroup>
+
+    <Error Condition="'@(_ProcessFixtureAsset)' == ''"
+           Text="Process fixture output not found at $(ProcessFixtureOutputDir). The lifecycle tests require it." />
+
+    <Copy SourceFiles="@(_ProcessFixtureAsset)"
+          DestinationFiles="@(_ProcessFixtureAsset->'$(OutDir)$(ProcessFixtureSubdirectory)\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Retries="3" />
+  </Target>
 
 </Project>

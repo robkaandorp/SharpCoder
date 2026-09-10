@@ -6,5 +6,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/SharpCoder.Tests/SharpCoder.Tests.csproj" />
     <Project Path="tests/SharpCoder.Providers.Tests/SharpCoder.Providers.Tests.csproj" />
+    <Project Path="tests/SharpCoder.ProcessFixture/SharpCoder.ProcessFixture.csproj" />
   </Folder>
 </Solution>
