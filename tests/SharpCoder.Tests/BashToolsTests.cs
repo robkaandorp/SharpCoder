@@ -50,7 +50,7 @@ public class BashToolsTests
     /// without ever waiting for it. The returned list records every timeout the production
     /// execution path selected, in call order.
     /// </summary>
-    private static List<int> ObserveTimeouts(BashTools tools)
+    internal static List<int> ObserveTimeouts(BashTools tools)
     {
         var observed = new List<int>();
         tools.DelayFactory = (timeoutMs, token) =>
@@ -217,6 +217,53 @@ public class BashToolsTests
         {
             try { Directory.Delete(workDir, recursive: true); } catch { }
         }
+    }
+
+    // ========================================================================
+    // Pre-cancelled calls launch nothing (lifecycle fix)
+    // ========================================================================
+
+    [Fact]
+    public async Task PreCancelledToken_ThrowsBeforeProcessLaunch()
+    {
+        var workDir = Path.Combine(Path.GetTempPath(), "bashtools-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workDir);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        try
+        {
+            var marker = Path.Combine(workDir, "marker.txt");
+            var tools = new BashTools(workDir);
+            var observed = ObserveTimeouts(tools);
+
+            var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => tools.execute_bash_command("echo launched > marker.txt", cts.Token));
+
+            Assert.Equal(cts.Token, ex.CancellationToken);
+            Assert.False(File.Exists(marker), "No process may be launched for an already-cancelled call.");
+            Assert.Empty(observed);
+        }
+        finally
+        {
+            try { Directory.Delete(workDir, recursive: true); } catch { }
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task InvalidTimeout_IsRejected_EvenWhenTheTokenIsAlreadyCancelled(int timeoutMs)
+    {
+        // Argument validation still runs first: the contract for an invalid timeout_ms is
+        // unchanged by the pre-cancellation guard.
+        var tools = new BashTools(Environment.CurrentDirectory);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var ex = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => tools.execute_bash_command("echo never", cts.Token, timeoutMs));
+
+        Assert.Equal("timeout_ms", ex.ParamName);
     }
 
     // ========================================================================
