@@ -320,16 +320,15 @@ var options = new AgentOptions
 | `glob` | Find files by pattern (e.g. `src/**/*.cs`) | `EnableFileOps` |
 | `grep` | Search file contents with regex | `EnableFileOps` |
 | `execute_bash_command` | Run shell commands | `EnableBash` |
+| `list_skills` / `load_skill` | Discover and load project skills | `EnableSkills` |
 
-`execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Nonpositive values are rejected before process launch, and each invocation starts a fresh shell process. A valid tool call is:
+`execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Zero or negative values are rejected before process launch, and each invocation starts a fresh shell process. The original C# caller signature remains compatible. A valid tool call is:
 
 ```json
 {"command":"dotnet test --configuration Release", "timeout_ms":900000}
 ```
 
-This per-invocation budget selection does not add an `AgentOptions` command-timeout setting. Existing direct shell callers remain compatible separately from the breaking sub-agent property removal. The timeout feature does not provide reliable process-tree cleanup, corrected cancellation classification, captured timeout diagnostics or exit-status reporting, a managed background-job API, or a guaranteed bound on the whole tool call including pipe drains.
-
-| `list_skills` / `load_skill` | Discover and load project skills | `EnableSkills` |
+Caller cancellation propagates an `OperationCanceledException`; it does not return a timeout transcript, and raw captured output is not promised on cancellation. The command deadline covers root-process exit and redirected-output draining. Native process-tree termination is attempted while the root process is still alive; descendants that escaped ancestry or were reparented after root exit cannot reliably be found or killed, so cleanup is not guaranteed to be complete. The fixed five-second cleanup allowance bounds managed waits only, not synchronous OS calls, and there is no public `AgentOptions` command-timeout setting or managed background-job API. Completed output remains available with incomplete-capture diagnostics when output was not fully captured, and actual exit status is reported, including silent nonzero exits.
 
 ## Agent Result
 

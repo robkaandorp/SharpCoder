@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.20.1] — 2026-09-10 UTC
+
+### Fixed
+
+- **Bash-command lifecycle and diagnostics** — Valid calls cancelled before launch do not start a process. Caller cancellation propagates as `OperationCanceledException` rather than a timeout, with no timeout transcript returned. The command deadline covers both root-process exit and redirected-output draining; managed cleanup waits are bounded by five seconds. Native process-tree termination is attempted while the root remains alive, with explicit degraded-cleanup reporting when descendants have escaped ancestry. Actual exit status is reported, including silent nonzero exits, and available completed output is returned alongside incomplete-capture diagnostics when capture does not finish.
+
 ## [0.20.0] — 2026-09-09
 
 ### Added
