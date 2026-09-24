@@ -3693,8 +3693,8 @@ public sealed class OwnedCopilotChatClientTests
     }
 
     /// <summary>
-    /// Terminal handler that records the outgoing request body <em>and</em> its
-    /// <c>Authorization</c> header, then answers with a canned JSON body.
+    /// Terminal handler that records the outgoing request body, its <c>Authorization</c> header
+    /// and its <c>Copilot-Integration-Id</c> values, then answers with a canned JSON body.
     /// </summary>
     private sealed class ProbeTerminalHandler : HttpMessageHandler
     {
@@ -3704,11 +3704,15 @@ public sealed class OwnedCopilotChatClientTests
 
         public string? LastBody { get; private set; }
         public System.Net.Http.Headers.AuthenticationHeaderValue? LastAuthorization { get; private set; }
+        public IReadOnlyList<string> LastIntegrationIds { get; private set; } = Array.Empty<string>();
         public bool Disposed { get; private set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             LastAuthorization = request.Headers.Authorization;
+            LastIntegrationIds = request.Headers.TryGetValues("Copilot-Integration-Id", out var ids)
+                ? ids.ToArray()
+                : Array.Empty<string>();
             if (request.Content is not null)
                 LastBody = await request.Content.ReadAsStringAsync(ct);
 
@@ -4040,10 +4044,12 @@ public sealed class OwnedCopilotChatClientTests
     /// <summary>
     /// The seam has no token dependency, proven without mutating any process-wide state: it
     /// contributes <b>no credential material at all</b>. The <see cref="HttpClient"/> it hands to
-    /// the factory carries no default headers (in particular no <c>Authorization</c>) and no
-    /// <see cref="HttpClient.BaseAddress"/>, and a real request driven through the entire chain
-    /// reaches the terminal handler without an <c>Authorization</c> header. Nothing in the seam can
-    /// therefore be reading — let alone requiring — <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>.
+    /// the factory carries no <c>Authorization</c> default header (the only default header it holds
+    /// is the non-credential <c>Copilot-Integration-Id</c> integration marker, which is asserted to
+    /// be exactly that) and no <see cref="HttpClient.BaseAddress"/>, and a real request driven
+    /// through the entire chain reaches the terminal handler without an <c>Authorization</c>
+    /// header. Nothing in the seam can therefore be reading — let alone requiring —
+    /// <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>.
     /// </summary>
     [Fact]
     public async Task CreateCopilotClientForTestFull_ContributesNoCredentialMaterial()
@@ -4061,14 +4067,20 @@ public sealed class OwnedCopilotChatClientTests
 
         Assert.NotNull(factoryHttpClient);
         Assert.Null(factoryHttpClient!.DefaultRequestHeaders.Authorization);
-        Assert.Empty(factoryHttpClient.DefaultRequestHeaders);
         Assert.Null(factoryHttpClient.BaseAddress);
+
+        // The default-header set is exactly the integration marker — and that marker is not
+        // credential material: it carries the fixed integration id, never a token.
+        var defaultHeader = Assert.Single(factoryHttpClient.DefaultRequestHeaders);
+        Assert.Equal("Copilot-Integration-Id", defaultHeader.Key);
+        Assert.Equal(new[] { "copilot-developer-cli" }, defaultHeader.Value);
 
         _ = await client.GetResponseAsync(
             [new ChatMessage(ChatRole.User, "hi")], cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.NotNull(terminal.LastBody);
         Assert.Null(terminal.LastAuthorization);
+        Assert.Equal(new[] { "copilot-developer-cli" }, terminal.LastIntegrationIds);
     }
 
     /// <summary>
@@ -4309,5 +4321,359 @@ public sealed class CopilotClientSeamTokenIndependenceTests : IDisposable
         Assert.False(ChatClientFactory.RequiresResponsesEndpoint("gpt-4o"));
         Assert.False(ChatClientFactory.RequiresResponsesEndpoint("claude-opus"));
         Assert.False(ChatClientFactory.RequiresResponsesEndpoint("llama-3"));
+    }
+}
+
+/// <summary>
+/// Tests for the <c>Copilot-Integration-Id</c> header that every GitHub Copilot HTTP request must
+/// carry, so the Copilot API does not classify SharpCoder as third-party-app traffic (a
+/// fine-grained PAT is otherwise rejected with <c>400</c>, and a custom OAuth app token otherwise
+/// only sees a reduced model catalog).
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every test here is <b>behavioural</b>: it drives a real request through the REAL production
+/// handler chain (the <see cref="ChatClientFactory.CreateCopilotClientForTest(bool, string, HttpMessageHandler)"/>
+/// and <see cref="ChatClientFactory.CreateCopilotClientForTestFull(bool, HttpMessageHandler, Func{HttpClient, IChatClient})"/>
+/// seams) into a terminal handler that records exactly what the transport would have put on the
+/// wire. No network access and no sleeps are involved; the retry test uses the same near-zero
+/// retry-delay override the existing retry tests use, so the genuine resilience pipeline (same
+/// retry count and backoff type as production) is still the thing under test.
+/// </para>
+/// <para>
+/// <b>Removal-proof.</b> Each test fails on its own when the single header line in
+/// <c>CreateCopilotHttpClient</c> is deleted — the request-level tests because the header is then
+/// absent, the negative controls because a mistakenly global placement would show up on the Ollama
+/// request.
+/// </para>
+/// </remarks>
+public sealed class CopilotIntegrationIdHeaderTests
+{
+    /// <summary>The header name under test, spelled exactly as the Copilot API expects it.</summary>
+    private const string IntegrationHeaderName = "Copilot-Integration-Id";
+
+    /// <summary>The exact value the Copilot API expects.</summary>
+    private const string IntegrationHeaderValue = "copilot-developer-cli";
+
+    /// <summary>Near-zero base retry delay, mirroring the existing retry tests' pattern.</summary>
+    private static readonly TimeSpan FastRetry = TimeSpan.FromMilliseconds(1);
+
+    /// <summary>
+    /// Asserts that <paramref name="request"/> carries the integration header EXACTLY once, with the
+    /// exact expected value. <see cref="Assert.Single(System.Collections.IEnumerable)"/> on the
+    /// captured values is what makes a duplicated header — which the API may reject just as it
+    /// rejects a missing one — fail loudly.
+    /// </summary>
+    private static void AssertSingleIntegrationHeader(HttpRequestMessage request)
+    {
+        Assert.True(
+            request.Headers.TryGetValues(IntegrationHeaderName, out var values),
+            $"Every Copilot request must carry the {IntegrationHeaderName} header.");
+        Assert.Equal(new[] { IntegrationHeaderValue }, values);
+
+        // The literal value is the contract with the API; asserting it independently of the
+        // internal const means a changed const cannot silently redefine "correct".
+        Assert.Equal(IntegrationHeaderValue, ChatClientFactory.CopilotIntegrationId);
+    }
+
+    /// <summary>
+    /// The integration id is defined once, as the documented internal const, with the exact value
+    /// the Copilot API expects.
+    /// </summary>
+    [Fact]
+    public void CopilotIntegrationId_HasTheExpectedValue()
+    {
+        Assert.Equal("copilot-developer-cli", ChatClientFactory.CopilotIntegrationId);
+    }
+
+    /// <summary>
+    /// (a) chat-completions branch (<c>useResponsesApi = false</c>): a request driven through the
+    /// real chain reaches the terminal carrying exactly one <c>Copilot-Integration-Id</c> header
+    /// with the expected value. Sending twice through the same client also proves the value never
+    /// accumulates.
+    /// </summary>
+    [Fact]
+    public async Task ChatCompletionsRequest_CarriesExactlyOneIntegrationHeader()
+    {
+        var terminal = new CopilotProbeTerminalHandler(
+            """{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}""");
+        using var client = ChatClientFactory.CreateCopilotClientForTest(
+            useResponsesApi: false, ChatClientFactory.CopilotExtraHighMapping, terminal);
+
+        // The header is visible on the client's default headers too — exactly once.
+        Assert.True(client.DefaultRequestHeaders.TryGetValues(IntegrationHeaderName, out var defaults));
+        Assert.Equal(new[] { IntegrationHeaderValue }, defaults);
+
+        for (var i = 0; i < 2; i++)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post, "https://api.githubcopilot.com/chat/completions")
+            {
+                Content = new StringContent(
+                    """{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}""",
+                    Encoding.UTF8, "application/json"),
+            };
+
+            using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+
+            Assert.Single(terminal.Requests);
+            AssertSingleIntegrationHeader(terminal.Requests[^1]);
+            // The integration marker is not credential material: nothing on this chain sets
+            // Authorization.
+            Assert.Null(terminal.Requests[^1].Headers.Authorization);
+            terminal.Requests.Clear();
+        }
+    }
+
+    /// <summary>
+    /// (b) /responses branch (<c>useResponsesApi = true</c>): the same guarantee holds on the other
+    /// endpoint, which the header must cover just as well.
+    /// </summary>
+    [Fact]
+    public async Task ResponsesApiRequest_CarriesExactlyOneIntegrationHeader()
+    {
+        var terminal = new CopilotProbeTerminalHandler("""{"id":"resp_1","output":[]}""");
+        using var client = ChatClientFactory.CreateCopilotClientForTest(
+            useResponsesApi: true, ChatClientFactory.CopilotExtraHighMapping, terminal);
+
+        Assert.True(client.DefaultRequestHeaders.TryGetValues(IntegrationHeaderName, out var defaults));
+        Assert.Equal(new[] { IntegrationHeaderValue }, defaults);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, "https://api.githubcopilot.com/responses")
+        {
+            Content = new StringContent(
+                """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"hi"}]}""",
+                Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+
+        var captured = Assert.Single(terminal.Requests);
+        AssertSingleIntegrationHeader(captured);
+        Assert.Null(captured.Headers.Authorization);
+    }
+
+    /// <summary>
+    /// (b, full stack) The /responses guarantee also holds all the way through the owned production
+    /// client built by <see cref="ChatClientFactory.CreateCopilotClientForTestFull(bool, HttpMessageHandler, Func{HttpClient, IChatClient})"/>,
+    /// i.e. for the object production really hands back.
+    /// </summary>
+    [Fact]
+    public async Task ResponsesApiRequest_ViaFullOwnedClient_CarriesExactlyOneIntegrationHeader()
+    {
+        var terminal = new CopilotProbeTerminalHandler("""{"id":"resp_1","output":[]}""");
+        using var client = ChatClientFactory.CreateCopilotClientForTestFull(
+            useResponsesApi: true, terminal, httpClient => new ResponseProbeChatClient(httpClient));
+
+        _ = await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "hi")], cancellationToken: TestContext.Current.CancellationToken);
+
+        var captured = Assert.Single(terminal.Requests);
+        AssertSingleIntegrationHeader(captured);
+        Assert.Null(captured.Headers.Authorization);
+    }
+
+    /// <summary>
+    /// (c) retried attempt: a transient <c>500</c> is retried by the real resilience pipeline, and
+    /// the retried attempt must still carry exactly one integration header. The attempt count is
+    /// asserted too, so the test cannot pass vacuously on a single un-retried attempt.
+    /// </summary>
+    [Fact]
+    public async Task RetriedAttempt_CarriesExactlyOneIntegrationHeader()
+    {
+        var terminal = new CopilotProbeTerminalHandler("""{"id":"resp_1","output":[]}""")
+        {
+            RemainingFailures = 1,
+        };
+
+        using var client = ChatClientFactory.CreateCopilotClientForTest(
+            useResponsesApi: true,
+            ChatClientFactory.CopilotExtraHighMapping,
+            terminal,
+            out _,
+            FastRetry);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, "https://api.githubcopilot.com/responses")
+        {
+            Content = new StringContent(
+                """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"first"}]}""",
+                Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(2, terminal.Requests.Count);
+
+        // The first (failed) attempt and the retried attempt both carried the header, exactly once.
+        AssertSingleIntegrationHeader(terminal.Requests[0]);
+        AssertSingleIntegrationHeader(terminal.Requests[1]);
+        Assert.Null(terminal.Requests[1].Headers.Authorization);
+    }
+
+    /// <summary>
+    /// (d) Negative control: the Ollama stack is Copilot-unrelated, so a request driven through the
+    /// real <see cref="ChatClientFactory.CreateOllamaClientForTest(string, HttpMessageHandler)"/>
+    /// stack must NOT carry the header. This is what fails if the header were ever applied somewhere
+    /// shared instead of on the Copilot-owned client.
+    /// </summary>
+    [Fact]
+    public async Task OllamaRequest_DoesNotCarryTheIntegrationHeader()
+    {
+        var terminal = new OllamaProbeTerminalHandler();
+        using var client = ChatClientFactory.CreateOllamaClientForTest("gpt-oss:20b", terminal);
+
+        await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "hello")],
+            new ChatOptions { Reasoning = new ReasoningOptions { Effort = ReasoningEffort.ExtraHigh } },
+            TestContext.Current.CancellationToken);
+
+        var captured = Assert.Single(terminal.Requests);
+        Assert.False(
+            captured.Headers.Contains(IntegrationHeaderName),
+            "The Copilot-Integration-Id header is Copilot-only and must never reach the Ollama stack.");
+    }
+
+    /// <summary>
+    /// (e) The integration header is not credential material: the Copilot-owned <see cref="HttpClient"/>
+    /// handed to the factory has a <see langword="null"/> <c>Authorization</c> default header, and a
+    /// real request reaches the terminal with no <c>Authorization</c> at all — only the fixed
+    /// integration marker.
+    /// </summary>
+    [Fact]
+    public async Task IntegrationHeader_IsNotCredentialMaterial_AuthorizationStaysNull()
+    {
+        var terminal = new CopilotProbeTerminalHandler("""{"id":"resp_1","output":[]}""");
+        HttpClient? factoryHttpClient = null;
+
+        using var client = ChatClientFactory.CreateCopilotClientForTestFull(
+            useResponsesApi: true, terminal,
+            httpClient =>
+            {
+                factoryHttpClient = httpClient;
+                return new ResponseProbeChatClient(httpClient);
+            });
+
+        Assert.NotNull(factoryHttpClient);
+        Assert.Null(factoryHttpClient!.DefaultRequestHeaders.Authorization);
+        Assert.Null(factoryHttpClient.BaseAddress);
+
+        // The only default header is the integration marker, and it holds the fixed id — never a
+        // token.
+        var defaultHeader = Assert.Single(factoryHttpClient.DefaultRequestHeaders);
+        Assert.Equal(IntegrationHeaderName, defaultHeader.Key);
+        Assert.Equal(new[] { IntegrationHeaderValue }, defaultHeader.Value);
+
+        _ = await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "hi")], cancellationToken: TestContext.Current.CancellationToken);
+
+        var captured = Assert.Single(terminal.Requests);
+        Assert.Null(captured.Headers.Authorization);
+        AssertSingleIntegrationHeader(captured);
+    }
+
+    /// <summary>
+    /// Terminal handler that records every outgoing <see cref="HttpRequestMessage"/> (so per-attempt
+    /// headers can be inspected) and returns a canned JSON body, failing a configurable number of
+    /// times first so the resilience pipeline really retries.
+    /// </summary>
+    private sealed class CopilotProbeTerminalHandler : HttpMessageHandler
+    {
+        private readonly string _responseBody;
+        private int _remainingFailures;
+
+        public CopilotProbeTerminalHandler(string responseBody) => _responseBody = responseBody;
+
+        /// <summary>Number of leading attempts answered with a retryable <c>500</c>.</summary>
+        public int RemainingFailures
+        {
+            get => _remainingFailures;
+            init => _remainingFailures = value;
+        }
+
+        public List<HttpRequestMessage> Requests { get; } = new();
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Requests.Add(request);
+            if (request.Content is not null)
+                await request.Content.ReadAsStringAsync(ct);
+
+            if (_remainingFailures > 0)
+            {
+                _remainingFailures--;
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                {
+                    RequestMessage = request,
+                    Content = new StringContent("""{"error":"transient"}""", Encoding.UTF8, "application/json"),
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(_responseBody, Encoding.UTF8, "application/json"),
+            };
+        }
+    }
+
+    /// <summary>
+    /// Terminal handler that records every outgoing <see cref="HttpRequestMessage"/> and answers with
+    /// the Ollama-shaped NDJSON body the real <c>OllamaApiClient</c> accepts.
+    /// </summary>
+    private sealed class OllamaProbeTerminalHandler : HttpMessageHandler
+    {
+        public List<HttpRequestMessage> Requests { get; } = new();
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Requests.Add(request);
+            if (request.Content is not null)
+                await request.Content.ReadAsStringAsync(ct);
+
+            const string done = """{"model":"gpt-oss:20b","created_at":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}""";
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(done, Encoding.UTF8, "application/x-ndjson"),
+            };
+        }
+    }
+
+    /// <summary>
+    /// Inner client that really sends a /responses request through the supplied production
+    /// <see cref="HttpClient"/>, so the header placement is exercised through the owned stack.
+    /// </summary>
+    private sealed class ResponseProbeChatClient : IChatClient
+    {
+        private readonly HttpClient _httpClient;
+
+        public ResponseProbeChatClient(HttpClient httpClient) => _httpClient = httpClient;
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post, "https://api.githubcopilot.com/responses")
+            {
+                Content = new StringContent(
+                    """{"model":"gpt-5","input":[{"type":"message","role":"user","content":"hi"}]}""",
+                    Encoding.UTF8, "application/json"),
+            };
+
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, "ok"));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
     }
 }

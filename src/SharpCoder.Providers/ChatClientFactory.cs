@@ -595,6 +595,18 @@ public static class ChatClientFactory
     /// </summary>
     internal const string CopilotExtraHighMapping = "xhigh";
 
+    /// <summary>
+    /// The value sent in the <c>Copilot-Integration-Id</c> header on every GitHub Copilot HTTP
+    /// request.
+    /// </summary>
+    /// <remarks>
+    /// Without this header the Copilot API classifies the request as third-party-app traffic:
+    /// a fine-grained PAT is rejected with <c>400</c> ("Personal Access Tokens are not supported
+    /// for this endpoint"), and a custom GitHub OAuth app token receives a reduced model catalog.
+    /// With it, OAuth app tokens, gh CLI tokens and PATs all receive the full catalog.
+    /// </remarks>
+    internal const string CopilotIntegrationId = "copilot-developer-cli";
+
     private static IChatClient CreateCopilotClient(string model)
     {
         var ghToken = ResolveCopilotToken();
@@ -627,6 +639,58 @@ public static class ChatClientFactory
     }
 
     /// <summary>
+    /// Builds the Copilot-owned <see cref="HttpClient"/> over the FULL production handler chain
+    /// (resilience → Copilot handler → reasoning-effort mapping → <paramref name="terminalHandler"/>)
+    /// and stamps it with the <c>Copilot-Integration-Id</c> header.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
+    /// <param name="copilotHandler">The Copilot handler instance inside the chain.</param>
+    /// <param name="retryDelay">Optional retry-delay override so retry tests run fast.</param>
+    /// <remarks>
+    /// <para>
+    /// <b>One construction point.</b> Both the production
+    /// <see cref="CreateCopilotClientCore"/> path and the <see cref="CreateCopilotClientForTest(bool, string, HttpMessageHandler, out DelegatingHandler, TimeSpan?)"/>
+    /// test seam build their Copilot <see cref="HttpClient"/> here, so the header is applied on
+    /// exactly one code path and every seam sees the production behaviour.
+    /// </para>
+    /// <para>
+    /// <b>Why the header goes on <see cref="HttpClient.DefaultRequestHeaders"/>.</b> The header is
+    /// stamped on the client <em>before</em> any request enters the <c>ResilienceHandler</c>, so the
+    /// exact same header is re-transmitted on every retry attempt, and it covers the
+    /// chat-completions path, the /responses path and retries with one single placement. Without it
+    /// the Copilot API treats the request as third-party-app traffic (see
+    /// <see cref="CopilotIntegrationId"/>).
+    /// </para>
+    /// <para>
+    /// The write is guarded by a <see cref="HttpHeaders.Contains(string)"/> check so exactly one
+    /// value ever exists on the client, no matter how often this runs for a client.
+    /// </para>
+    /// </remarks>
+    private static HttpClient CreateCopilotHttpClient(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
+        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+    {
+        ArgumentNullException.ThrowIfNull(terminalHandler);
+
+        var httpClient = new HttpClient(CreateCopilotHandlerChain(
+            useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay))
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        // Identify this integration to the Copilot API: without the header, requests count as
+        // third-party-app traffic — a fine-grained PAT is rejected with 400 ("Personal Access
+        // Tokens are not supported for this endpoint") and a custom GitHub OAuth app token only
+        // sees a reduced model catalog. Guarded so exactly one value ever exists.
+        if (!httpClient.DefaultRequestHeaders.Contains("Copilot-Integration-Id"))
+            httpClient.DefaultRequestHeaders.Add("Copilot-Integration-Id", CopilotIntegrationId);
+
+        return httpClient;
+    }
+
+    /// <summary>
     /// Shared construction core for the Copilot provider: builds the <see cref="HttpClient"/> over
     /// the production handler chain, lets <paramref name="clientFactory"/> build the inner
     /// <see cref="IChatClient"/> over it, and wraps the result in an
@@ -649,11 +713,8 @@ public static class ChatClientFactory
         ArgumentNullException.ThrowIfNull(terminalHandler);
         ArgumentNullException.ThrowIfNull(clientFactory);
 
-        var httpClient = new HttpClient(CreateCopilotHandlerChain(
-            useResponsesApi, extraHighMapping, terminalHandler))
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
+        var httpClient = CreateCopilotHttpClient(
+            useResponsesApi, extraHighMapping, terminalHandler, out _);
 
         try
         {
@@ -839,7 +900,9 @@ public static class ChatClientFactory
     /// <summary>
     /// Test seam: builds an <see cref="HttpClient"/> over the FULL production Copilot handler
     /// chain (resilience → Copilot handler → reasoning-effort mapping) but with an injectable
-    /// terminal handler, so the chain can be exercised without any network access.
+    /// terminal handler, so the chain can be exercised without any network access. The client is
+    /// built by the very same helper production uses, so it carries the identical
+    /// <c>Copilot-Integration-Id</c> default header.
     /// </summary>
     /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
     /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
@@ -860,15 +923,8 @@ public static class ChatClientFactory
     internal static HttpClient CreateCopilotClientForTest(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
         out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
-    {
-        ArgumentNullException.ThrowIfNull(terminalHandler);
-        var chain = CreateCopilotHandlerChain(
+        => CreateCopilotHttpClient(
             useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay);
-        return new HttpClient(chain)
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
-    }
 
     /// <summary>
     /// Test seam: builds the FULL production Ollama client stack —

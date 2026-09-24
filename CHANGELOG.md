@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.20.2] — 2026-09-24
+
+### Fixed
+
+- Copilot provider requests now send `Copilot-Integration-Id: copilot-developer-cli` on every request and every retry attempt.
+- Without the header, the GitHub Copilot API treats requests as third-party-app traffic: fine-grained PATs are rejected with 400 ("Personal Access Tokens are not supported for this endpoint") and custom GitHub OAuth app tokens receive a reduced model catalog.
+
 ## [0.20.1] — 2026-09-10 UTC
 
 ### Fixed
