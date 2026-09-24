@@ -15,6 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New public API on `ChatClientFactory`: `GetCopilotApiEndpointAsync(string token, CancellationToken)` and `DefaultCopilotApiEndpoint`.
 - GitHub Enterprise (`*.ghe.com`) is not supported.
 
+### Fixed
+
+- SharpCoder.Providers package now includes a package README.
+
 ## [0.20.2] — 2026-09-24
 
 ### Fixed
