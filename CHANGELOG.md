@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.21.0] — 2026-09-24
+
+### Added
+
+- Copilot endpoint discovery: provider requests are routed to the per-account API endpoint GitHub advertises (`endpoints.api` from `GET https://api.github.com/copilot_internal/user`), instead of always using the hardcoded `https://api.githubcopilot.com`.
+- Trust rule: a discovered endpoint is accepted only if it is an absolute HTTPS URI with no userinfo, the default port, and host exactly `githubcopilot.com` or ending in `.githubcopilot.com` (case-insensitive), normalized to scheme+authority only. Anything else quietly falls back to the default host.
+- Quiet fallback on any failure: non-2xx responses, timeouts (~5 seconds, no retries), network errors, invalid JSON, missing or non-string fields, and untrusted URIs all fall back to the default endpoint.
+- Caching semantics: one cached entry keyed by a SHA-256 hash of the token (the raw token is never stored or logged); the fallback result is cached too; no time-based expiry (a process restart or token change refreshes the lookup); concurrent callers with the same token share a single in-flight lookup.
+- New public API on `ChatClientFactory`: `GetCopilotApiEndpointAsync(string token, CancellationToken)` and `DefaultCopilotApiEndpoint`.
+- GitHub Enterprise (`*.ghe.com`) is not supported.
+
+### Fixed
+
+- SharpCoder.Providers package now includes a package README.
+
 ## [0.20.2] — 2026-09-24
 
 ### Fixed

@@ -21,6 +21,8 @@ SharpCoder gives any `IChatClient` (OpenAI, Ollama, Azure, Anthropic, etc.) the 
 
 ## Quick Start
 
+GitHub Copilot provider requests use the per-account API endpoint advertised by GitHub when it can be discovered; if the lookup fails or the endpoint is untrusted, requests quietly fall back to `https://api.githubcopilot.com`. GitHub Enterprise (`*.ghe.com`) endpoints are not supported.
+
 ```bash
 dotnet add package SharpCoder
 ```

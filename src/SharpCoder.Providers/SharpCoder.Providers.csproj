@@ -16,9 +16,11 @@
     <RepositoryUrl>https://github.com/robkaandorp/SharpCoder</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
+    <None Update="README.md" Pack="true" PackagePath="\" />
     <InternalsVisibleTo Include="SharpCoder.Providers.Tests" />
     <InternalsVisibleTo Include="CopilotHive.Tests" />
   </ItemGroup>
