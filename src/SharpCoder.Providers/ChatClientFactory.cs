@@ -82,6 +82,50 @@ public static class ChatClientFactory
     }
 
     /// <summary>
+    /// The Copilot API host used when no per-account endpoint is discovered:
+    /// <c>https://api.githubcopilot.com</c>.
+    /// </summary>
+    /// <remarks>
+    /// This is both the endpoint every Copilot request used before endpoint discovery existed and
+    /// the fallback every discovery failure degrades to, so it is also the endpoint the OpenAI SDK
+    /// is configured with — the requests that are actually sent are rewritten by
+    /// <see cref="CopilotEndpointHandler"/> when an account endpoint is known.
+    /// </remarks>
+    public static Uri DefaultCopilotApiEndpoint { get; } = new("https://api.githubcopilot.com");
+
+    /// <summary>
+    /// Resolves the API endpoint to send Copilot requests for <paramref name="token"/> to: the
+    /// per-account endpoint GitHub advertises, or <see cref="DefaultCopilotApiEndpoint"/>.
+    /// </summary>
+    /// <param name="token">
+    /// The GitHub token whose account endpoint is looked up. A null, empty or whitespace token
+    /// resolves to the default endpoint without any network access.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels <b>this caller's await</b> only: the shared lookup underneath is not linked to it, so
+    /// one caller cancelling neither cancels the lookup other callers are awaiting nor poisons the
+    /// cached result.
+    /// </param>
+    /// <returns>
+    /// The resolved endpoint, or <see cref="DefaultCopilotApiEndpoint"/> when the lookup fails in any
+    /// way — non-2xx, timeout, network error, invalid JSON, a missing or non-string
+    /// <c>endpoints.api</c>, or an untrusted value. Never <see langword="null"/>.
+    /// </returns>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled.
+    /// </exception>
+    /// <remarks>
+    /// GitHub advertises a seat-specific host in
+    /// <c>GET https://api.github.com/copilot_internal/user</c> (e.g.
+    /// <c>https://api.business.githubcopilot.com</c> for a Copilot Business seat) and GitHub's own
+    /// CLI targets it directly. This lookup is optional hardening and therefore never fails
+    /// visibly; see <see cref="CopilotEndpointDiscovery"/> for the trust rule and the caching
+    /// contract.
+    /// </remarks>
+    public static Task<Uri> GetCopilotApiEndpointAsync(string token, CancellationToken cancellationToken = default)
+        => CopilotEndpointDiscovery.GetEndpointAsync(token, cancellationToken);
+
+    /// <summary>
     /// Reports whether a non-whitespace Copilot token is available, using the same precedence as
     /// the Copilot client factory: stored OAuth token (via <see cref="SetTokenProvider"/>) →
     /// <c>GH_TOKEN</c> → <c>GITHUB_TOKEN</c>, with whitespace treated as absent at every level.
@@ -608,6 +652,21 @@ public static class ChatClientFactory
     internal const string CopilotIntegrationId = "copilot-developer-cli";
 
     private static IChatClient CreateCopilotClient(string model)
+        => CreateCopilotClient(model, terminalHandler: null);
+
+    /// <summary>
+    /// Builds the production Copilot client: resolves the token, selects the /responses branch,
+    /// wires the token's per-account endpoint discovery into the transport chain, and hands back the
+    /// owned SDK client. <b>No network I/O happens here</b> — endpoint discovery is lazy, performed
+    /// by the chain on the first request.
+    /// </summary>
+    /// <param name="model">The Copilot model, which also selects the /responses branch.</param>
+    /// <param name="terminalHandler">
+    /// Overrides the innermost transport handler. <see langword="null"/> — the production path taken
+    /// by <see cref="Create"/> — means a real <see cref="HttpClientHandler"/>; a test can pass a fake
+    /// so the whole production wiring (token → discovery → transmitted URI) is exercised offline.
+    /// </param>
+    private static IChatClient CreateCopilotClient(string model, HttpMessageHandler? terminalHandler)
     {
         var ghToken = ResolveCopilotToken();
         if (ghToken is null) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
@@ -619,14 +678,18 @@ public static class ChatClientFactory
         // does not dispose an injected transport (mirroring the Ollama ownership rationale), so
         // without it the resilience/mapping handler chain and its sockets would leak.
         return CreateCopilotClientCore(
-            useResponsesApi, CopilotExtraHighMapping, new HttpClientHandler(),
+            useResponsesApi, CopilotExtraHighMapping, terminalHandler ?? new HttpClientHandler(),
             httpClient =>
             {
                 var openAiClient = new OpenAIClient(
                     new ApiKeyCredential(ghToken),
                     new OpenAIClientOptions
                     {
-                        Endpoint = new Uri("https://api.githubcopilot.com"),
+                        // The endpoint every Copilot request used before per-account discovery
+                        // existed, and the fallback every discovery failure degrades to. Requests
+                        // are redirected to the account's endpoint by CopilotEndpointHandler when
+                        // one is discovered; the SDK's own configuration stays untouched.
+                        Endpoint = DefaultCopilotApiEndpoint,
                         Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
                         NetworkTimeout = TimeSpan.FromMinutes(30)
                     }
@@ -635,19 +698,39 @@ public static class ChatClientFactory
                 return useResponsesApi
                     ? openAiClient.GetResponsesClient().AsIChatClient(model)
                     : openAiClient.GetChatClient(model).AsIChatClient();
-            });
+            },
+            endpointToken: ghToken);
     }
 
     /// <summary>
+    /// Test seam: the production Copilot client path exactly as <see cref="Create"/> takes it —
+    /// token resolution, branch selection and per-account endpoint discovery wiring included — but
+    /// over <paramref name="terminalHandler"/> instead of the real transport, so the whole production
+    /// wiring can be exercised offline.
+    /// </summary>
+    /// <param name="model">The Copilot model to build the client for.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    internal static IChatClient CreateCopilotClientForTest(string model, HttpMessageHandler terminalHandler)
+        => CreateCopilotClient(model, terminalHandler);
+
+    /// <summary>
     /// Builds the Copilot-owned <see cref="HttpClient"/> over the FULL production handler chain
-    /// (resilience → Copilot handler → reasoning-effort mapping → <paramref name="terminalHandler"/>)
-    /// and stamps it with the <c>Copilot-Integration-Id</c> header.
+    /// (resilience → Copilot handler → reasoning-effort mapping → [endpoint handler →]
+    /// <paramref name="terminalHandler"/>) and stamps it with the <c>Copilot-Integration-Id</c>
+    /// header.
     /// </summary>
     /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
     /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
     /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
     /// <param name="copilotHandler">The Copilot handler instance inside the chain.</param>
     /// <param name="retryDelay">Optional retry-delay override so retry tests run fast.</param>
+    /// <param name="endpointToken">
+    /// Optional token enabling per-account endpoint discovery: when non-<see langword="null"/>, a
+    /// <see cref="CopilotEndpointHandler"/> for that token is inserted immediately above
+    /// <paramref name="terminalHandler"/>, so every request — and every resilience retry attempt —
+    /// is sent to the discovered endpoint. <see langword="null"/> (the test seams' default) means no
+    /// endpoint resolution at all.
+    /// </param>
     /// <remarks>
     /// <para>
     /// <b>One construction point.</b> Both the production
@@ -670,12 +753,12 @@ public static class ChatClientFactory
     /// </remarks>
     private static HttpClient CreateCopilotHttpClient(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
-        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null, string? endpointToken = null)
     {
         ArgumentNullException.ThrowIfNull(terminalHandler);
 
         var httpClient = new HttpClient(CreateCopilotHandlerChain(
-            useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay))
+            useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay, endpointToken))
         {
             Timeout = Timeout.InfiniteTimeSpan
         };
@@ -701,6 +784,10 @@ public static class ChatClientFactory
     /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
     /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
     /// <param name="clientFactory">Builds the inner client over the constructed <see cref="HttpClient"/>.</param>
+    /// <param name="endpointToken">
+    /// The token whose per-account endpoint every request is sent to, or <see langword="null"/> to
+    /// skip endpoint resolution entirely — see <see cref="CreateCopilotHttpClient"/>.
+    /// </param>
     /// <remarks>
     /// On any construction failure (factory throw or null result) the <see cref="HttpClient"/> is
     /// disposed best-effort — without masking the original exception — before the failure rethrows,
@@ -708,13 +795,13 @@ public static class ChatClientFactory
     /// </remarks>
     private static IChatClient CreateCopilotClientCore(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
-        Func<HttpClient, IChatClient> clientFactory)
+        Func<HttpClient, IChatClient> clientFactory, string? endpointToken = null)
     {
         ArgumentNullException.ThrowIfNull(terminalHandler);
         ArgumentNullException.ThrowIfNull(clientFactory);
 
         var httpClient = CreateCopilotHttpClient(
-            useResponsesApi, extraHighMapping, terminalHandler, out _);
+            useResponsesApi, extraHighMapping, terminalHandler, out _, endpointToken: endpointToken);
 
         try
         {
@@ -865,13 +952,16 @@ public static class ChatClientFactory
     /// <summary>
     /// Builds the outbound handler chain used for the Copilot provider:
     /// <c>ResilienceHandler → CopilotResponsesHandler/CopilotChoiceMergingHandler →
-    /// ReasoningEffortMappingHandler → terminalHandler</c>.
+    /// ReasoningEffortMappingHandler → [CopilotEndpointHandler →] terminalHandler</c>.
     /// </summary>
     /// <remarks>
     /// Order matters: the Copilot handler rewrites the request body first (tool-call argument
     /// fix-ups / responses-API input reconstruction), then the mapping handler translates
-    /// <c>extra_high</c> into the provider spelling on the final body, then the terminal handler
-    /// transmits it.
+    /// <c>extra_high</c> into the provider spelling on the final body, then the endpoint handler
+    /// (when <paramref name="endpointToken"/> is given) points the request at the token's discovered
+    /// endpoint, and the terminal handler transmits it. The endpoint handler sits <b>beneath</b> the
+    /// resilience handler on purpose: Polly re-sends the same request instance per attempt, so every
+    /// retry passes through it and reaches the same resolved host.
     /// </remarks>
     private static HttpMessageHandler CreateCopilotHandlerChain(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler)
@@ -881,20 +971,32 @@ public static class ChatClientFactory
     /// Builds the Copilot chain and also hands back the Copilot handler instance, so tests can
     /// assert on its accumulated conversation state.
     /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
+    /// <param name="copilotHandler">The Copilot handler instance inside the chain.</param>
+    /// <param name="retryDelay">Optional retry-delay override so retry tests run fast.</param>
+    /// <param name="endpointToken">
+    /// Optional token enabling per-account endpoint discovery; see
+    /// <see cref="CreateCopilotHttpClient"/>. <see langword="null"/> inserts no endpoint handler.
+    /// </param>
     private static HttpMessageHandler CreateCopilotHandlerChain(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
-        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null, string? endpointToken = null)
     {
         copilotHandler = useResponsesApi
             ? new CopilotResponsesHandler()
             : new CopilotChoiceMergingHandler();
 
-        return CreateResilientHandler(
-            BuildHandlerChain(
-                copilotHandler,
-                new ReasoningEffortMappingHandler(extraHighMapping),
-                terminalHandler),
-            retryDelay);
+        // Built as one flat list, so BuildHandlerChain links each handler to its successor exactly
+        // once. The endpoint handler (only when a token is given) goes directly above the terminal
+        // handler: it must see the fully rewritten body and must be re-entered on every resilience
+        // retry attempt, which is why it sits beneath the ResilienceHandler.
+        HttpMessageHandler[] handlers = endpointToken is null
+            ? [copilotHandler, new ReasoningEffortMappingHandler(extraHighMapping), terminalHandler]
+            : [copilotHandler, new ReasoningEffortMappingHandler(extraHighMapping), new CopilotEndpointHandler(endpointToken), terminalHandler];
+
+        return CreateResilientHandler(BuildHandlerChain(handlers), retryDelay);
     }
 
     /// <summary>
@@ -925,6 +1027,24 @@ public static class ChatClientFactory
         out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
         => CreateCopilotHttpClient(
             useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay);
+
+    /// <summary>
+    /// Test seam: like <see cref="CreateCopilotClientForTest(bool, string, HttpMessageHandler)"/>,
+    /// but with a token whose per-account endpoint resolution is inserted exactly as production
+    /// does, so requests can be driven through the REAL chain (endpoint handler included) into an
+    /// injectable terminal handler.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    /// <param name="endpointToken">The token whose endpoint discovery is wired into the chain.</param>
+    /// <param name="copilotHandler">The Copilot handler instance inside the chain.</param>
+    /// <param name="retryDelay">Optional retry-delay override so retry tests run fast.</param>
+    internal static HttpClient CreateCopilotClientForTestWithEndpoint(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
+        string endpointToken, out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+        => CreateCopilotHttpClient(
+            useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay, endpointToken);
 
     /// <summary>
     /// Test seam: builds the FULL production Ollama client stack —
