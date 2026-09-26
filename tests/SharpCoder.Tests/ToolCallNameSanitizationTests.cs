@@ -522,4 +522,209 @@ public class ToolCallNameSanitizationTests
         Assert.Equal("invalid_tool_name", call.Name);
         Assert.Equal("call_empty", call.CallId);
     }
+
+    // ---------------------------------------------------------------------
+    // Trailing-newline boundary (the `$`-anchor hole the validator fix closed)
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void IsValidToolCallName_TrailingNewline_IsInvalid()
+    {
+        // In .NET, `$` also matches immediately before a final '\n', so the old
+        // regex-based validator accepted "good\n". The strict check must not.
+        Assert.False(CodingAgent.IsValidToolCallName("good\n"));
+        Assert.False(CodingAgent.IsValidToolCallName("functions_bad_name\n"));
+    }
+
+    [Fact]
+    public void IsValidToolCallName_LeadingNewlineAndEmbeddedWhitespace_AreInvalid()
+    {
+        // The old `$` anchor only forgave a trailing newline; a strict per-character
+        // check must reject newline anywhere, plus other whitespace.
+        Assert.False(CodingAgent.IsValidToolCallName("\ngood"));
+        Assert.False(CodingAgent.IsValidToolCallName("go\nod"));
+        Assert.False(CodingAgent.IsValidToolCallName("has space"));
+        Assert.False(CodingAgent.IsValidToolCallName("tab\there"));
+    }
+
+    [Fact]
+    public void IsValidToolCallName_63ValidCharsPlusNewline_IsInvalid()
+    {
+        // 63 valid characters + a trailing newline = 64 characters total: the length
+        // bound alone would accept it, so the newline must be caught per character.
+        var name = new string('a', 63) + "\n";
+        Assert.Equal(64, name.Length);
+        Assert.False(CodingAgent.IsValidToolCallName(name));
+    }
+
+    [Fact]
+    public void IsValidToolCallName_64ValidCharsPlusNewline_IsInvalid()
+    {
+        // 64 valid characters + a trailing newline = 65 characters total: the old
+        // regex accepted it (anchor before the newline, 64 "valid" chars matched),
+        // but the length bound alone must also reject it. Both defenses apply.
+        var name = new string('a', 64) + "\n";
+        Assert.Equal(65, name.Length);
+        Assert.False(CodingAgent.IsValidToolCallName(name));
+    }
+
+    [Fact]
+    public void IsValidToolCallName_64ValidChars_IsValidBoundary()
+    {
+        // Control: exactly 64 valid characters is still valid — proves the rejection
+        // above comes from the newline/length, not an off-by-one in the bound.
+        var name = new string('a', 64);
+        Assert.Equal(64, name.Length);
+        Assert.True(CodingAgent.IsValidToolCallName(name));
+    }
+
+    [Theory]
+    [InlineData("good\n", "good_")]
+    [InlineData("functions_bad_name\n", "functions_bad_name_")]
+    [InlineData("\n", "_")]
+    [InlineData("bad\nname", "bad_name")]
+    public void SanitizeToolCallName_TrailingNewline_BecomesUnderscore(string original, string expected)
+    {
+        var sanitized = CodingAgent.SanitizeToolCallName(original);
+        Assert.Equal(expected, sanitized);
+        // Every mapped name must itself satisfy the strict validator.
+        Assert.True(CodingAgent.IsValidToolCallName(sanitized),
+            $"Sanitized name '{ShowName(sanitized)}' must satisfy IsValidToolCallName");
+    }
+
+    [Fact]
+    public void SanitizeToolCallName_63ValidCharsPlusNewline_CutsTo64Valid()
+    {
+        // 63 valid chars + newline: after replacement it is 64 characters of valid
+        // characters ("a…a_"), so the 64-cap is exactly what keeps it usable.
+        var name = new string('a', 63) + "\n";
+        var sanitized = CodingAgent.SanitizeToolCallName(name);
+        Assert.Equal(64, sanitized.Length);
+        Assert.Equal(new string('a', 63) + "_", sanitized);
+        Assert.True(CodingAgent.IsValidToolCallName(sanitized));
+    }
+
+    [Fact]
+    public void SanitizeOutboundToolCallNames_TrailingNewline_RewritesMessageStrictly()
+    {
+        var call = new FunctionCallContent("call_nl", "good\n",
+            new Dictionary<string, object?> { ["x"] = "1" });
+        var resultContent = new FunctionResultContent("call_nl", "Unknown tool: good\n");
+        var original = new ChatMessage(ChatRole.Assistant,
+            [new TextContent("calling"), call, resultContent])
+        {
+            AuthorName = "model",
+            MessageId = "msg-nl",
+        };
+        var user = new ChatMessage(ChatRole.User, "hi");
+        var messages = new List<ChatMessage> { user, original };
+
+        var result = CodingAgent.SanitizeOutboundToolCallNames(messages);
+
+        Assert.Equal(2, result.Count);
+        Assert.Same(user, result[0]);
+
+        var rewritten = result[1];
+        Assert.NotSame(original, rewritten);
+        Assert.Equal(original.Role, rewritten.Role);
+        Assert.Equal(original.AuthorName, rewritten.AuthorName);
+        Assert.Equal(original.MessageId, rewritten.MessageId);
+        Assert.Null(rewritten.RawRepresentation);
+
+        var contents = rewritten.Contents.ToList();
+        Assert.Equal(3, contents.Count);
+        Assert.Same(original.Contents.ElementAt(0), contents[0]);
+
+        var newCall = Assert.IsType<FunctionCallContent>(contents[1]);
+        Assert.Equal("good_", newCall.Name);
+        Assert.Equal("call_nl", newCall.CallId);
+        Assert.Null(newCall.RawRepresentation);
+        // Strict oracle: the rewritten name must satisfy the per-character check.
+        Assert.True(IsStrictlyValidName(newCall.Name));
+
+        // The result content is untouched (same instance, same call id).
+        Assert.Same(resultContent, contents[2]);
+
+        // The original message object is untouched.
+        var originalCall = Assert.IsType<FunctionCallContent>(original.Contents.ElementAt(1));
+        Assert.Equal("good\n", originalCall.Name);
+    }
+
+    [Fact]
+    public async Task Sanitize_PersistedTrailingNewlineName_DefaultStreamingPath_RepairsStrictly()
+    {
+        var client = new RecordingTextClient();
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("newline-session");
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "do the thing"));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+            [new FunctionCallContent(
+                "call_nl", "functions_bad_name\n",
+                new Dictionary<string, object?> { ["x"] = "1" })]));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("call_nl", "Unknown tool: functions_bad_name\n")]));
+        var ct = TestContext.Current.CancellationToken;
+
+        await foreach (var _ in agent.ExecuteStreamingAsync(session, "continue", ct)) { }
+
+        Assert.Single(client.ReceivedMessages);
+        var sent = client.ReceivedMessages[0];
+
+        var call = FindCall(sent);
+        Assert.NotNull(call);
+        Assert.Equal("functions_bad_name_", call!.Name);
+        Assert.Equal("call_nl", call.CallId);
+        Assert.True(IsStrictlyValidName(call.Name));
+
+        var result = FindResult(sent);
+        Assert.NotNull(result);
+        Assert.Equal("call_nl", result!.CallId);
+        Assert.Equal("Unknown tool: functions_bad_name\n", result.Result?.ToString());
+
+        // Strict oracle over every received name: no trailing-newline name may pass.
+        AssertNoInvalidNames(client.ReceivedMessages);
+
+        // Stored history keeps the ORIGINAL (newline-bearing) name.
+        var historyCall = FindCall(session.MessageHistory);
+        Assert.NotNull(historyCall);
+        Assert.Equal("functions_bad_name\n", historyCall!.Name);
+    }
+
+    [Fact]
+    public async Task Sanitize_PersistedTrailingNewlineName_NonStreaming_RepairsStrictly()
+    {
+        var client = new RecordingTextClient();
+        var agent = new CodingAgent(client, MinimalOptions());
+        var session = AgentSession.Create("newline-session-nostream");
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "do the thing"));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+            [new FunctionCallContent(
+                "call_nl", "functions_bad_name\n",
+                new Dictionary<string, object?> { ["x"] = "1" })]));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Tool,
+            [new FunctionResultContent("call_nl", "Unknown tool: functions_bad_name\n")]));
+        var ct = TestContext.Current.CancellationToken;
+
+        await agent.ExecuteAsync(session, "continue", ct);
+
+        Assert.True(client.ReceivedMessages.Count >= 1);
+        var sent = client.ReceivedMessages[0];
+
+        var call = FindCall(sent);
+        Assert.NotNull(call);
+        Assert.Equal("functions_bad_name_", call!.Name);
+        Assert.Equal("call_nl", call.CallId);
+        Assert.True(IsStrictlyValidName(call.Name));
+
+        var result = FindResult(sent);
+        Assert.NotNull(result);
+        Assert.Equal("call_nl", result!.CallId);
+        Assert.Equal("Unknown tool: functions_bad_name\n", result.Result?.ToString());
+
+        AssertNoInvalidNames(client.ReceivedMessages);
+
+        var historyCall = FindCall(session.MessageHistory);
+        Assert.NotNull(historyCall);
+        Assert.Equal("functions_bad_name\n", historyCall!.Name);
+    }
 }
