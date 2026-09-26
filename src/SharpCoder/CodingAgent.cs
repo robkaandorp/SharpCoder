@@ -1048,8 +1048,9 @@ public sealed class CodingAgent : IAsyncDisposable
         => ToolCallNameSanitizingChatClient.SanitizeToolName(name);
 
     /// <summary>
-    /// Test seam: true when <paramref name="name"/> already matches <c>^[a-zA-Z0-9_-]{1,64}$</c>.
-    /// Null and empty names are NOT valid.
+    /// Test seam: true when <paramref name="name"/> is a provider-accepted tool-call name —
+    /// 1-64 characters, every one from <c>[a-zA-Z0-9_-]</c>. Null and empty names are NOT valid,
+    /// and neither is a name with a trailing newline (the check is strict end-of-string).
     /// </summary>
     internal static bool IsValidToolCallName(string? name)
         => ToolCallNameSanitizingChatClient.IsValidToolName(name);
@@ -1082,9 +1083,6 @@ public sealed class CodingAgent : IAsyncDisposable
     /// </summary>
     private sealed class ToolCallNameSanitizingChatClient : DelegatingChatClient
     {
-        /// <summary>The provider-side name pattern: 1-64 characters from <c>[a-zA-Z0-9_-]</c>.</summary>
-        private static readonly Regex ValidToolName = new Regex("^[a-zA-Z0-9_-]{1,64}$", RegexOptions.Compiled);
-
         private static readonly Regex InvalidToolNameChars = new Regex("[^a-zA-Z0-9_-]", RegexOptions.Compiled);
 
         /// <summary>Fallback used when the model produced no name at all.</summary>
@@ -1096,11 +1094,37 @@ public sealed class CodingAgent : IAsyncDisposable
         public ToolCallNameSanitizingChatClient(IChatClient inner) : base(inner) { }
 
         /// <summary>
-        /// True when <paramref name="name"/> is a valid provider-side tool-call name.
-        /// Null and empty names are NOT valid.
+        /// True when <paramref name="name"/> is a valid provider-side tool-call name: 1-64 characters,
+        /// every one from <c>[a-zA-Z0-9_-]</c>. Null and empty names are NOT valid.
+        /// <para>
+        /// This checks every character explicitly instead of using the regex
+        /// <c>^[a-zA-Z0-9_-]{1,64}$</c>. In .NET, <c>$</c> also matches immediately before a final
+        /// <c>'\n'</c>, so that regex accepts <c>"good\n"</c> (and even a 64-valid-character name
+        /// followed by a newline, whose 65-character total length must be rejected). Providers reject
+        /// such names, which is exactly what this guard exists to prevent, so neither <c>$</c> nor
+        /// <c>\Z</c> is used; <c>\z</c> would work but a character check cannot regress to anchor
+        /// semantics at all.
+        /// </para>
         /// </summary>
         internal static bool IsValidToolName(string? name)
-            => name != null && ValidToolName.IsMatch(name);
+        {
+            if (name is null || name.Length == 0 || name.Length > MaxToolNameLength) return false;
+
+            foreach (var c in name)
+            {
+                if (!IsValidToolNameChar(c)) return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>True for the characters providers accept in a tool-call name.</summary>
+        private static bool IsValidToolNameChar(char c)
+            => (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '_'
+            || c == '-';
 
         /// <summary>
         /// Maps an arbitrary model-produced name onto a provider-accepted one, in this order:

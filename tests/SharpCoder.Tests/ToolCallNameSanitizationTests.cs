@@ -1,5 +1,4 @@
 using System.Runtime.CompilerServices;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.AI;
 using SharpCoder;
 
@@ -12,7 +11,37 @@ namespace SharpCoder.Tests;
 /// </summary>
 public class ToolCallNameSanitizationTests
 {
-    private static readonly Regex ValidNamePattern = new("^[a-zA-Z0-9_-]{1,64}$");
+    /// <summary>
+    /// Strict oracle: 1-64 characters, every one from <c>[a-zA-Z0-9_-]</c>.
+    /// <para>
+    /// Checked character by character rather than with <c>^[a-zA-Z0-9_-]{1,64}$</c>, because in
+    /// .NET <c>$</c> also matches immediately before a final <c>'\n'</c> — that permissive anchor
+    /// would happily accept <c>"functions_bad_name\n"</c> and hide exactly the regression this
+    /// oracle exists to catch.
+    /// </para>
+    /// </summary>
+    private static bool IsStrictlyValidName(string? name)
+    {
+        if (name is null || name.Length == 0 || name.Length > 64) return false;
+
+        foreach (var c in name)
+        {
+            var ok = (c >= 'a' && c <= 'z')
+                     || (c >= 'A' && c <= 'Z')
+                     || (c >= '0' && c <= '9')
+                     || c == '_'
+                     || c == '-';
+            if (!ok) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Renders a name so whitespace is visible in assertion messages.</summary>
+    private static string ShowName(string? name)
+        => name is null
+            ? "<null>"
+            : name.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
 
     /// <summary>
     /// Recording fake: captures every request on both the streaming and non-streaming
@@ -136,8 +165,8 @@ public class ToolCallNameSanitizationTests
             foreach (var call in round.SelectMany(m => m.Contents).OfType<FunctionCallContent>())
             {
                 Assert.True(
-                    ValidNamePattern.IsMatch(call.Name ?? string.Empty),
-                    $"Received function-call name '{call.Name}' does not match ^[a-zA-Z0-9_-]{{1,64}}$");
+                    IsStrictlyValidName(call.Name),
+                    $"Received function-call name '{ShowName(call.Name)}' is not 1-64 characters of [a-zA-Z0-9_-]");
             }
         }
     }
