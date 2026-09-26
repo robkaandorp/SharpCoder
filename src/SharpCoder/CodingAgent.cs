@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
@@ -19,6 +20,15 @@ public sealed class CodingAgent : IAsyncDisposable
     private int _disposed;
 
     private readonly IChatClient _client;
+
+    /// <summary>
+    /// <see cref="_client"/> wrapped in <see cref="ToolCallNameSanitizingChatClient"/>. Every
+    /// model request must go through this instance, while <see cref="_client"/> stays the raw
+    /// client so callers that need the original (sub-agent manager, context compactor, tests)
+    /// keep seeing exactly what was injected.
+    /// </summary>
+    private readonly IChatClient _sanitizingClient;
+
     private readonly AgentOptions _options;
     private readonly ILogger _logger;
     private readonly ContextCompactor _compactor;
@@ -136,6 +146,7 @@ public sealed class CodingAgent : IAsyncDisposable
     public CodingAgent(IChatClient client, AgentOptions options)
     {
         _client = client;
+        _sanitizingClient = new ToolCallNameSanitizingChatClient(client);
         _options = options;
         _logger = options.Logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         _compactor = new ContextCompactor(options.CompactionClient ?? client, _logger);
@@ -454,11 +465,13 @@ public sealed class CodingAgent : IAsyncDisposable
 
         while (steps <= _options.MaxSteps)
         {
-            // Stream one round from the raw client (no FunctionInvokingChatClient)
+            // Stream one round from the raw client (no FunctionInvokingChatClient),
+            // still passing through the outbound tool-call name sanitizer so a
+            // malformed name in the request never reaches the provider.
             var streamUpdates = new List<ChatResponseUpdate>();
             Exception? streamError = null;
 
-            var enumerator = _client.GetStreamingResponseAsync(messages, chatOptions, ct)
+            var enumerator = _sanitizingClient.GetStreamingResponseAsync(messages, chatOptions, ct)
                 .GetAsyncEnumerator(ct);
             try
             {
@@ -740,7 +753,10 @@ public sealed class CodingAgent : IAsyncDisposable
 
     private (IChatClient Wrapped, UsageCapturingChatClient Capture) BuildWrappedClientWithCapture()
     {
-        var capture = new UsageCapturingChatClient(_client);
+        // Chain order: FunctionInvokingChatClient → UsageCapturingChatClient → sanitizer → raw client.
+        // The sanitizer must sit BELOW function invocation so tool dispatch (and its not-found
+        // handling) still sees the name the model actually produced.
+        var capture = new UsageCapturingChatClient(_sanitizingClient);
         var wrapped = new ChatClientBuilder(capture)
             .UseFunctionInvocation(configure: fic =>
             {
@@ -1021,6 +1037,169 @@ public sealed class CodingAgent : IAsyncDisposable
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Test seam: maps an arbitrary model-produced tool-call name onto a provider-accepted one.
+    /// Null/empty becomes <c>invalid_tool_name</c>, every character outside <c>[a-zA-Z0-9_-]</c>
+    /// becomes <c>'_'</c>, and the result is cut to 64 characters.
+    /// </summary>
+    internal static string SanitizeToolCallName(string? name)
+        => ToolCallNameSanitizingChatClient.SanitizeToolName(name);
+
+    /// <summary>
+    /// Test seam: true when <paramref name="name"/> already matches <c>^[a-zA-Z0-9_-]{1,64}$</c>.
+    /// Null and empty names are NOT valid.
+    /// </summary>
+    internal static bool IsValidToolCallName(string? name)
+        => ToolCallNameSanitizingChatClient.IsValidToolName(name);
+
+    /// <summary>
+    /// Test seam: applies the outbound tool-call name sanitizer to a message sequence. Messages
+    /// with only valid names are returned as the same instances, and the input sequence is never
+    /// mutated.
+    /// </summary>
+    internal static IReadOnlyList<ChatMessage> SanitizeOutboundToolCallNames(IEnumerable<ChatMessage> messages)
+        => ToolCallNameSanitizingChatClient.SanitizeMessages(messages).ToList();
+
+    /// <summary>
+    /// Outbound guard that repairs tool-call names that providers reject. A model can emit a
+    /// <see cref="FunctionCallContent"/> whose <see cref="FunctionCallContent.Name"/> contains
+    /// characters outside <c>[a-zA-Z0-9_-]</c> (for example <c>functions.x</c> or
+    /// <c>multi_tool_use.parallel</c>). OpenAI/Copilot and Anthropic reject any request whose
+    /// history contains such a name with <c>HTTP 400 invalid_request_body</c>, which fails the
+    /// rest of the run and every later resume of a saved session.
+    /// <para>
+    /// The name is repaired on the way OUT only: the stored conversation (and therefore
+    /// <see cref="AgentSession.MessageHistory"/>) keeps the name the model really produced, and
+    /// sessions that were already saved are repaired as well. Call ids are never touched, so
+    /// every <see cref="FunctionResultContent"/> still matches its call.
+    /// </para>
+    /// <para>
+    /// Because this wrapper sits below function invocation, tool dispatch still sees the raw
+    /// name; only the bytes sent to the provider are repaired.
+    /// </para>
+    /// </summary>
+    private sealed class ToolCallNameSanitizingChatClient : DelegatingChatClient
+    {
+        /// <summary>The provider-side name pattern: 1-64 characters from <c>[a-zA-Z0-9_-]</c>.</summary>
+        private static readonly Regex ValidToolName = new Regex("^[a-zA-Z0-9_-]{1,64}$", RegexOptions.Compiled);
+
+        private static readonly Regex InvalidToolNameChars = new Regex("[^a-zA-Z0-9_-]", RegexOptions.Compiled);
+
+        /// <summary>Fallback used when the model produced no name at all.</summary>
+        internal const string FallbackToolName = "invalid_tool_name";
+
+        /// <summary>Maximum provider-accepted tool-call name length.</summary>
+        internal const int MaxToolNameLength = 64;
+
+        public ToolCallNameSanitizingChatClient(IChatClient inner) : base(inner) { }
+
+        /// <summary>
+        /// True when <paramref name="name"/> is a valid provider-side tool-call name.
+        /// Null and empty names are NOT valid.
+        /// </summary>
+        internal static bool IsValidToolName(string? name)
+            => name != null && ValidToolName.IsMatch(name);
+
+        /// <summary>
+        /// Maps an arbitrary model-produced name onto a provider-accepted one, in this order:
+        /// (a) null/empty becomes <see cref="FallbackToolName"/>; (b) every character outside
+        /// <c>[a-zA-Z0-9_-]</c> becomes <c>'_'</c>; (c) the result is cut to 64 characters.
+        /// </summary>
+        internal static string SanitizeToolName(string? name)
+        {
+            if (string.IsNullOrEmpty(name)) return FallbackToolName;
+
+            var replaced = InvalidToolNameChars.Replace(name, "_");
+            return replaced.Length <= MaxToolNameLength
+                ? replaced
+                : replaced.Substring(0, MaxToolNameLength);
+        }
+
+        /// <summary>
+        /// Returns a list safe to hand to the inner client. Messages whose function-call names are
+        /// all valid are passed through as the SAME instances; otherwise a new sequence of messages
+        /// is produced with the invalid calls rewritten. The input sequence, its message objects and
+        /// <see cref="AgentSession.MessageHistory"/> are never mutated.
+        /// </summary>
+        internal static IEnumerable<ChatMessage> SanitizeMessages(IEnumerable<ChatMessage> messages)
+        {
+            var rewritten = new List<ChatMessage>();
+            bool anyRewritten = false;
+
+            foreach (var message in messages)
+            {
+                var hasInvalidCall = false;
+                foreach (var content in message.Contents)
+                {
+                    if (content is FunctionCallContent call && !IsValidToolName(call.Name))
+                    {
+                        hasInvalidCall = true;
+                        break;
+                    }
+                }
+
+                if (!hasInvalidCall)
+                {
+                    rewritten.Add(message);
+                    continue;
+                }
+
+                anyRewritten = true;
+                rewritten.Add(RewriteMessage(message));
+            }
+
+            return anyRewritten ? rewritten : messages;
+        }
+
+        /// <summary>
+        /// Builds a copy of <paramref name="message"/> with every invalid function-call name
+        /// repaired. Role, <see cref="ChatMessage.AuthorName"/>, <see cref="ChatMessage.MessageId"/>
+        /// and all other contents (in order) are preserved. RawRepresentation is deliberately NOT
+        /// copied onto the new message or the new function-call content: the OpenAI adapter honors
+        /// raw representations, and forwarding them would re-send the original bad name.
+        /// </summary>
+        private static ChatMessage RewriteMessage(ChatMessage message)
+        {
+            var contents = new List<AIContent>(message.Contents.Count);
+            foreach (var content in message.Contents)
+            {
+                if (content is FunctionCallContent call && !IsValidToolName(call.Name))
+                {
+                    // Same call id so the paired FunctionResultContent still matches; the
+                    // arguments dictionary is shared (this type never mutates it either).
+                    contents.Add(new FunctionCallContent(call.CallId, SanitizeToolName(call.Name), call.Arguments));
+                }
+                else
+                {
+                    contents.Add(content);
+                }
+            }
+
+            var copy = new ChatMessage(message.Role, contents)
+            {
+                AuthorName = message.AuthorName,
+                MessageId = message.MessageId
+            };
+            return copy;
+        }
+
+        public override Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, CancellationToken ct = default)
+            => InnerClient.GetResponseAsync(SanitizeMessages(messages), chatOptions, ct);
+
+        public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions,
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await foreach (var update in InnerClient
+                .GetStreamingResponseAsync(SanitizeMessages(messages), chatOptions, ct)
+                .WithCancellation(ct))
+            {
+                yield return update;
+            }
+        }
     }
 
     private sealed class UsageCapturingChatClient : DelegatingChatClient
