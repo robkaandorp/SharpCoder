@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.21.1] — 2026-09-26
+
+### Fixed
+
+- Outbound tool-call names are sanitized before model requests, preventing invalid names in live or persisted conversation history from causing provider HTTP 400 errors while preserving the original names in session history and for tool dispatch.
+
 ## [0.21.0] — 2026-09-24
 
 ### Added
