@@ -105,6 +105,29 @@ public sealed class AgentOptions
     public ILogger Logger { get; set; } = NullLogger.Instance;
 
     /// <summary>
+    /// Optional callback invoked exactly once for every model call the agent records, as soon as
+    /// that call ends — however it ends (a completed response, a failure, or a stream disposed
+    /// early; a call that reported no usage arrives with zero tokens). Use it to report usage live.
+    /// <para>
+    /// Events arrive from every source SharpCoder produces today: agent-loop rounds
+    /// (<see cref="UsageSource.Agent"/>) and context-compaction summary calls
+    /// (<see cref="UsageSource.Compaction"/>) — including compaction a host triggers directly
+    /// through <see cref="ContextCompactor.ForceCompactAsync"/>, <see cref="ContextCompactor.CompactOldestPercentAsync"/>
+    /// or <see cref="ContextCompactor.CompactIfNeededAsync(AgentSession, AgentOptions, CancellationToken)"/>,
+    /// and every chunk of chunked summarisation. Sub-agent usage
+    /// (<see cref="UsageSource.SubAgent"/> and <see cref="UsageSource.SubAgentCompaction"/>) is
+    /// declared in <see cref="UsageSource"/> but is not produced yet; forwarding it is the
+    /// follow-up goal sharpcoder-subagent-usage-forwarding, so in this version
+    /// <see cref="UsageEvent.SubAgentId"/> is always <c>null</c>.
+    /// </para>
+    /// <para>
+    /// The callback is invoked outside any internal lock, and an exception it throws is caught and
+    /// logged: it can never fail or otherwise alter the run.
+    /// </para>
+    /// </summary>
+    public Action<UsageEvent>? OnUsage { get; set; }
+
+    /// <summary>
     /// Optional reasoning effort level for models that support extended thinking.
     /// When set, the model will adjust its reasoning depth accordingly.
     /// When <c>null</c>, no reasoning configuration is sent (provider default).

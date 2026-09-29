@@ -26,11 +26,28 @@ public sealed class AgentSession
     /// <summary>Total tool calls across all turns in this session.</summary>
     public int TotalToolCalls { get; set; }
 
-    /// <summary>Cumulative input tokens used across all turns.</summary>
+    /// <summary>
+    /// Cumulative input tokens used across all turns.
+    /// Increases by the input tokens of every recorded model call (including calls that reported no
+    /// usage, which contribute zero), so it is the sum over calls — never the last round's value.
+    /// </summary>
     public long InputTokensUsed { get; set; }
 
-    /// <summary>Cumulative output tokens used across all turns.</summary>
+    /// <summary>
+    /// Cumulative output tokens used across all turns.
+    /// Increases by the output tokens of every recorded model call (including calls that reported no
+    /// usage, which contribute zero), so it is the sum over calls — never the last round's value.
+    /// </summary>
     public long OutputTokensUsed { get; set; }
+
+    /// <summary>
+    /// Cumulative per-call usage of this session, grouped by source and model, over every recorded
+    /// model call. Updated as each call ends, so a host polling the session mid-run sees current
+    /// totals. Persisted by <see cref="SaveAsync"/> and restored by <see cref="LoadAsync"/>; session
+    /// files written before this property existed load with an empty summary; <see cref="Fork"/>
+    /// resets it, like the token counters.
+    /// </summary>
+    public UsageSummary Usage { get; set; } = new UsageSummary();
 
     /// <summary>When this session was created.</summary>
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -101,7 +118,8 @@ public sealed class AgentSession
             CreatedAt = CreatedAt,
             LastActivityAt = LastActivityAt,
             Messages = MessageHistory,
-            LastKnownContextTokens = LastKnownContextTokens
+            LastKnownContextTokens = LastKnownContextTokens,
+            Usage = Usage.Snapshot()
         };
 
         var json = JsonSerializer.Serialize(data, SerializerOptions);
@@ -127,7 +145,10 @@ public sealed class AgentSession
             OutputTokensUsed = data.OutputTokensUsed,
             CreatedAt = data.CreatedAt,
             LastActivityAt = data.LastActivityAt,
-            LastKnownContextTokens = data.LastKnownContextTokens
+            LastKnownContextTokens = data.LastKnownContextTokens,
+            // Session files written before Usage existed have no such field: they load with an
+            // empty summary (their stored token counters are preserved above).
+            Usage = data.Usage is null ? new UsageSummary() : new UsageSummary(data.Usage.Entries)
         };
     }
 
@@ -142,9 +163,9 @@ public sealed class AgentSession
 
     /// <summary>
     /// Creates a deep copy of this session with a new session ID, zeroed token counters,
-    /// and fresh timestamps. The message history is deep-copied via JSON serialization so
-    /// mutations to either session's history do not affect the other.
-    /// <c>LastKnownContextTokens</c> is copied from the original.
+    /// a reset <see cref="Usage"/> summary, and fresh timestamps. The message history is
+    /// deep-copied via JSON serialization so mutations to either session's history do not affect
+    /// the other. <c>LastKnownContextTokens</c> is copied from the original.
     /// </summary>
     /// <param name="sessionId">Optional custom session ID for the forked session. If null, a new GUID is generated.</param>
     /// <returns>A new <see cref="AgentSession"/> branched from the current state.</returns>
@@ -164,6 +185,7 @@ public sealed class AgentSession
             TotalToolCalls = 0,
             InputTokensUsed = 0,
             OutputTokensUsed = 0,
+            Usage = new UsageSummary(),
             LastKnownContextTokens = LastKnownContextTokens,
             CreatedAt = now,
             LastActivityAt = now
@@ -213,5 +235,11 @@ public sealed class AgentSession
         public DateTimeOffset CreatedAt { get; set; }
         public DateTimeOffset LastActivityAt { get; set; }
         public long LastKnownContextTokens { get; set; }
+
+        /// <summary>
+        /// Cumulative per-call usage. Absent (<c>null</c>) in session files written before the
+        /// field existed; such files load with an empty summary.
+        /// </summary>
+        public UsageSummary? Usage { get; set; }
     }
 }

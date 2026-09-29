@@ -229,16 +229,21 @@ public sealed class CodingAgent : IAsyncDisposable
             throw new ObjectDisposedException(nameof(CodingAgent));
         _logger.LogInformation("Starting coding agent task in {Dir}", _options.WorkDirectory);
 
-        // Auto-compact before building messages if session is large
+        // Execution-local recording: created before anything can call a model, so the usage of this
+        // execution can never mix with a concurrent execution on the same agent.
+        var recorder = new UsageRecorder(_options, session, _logger);
+
+        // Auto-compact before building messages if session is large. The compaction's summary
+        // call is recorded into this execution's summary (UsageSource.Compaction).
         if (session != null)
         {
-            await _compactor.CompactIfNeededAsync(session, _options, ct);
+            await _compactor.CompactIfNeededAsync(session, _options, recorder, ct);
         }
 
         var chatOptions = BuildChatOptions(ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
-        var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
+        var (wrappedClient, recordingClient) = BuildWrappedClientWithRecord(recorder);
 
         var messages = BuildMessages(session, userMessage, images);
 
@@ -260,13 +265,14 @@ public sealed class CodingAgent : IAsyncDisposable
             }
 
             if (session != null)
-                session.LastKnownContextTokens = captureClient.LastRoundInputTokens
+                session.LastKnownContextTokens = recordingClient.LastRoundInputTokens
                     ?? response.Usage?.InputTokenCount ?? session.LastKnownContextTokens;
 
-            // Update session with new messages and usage
+            // Update session with new messages. Cumulative token counters and session.Usage were
+            // already updated by the recorder as each model call ended.
             if (session != null)
             {
-                UpdateSession(session, userMessage, images, response, captureClient);
+                UpdateSession(session, userMessage, images, response, recordingClient);
             }
 
             if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -274,11 +280,11 @@ public sealed class CodingAgent : IAsyncDisposable
                 _logger.LogWarning(
                     "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
                     _options.MaxSteps, toolCalls);
-                return BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics);
+                return BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics, recorder);
             }
 
             _logger.LogInformation("Task complete ({ToolCalls} tool calls).", toolCalls);
-            return BuildResult("Success", finalText, response, toolCalls, diagnostics);
+            return BuildResult("Success", finalText, response, toolCalls, diagnostics, recorder);
         }
         catch (OperationCanceledException)
         {
@@ -287,7 +293,13 @@ public sealed class CodingAgent : IAsyncDisposable
         catch (ArgumentOutOfRangeException ex)
         {
             _logger.LogError(ex, "SDK ArgumentOutOfRangeException — likely a malformed LLM response. Messages sent: {Count}", messages.Count);
-            return new AgentResult { Status = "Error", Message = $"SDK error (malformed LLM response): {ex.Message}", Diagnostics = diagnostics };
+            return new AgentResult
+            {
+                Status = "Error",
+                Message = $"SDK error (malformed LLM response): {ex.Message}",
+                Diagnostics = diagnostics,
+                TokenUsage = recorder.Summary.Snapshot()
+            };
         }
         catch (HttpRequestException)
         {
@@ -296,7 +308,13 @@ public sealed class CodingAgent : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Agent execution failed.");
-            return new AgentResult { Status = "Error", Message = ex.Message, Diagnostics = diagnostics };
+            return new AgentResult
+            {
+                Status = "Error",
+                Message = ex.Message,
+                Diagnostics = diagnostics,
+                TokenUsage = recorder.Summary.Snapshot()
+            };
         }
     }
 
@@ -327,16 +345,21 @@ public sealed class CodingAgent : IAsyncDisposable
             throw new ObjectDisposedException(nameof(CodingAgent));
         _logger.LogInformation("Starting streaming coding agent task in {Dir}", _options.WorkDirectory);
 
+        // Execution-local recording: created before anything can call a model, so the usage of this
+        // execution can never mix with a concurrent execution on the same agent.
+        var recorder = new UsageRecorder(_options, session, _logger);
+
         if (session != null)
         {
-            await _compactor.CompactIfNeededAsync(session, _options, ct);
+            // Compaction usage is recorded into this execution's summary (UsageSource.Compaction).
+            await _compactor.CompactIfNeededAsync(session, _options, recorder, ct);
         }
 
         // When ShowToolCallsInStream is enabled, handle the tool loop manually
         // so we can inject markdown-formatted tool call text at the right position.
         if (_options.ShowToolCallsInStream)
         {
-            await foreach (var update in StreamWithToolCallsAsync(session, userMessage, images, ct))
+            await foreach (var update in StreamWithToolCallsAsync(session, userMessage, images, recorder, ct))
                 yield return update;
             yield break;
         }
@@ -344,7 +367,7 @@ public sealed class CodingAgent : IAsyncDisposable
         var chatOptions = BuildChatOptions(ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
-        var (wrappedClient, captureClient) = BuildWrappedClientWithCapture();
+        var (wrappedClient, recordingClient) = BuildWrappedClientWithRecord(recorder);
         var messages = BuildMessages(session, userMessage, images);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
 
@@ -403,6 +426,7 @@ public sealed class CodingAgent : IAsyncDisposable
                 Status = "Error",
                 Message = streamError.Message,
                 Diagnostics = diagnostics,
+                TokenUsage = recorder.Summary.Snapshot(),
             });
             yield break;
         }
@@ -422,7 +446,7 @@ public sealed class CodingAgent : IAsyncDisposable
 
         if (session != null)
         {
-            UpdateSession(session, userMessage, images, response, captureClient);
+            UpdateSession(session, userMessage, images, response, recordingClient);
         }
 
         if (response.FinishReason == ChatFinishReason.ToolCalls)
@@ -431,24 +455,27 @@ public sealed class CodingAgent : IAsyncDisposable
                 "Agent reached MaxSteps limit ({MaxSteps}) with {ToolCalls} tool calls. Task may be incomplete.",
                 _options.MaxSteps, toolCalls);
             yield return StreamingUpdate.Completed(
-                BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics));
+                BuildResult("MaxStepsReached", finalText, response, toolCalls, diagnostics, recorder));
         }
         else
         {
             _logger.LogInformation("Streaming task complete ({ToolCalls} tool calls).", toolCalls);
             yield return StreamingUpdate.Completed(
-                BuildResult("Success", finalText, response, toolCalls, diagnostics));
+                BuildResult("Success", finalText, response, toolCalls, diagnostics, recorder));
         }
     }
 
     /// <summary>
     /// Streaming path that handles the tool invocation loop manually,
     /// injecting markdown-formatted tool call info into the text stream.
+    /// Every round (including one that fails with a context overflow and is retried) goes through a
+    /// recording client, so this execution records each round's usage exactly once.
     /// </summary>
     private async IAsyncEnumerable<StreamingUpdate> StreamWithToolCallsAsync(
         AgentSession? session,
         string userMessage,
         IReadOnlyList<ImageAttachment>? images,
+        UsageRecorder recorder,
         [EnumeratorCancellation] CancellationToken ct)
     {
         var chatOptions = BuildChatOptions(ct);
@@ -456,6 +483,11 @@ public sealed class CodingAgent : IAsyncDisposable
             throw new ObjectDisposedException(nameof(CodingAgent));
         var messages = BuildMessages(session, userMessage, images);
         var diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
+
+        // One recording wrapper for the whole execution: it records every round (all of them are
+        // Agent-source calls) while still passing through the outbound tool-call name sanitizer, so
+        // a malformed name in the request never reaches the provider.
+        var recordingClient = new UsageRecordingChatClient(_sanitizingClient, recorder);
 
         var allResponseMessages = new List<ChatMessage>();
         int totalToolCalls = 0;
@@ -465,13 +497,11 @@ public sealed class CodingAgent : IAsyncDisposable
 
         while (steps <= _options.MaxSteps)
         {
-            // Stream one round from the raw client (no FunctionInvokingChatClient),
-            // still passing through the outbound tool-call name sanitizer so a
-            // malformed name in the request never reaches the provider.
+            // Stream one round from the raw client (no FunctionInvokingChatClient).
             var streamUpdates = new List<ChatResponseUpdate>();
             Exception? streamError = null;
 
-            var enumerator = _sanitizingClient.GetStreamingResponseAsync(messages, chatOptions, ct)
+            var enumerator = recordingClient.GetStreamingResponseAsync(messages, chatOptions, ct)
                 .GetAsyncEnumerator(ct);
             try
             {
@@ -502,7 +532,7 @@ public sealed class CodingAgent : IAsyncDisposable
                 if (ContextCompactor.IsContextOverflowError(streamError))
                 {
                     _logger.LogWarning(streamError, "Context overflow — compacting and retrying");
-                    if (session != null && await _compactor.ForceCompactAsync(session, _options, ct))
+                    if (session != null && await _compactor.ForceCompactAsync(session, _options, recorder, ct))
                     {
                         messages = BuildMessages(session, userMessage, images); // rebuild from compacted session
                         continue; // retry the round
@@ -515,6 +545,7 @@ public sealed class CodingAgent : IAsyncDisposable
                     Status = "Error",
                     Message = streamError.Message,
                     Diagnostics = diagnostics,
+                    TokenUsage = recorder.Summary.Snapshot(),
                 });
                 yield break;
             }
@@ -524,8 +555,12 @@ public sealed class CodingAgent : IAsyncDisposable
             if (response.ModelId != null) lastModelId = response.ModelId;
             if (response.Usage != null) lastUsage = response.Usage;
 
-            if (session != null && response.Usage?.InputTokenCount != null)
-                session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
+            if (session != null)
+            {
+                var roundInputTokens = recordingClient.LastRoundInputTokens ?? response.Usage?.InputTokenCount;
+                if (roundInputTokens != null)
+                    session.LastKnownContextTokens = roundInputTokens.Value;
+            }
 
             // Track response messages for session
             foreach (var msg in response.Messages)
@@ -596,8 +631,10 @@ public sealed class CodingAgent : IAsyncDisposable
                 allResponseMessages.Add(resultMessage);
             }
 
-            // Mid-loop compaction: check before next API call
-            await _compactor.CompactIfNeededAsync(session, messages, _options, ct);
+            // Mid-loop compaction: check before next API call. Its summary calls are recorded
+            // into this execution's summary (UsageSource.Compaction); with a null session the
+            // recorder reports them to OnUsage only.
+            await _compactor.CompactIfNeededAsync(session, messages, _options, recorder, ct);
         }
 
         // Update session from the authoritative messages list.
@@ -610,11 +647,8 @@ public sealed class CodingAgent : IAsyncDisposable
 
             session.TotalToolCalls += totalToolCalls;
             session.LastActivityAt = DateTimeOffset.UtcNow;
-            if (lastUsage != null)
-            {
-                session.InputTokensUsed += lastUsage.InputTokenCount ?? 0;
-                session.OutputTokensUsed += lastUsage.OutputTokenCount ?? 0;
-            }
+            // Cumulative token counters and session.Usage were already updated by the recorder as
+            // each round ended; no usage is added here any more (that would double-count).
         }
 
         // Build final text from all assistant text messages
@@ -643,6 +677,7 @@ public sealed class CodingAgent : IAsyncDisposable
             ModelId = lastModelId,
             FinishReason = steps >= _options.MaxSteps ? ChatFinishReason.ToolCalls : ChatFinishReason.Stop,
             Usage = lastUsage,
+            TokenUsage = recorder.Summary.Snapshot(),
             ToolCallCount = totalToolCalls,
             Diagnostics = diagnostics,
         });
@@ -749,22 +784,25 @@ public sealed class CodingAgent : IAsyncDisposable
         return chatOptions;
     }
 
-    private IChatClient BuildWrappedClient() => BuildWrappedClientWithCapture().Wrapped;
-
-    private (IChatClient Wrapped, UsageCapturingChatClient Capture) BuildWrappedClientWithCapture()
+    /// <summary>
+    /// Builds the per-execution client chain: FunctionInvokingChatClient → recording client →
+    /// sanitizer → raw client. The recording client sits above the raw client so every model call
+    /// (each internal tool-call round trip included) is recorded exactly once, and it also exposes
+    /// the latest round's input token count for <see cref="AgentSession.LastKnownContextTokens"/>.
+    /// The sanitizer must sit BELOW function invocation so tool dispatch (and its not-found
+    /// handling) still sees the name the model actually produced.
+    /// </summary>
+    private (IChatClient Wrapped, UsageRecordingChatClient Recording) BuildWrappedClientWithRecord(UsageRecorder recorder)
     {
-        // Chain order: FunctionInvokingChatClient → UsageCapturingChatClient → sanitizer → raw client.
-        // The sanitizer must sit BELOW function invocation so tool dispatch (and its not-found
-        // handling) still sees the name the model actually produced.
-        var capture = new UsageCapturingChatClient(_sanitizingClient);
-        var wrapped = new ChatClientBuilder(capture)
+        var recording = new UsageRecordingChatClient(_sanitizingClient, recorder);
+        var wrapped = new ChatClientBuilder(recording)
             .UseFunctionInvocation(configure: fic =>
             {
                 fic.MaximumIterationsPerRequest = _options.MaxSteps;
                 fic.IncludeDetailedErrors = true;
             })
             .Build();
-        return (wrapped, capture);
+        return (wrapped, recording);
     }
 
     private List<ChatMessage> BuildMessages(AgentSession? session, string userMessage, IReadOnlyList<ImageAttachment>? images = null)
@@ -804,7 +842,7 @@ public sealed class CodingAgent : IAsyncDisposable
     }
 
     private void UpdateSession(AgentSession session, string userMessage, IReadOnlyList<ImageAttachment>? images,
-        ChatResponse response, UsageCapturingChatClient? captureClient = null)
+        ChatResponse response, UsageRecordingChatClient? recordingClient = null)
     {
         // Append the user message and all response messages to the existing history.
         // response.Messages contains assistant responses (and tool call/result messages
@@ -819,15 +857,12 @@ public sealed class CodingAgent : IAsyncDisposable
         session.TotalToolCalls += AgentResult.CountToolCalls(response.Messages);
         session.LastActivityAt = DateTimeOffset.UtcNow;
 
-        // Track token usage
-        if (response.Usage != null)
-        {
-            session.InputTokensUsed += response.Usage.InputTokenCount ?? 0;
-            session.OutputTokensUsed += response.Usage.OutputTokenCount ?? 0;
-        }
+        // Cumulative token counters (InputTokensUsed/OutputTokensUsed) and session.Usage were
+        // already updated as each model call ended by the execution's UsageRecorder; adding them
+        // here as well would double-count.
 
-        if (captureClient?.LastRoundInputTokens != null)
-            session.LastKnownContextTokens = captureClient.LastRoundInputTokens.Value;
+        if (recordingClient?.LastRoundInputTokens != null)
+            session.LastKnownContextTokens = recordingClient.LastRoundInputTokens.Value;
         else if (response.Usage?.InputTokenCount != null)
             session.LastKnownContextTokens = response.Usage.InputTokenCount.Value;
 
@@ -836,7 +871,8 @@ public sealed class CodingAgent : IAsyncDisposable
             session.SessionId, session.MessageHistory.Count, session.EstimatedContextTokens, session.TotalToolCalls);
     }
 
-    private static AgentResult BuildResult(string status, string message, ChatResponse response, int toolCalls, SessionDiagnostics? diagnostics = null)
+    private static AgentResult BuildResult(string status, string message, ChatResponse response, int toolCalls,
+        SessionDiagnostics? diagnostics, UsageRecorder recorder)
     {
         return new AgentResult
         {
@@ -846,6 +882,7 @@ public sealed class CodingAgent : IAsyncDisposable
             ModelId = response.ModelId,
             FinishReason = response.FinishReason,
             Usage = response.Usage,
+            TokenUsage = recorder.Summary.Snapshot(),
             ToolCallCount = toolCalls,
             Diagnostics = diagnostics,
         };
@@ -1223,38 +1260,6 @@ public sealed class CodingAgent : IAsyncDisposable
             {
                 yield return update;
             }
-        }
-    }
-
-    private sealed class UsageCapturingChatClient : DelegatingChatClient
-    {
-        public long? LastRoundInputTokens { get; private set; }
-
-        public UsageCapturingChatClient(IChatClient inner) : base(inner) { }
-
-        public override async Task<ChatResponse> GetResponseAsync(
-            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, CancellationToken ct = default)
-        {
-            var response = await InnerClient.GetResponseAsync(messages, chatOptions, ct);
-            LastRoundInputTokens = response.Usage?.InputTokenCount;
-            return response;
-        }
-
-        public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-            IEnumerable<ChatMessage> messages, ChatOptions? chatOptions,
-            [EnumeratorCancellation] CancellationToken ct = default)
-        {
-            long? captured = null;
-            await foreach (var update in InnerClient.GetStreamingResponseAsync(messages, chatOptions, ct)
-                .WithCancellation(ct))
-            {
-                if (update.Contents.OfType<UsageContent>().FirstOrDefault()?.Details is { } details)
-                {
-                    captured = details.InputTokenCount;
-                }
-                yield return update;
-            }
-            LastRoundInputTokens = captured;
         }
     }
 }
