@@ -5,9 +5,13 @@ using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
+/// <summary>Contains the outcome, response content, usage, and diagnostics for an agent execution.</summary>
 public sealed class AgentResult
 {
+    /// <summary>Execution outcome: <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>.</summary>
     public string Status { get; set; } = string.Empty;
+
+    /// <summary>Final assistant text, or an error message when <see cref="Status"/> is <c>Error</c>.</summary>
     public string Message { get; set; } = string.Empty;
 
     /// <summary>

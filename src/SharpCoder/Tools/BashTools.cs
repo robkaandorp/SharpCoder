@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SharpCoder.Tools;
 
+/// <summary>Runs commands in fresh shell processes and captures their standard output and error.</summary>
 public sealed class BashTools
 {
     /// <summary>
@@ -26,11 +27,21 @@ public sealed class BashTools
     private readonly string? _shellPathOverride;
     private readonly Func<string, string>? _shellArgsFormat;
 
+    /// <summary>Creates shell tools using the platform's default shell.</summary>
+    /// <param name="workingDirectory">Working directory for each command process.</param>
+    /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Defaults to 120000; values less than or equal to zero also use 120000.</param>
+    /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
     public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null)
         : this(workingDirectory, timeoutMs, logger, null, null)
     {
     }
 
+    /// <summary>Creates shell tools with an optional executable and argument formatter override.</summary>
+    /// <param name="workingDirectory">Working directory for each command process.</param>
+    /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Values less than or equal to zero use 120000.</param>
+    /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
+    /// <param name="shellPathOverride">Optional shell executable path; when omitted, the platform default is used.</param>
+    /// <param name="shellArgsFormat">Optional formatter that turns the command into the shell's argument string. When omitted with an override, bash-style <c>-c</c> arguments are used.</param>
     public BashTools(
         string workingDirectory,
         int timeoutMs,

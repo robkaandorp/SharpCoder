@@ -15,6 +15,7 @@ using SharpCoder.Tools;
 
 namespace SharpCoder;
 
+/// <summary>Runs model-backed coding tasks with configured tools, sessions, streaming, and context management.</summary>
 public sealed class CodingAgent : IAsyncDisposable
 {
     private int _disposed;
@@ -143,6 +144,9 @@ public sealed class CodingAgent : IAsyncDisposable
         }
     }
 
+    /// <summary>Creates an agent using the supplied model client and options.</summary>
+    /// <param name="client">The chat client used for agent responses.</param>
+    /// <param name="options">Tool, prompt, and context-management configuration for the agent.</param>
     public CodingAgent(IChatClient client, AgentOptions options)
     {
         _client = client;

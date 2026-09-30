@@ -19,6 +19,9 @@ public sealed class ContextCompactor
     private readonly IChatClient _client;
     private readonly ILogger _logger;
 
+    /// <summary>Creates a compactor that uses the specified chat client for summaries.</summary>
+    /// <param name="client">The chat client used to generate summaries.</param>
+    /// <param name="logger">Optional logger for compaction diagnostics; when <see langword="null"/>, logging is disabled.</param>
     public ContextCompactor(IChatClient client, ILogger? logger = null)
     {
         _client = client;
@@ -191,7 +194,7 @@ public sealed class ContextCompactor
 
     /// <summary>
     /// Compacts the oldest <paramref name="percent"/> percent of the non-system message history,
-    /// preserving the remaining recent messages verbatim. Unlike <see cref="ForceCompactAsync"/>,
+    /// preserving the remaining recent messages verbatim. Unlike <see cref="ForceCompactAsync(AgentSession, AgentOptions, CancellationToken)"/>,
     /// this method determines the split point by token-weighted percentage rather than by a fixed
     /// recent-message count. This is useful for callers (such as CopilotHive) that want to trim
     /// the oldest portion of the conversation without knowing the model's exact context budget.

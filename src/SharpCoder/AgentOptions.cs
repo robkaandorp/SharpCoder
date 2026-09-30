@@ -8,6 +8,7 @@ using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
+/// <summary>Configures the tools, prompts, model behavior, and context management for a <see cref="CodingAgent"/>.</summary>
 public sealed class AgentOptions
 {
     private string _workDirectory = Directory.GetCurrentDirectory();
@@ -31,6 +32,7 @@ public sealed class AgentOptions
         }
     }
 
+    /// <summary>Approximate tool-call budget; enforcement depends on the execution path. The streaming tool path checks the budget between model rounds but processes each round's full tool-call batch, so it can run beyond the configured value. Defaults to 25; reaching the path's limit returns a result with status <c>MaxStepsReached</c>.</summary>
     public int MaxSteps { get; set; } = 25;
 
     /// <summary>
@@ -64,16 +66,25 @@ public sealed class AgentOptions
     /// </summary>
     public Func<string, string>? BashShellArgsFormat { get; set; }
 
+    /// <summary>Registers tools for reading files and searching paths and contents. File paths are checked for lexical containment within <see cref="WorkDirectory"/>, but symlinks and reparse points are not resolved, so a workspace link can allow a read or search to reach a file outside the workspace. Defaults to <see langword="true"/>.</summary>
     public bool EnableFileOps { get; set; } = true;
+    /// <summary>Registers <c>write_file</c> and <c>edit_file</c> in addition to the read/search tools when <see cref="EnableFileOps"/> is enabled. Defaults to <see langword="true"/>.</summary>
     public bool EnableFileWrites { get; set; } = true;
+    /// <summary>Registers tools for listing and loading workspace skills from <c>.github/skills</c>. Defaults to <see langword="true"/>.</summary>
     public bool EnableSkills { get; set; } = true;
     
     // System Prompt settings
+    /// <summary>Replaces the built-in system prompt when non-empty; custom instructions and enabled workspace instructions are appended separately.</summary>
     public string? SystemPrompt { get; set; }
+
+    /// <summary>Optional instructions appended under a <c>Custom Instructions</c> heading in the system prompt.</summary>
     public string? CustomInstructions { get; set; }
+
+    /// <summary>When enabled (the default), appends workspace instruction files found under the work directory to the system prompt.</summary>
     public bool AutoLoadWorkspaceInstructions { get; set; } = true;
 
     // Tools
+    /// <summary>Additional model tools registered alongside the enabled built-in tools.</summary>
     public IList<AITool> CustomTools { get; set; } = new List<AITool>();
 
     // Context management
@@ -102,6 +113,7 @@ public sealed class AgentOptions
     /// </summary>
     public Action<CompactionResult>? OnCompacted { get; set; }
 
+    /// <summary>Logger used for agent, tool, and compaction diagnostics; defaults to <see cref="NullLogger.Instance"/>.</summary>
     public ILogger Logger { get; set; } = NullLogger.Instance;
 
     /// <summary>
@@ -112,7 +124,7 @@ public sealed class AgentOptions
     /// Events arrive from every source SharpCoder produces: agent-loop rounds
     /// (<see cref="UsageSource.Agent"/>) and context-compaction summary calls
     /// (<see cref="UsageSource.Compaction"/>) — including compaction a host triggers directly
-    /// through <see cref="ContextCompactor.ForceCompactAsync"/>, <see cref="ContextCompactor.CompactOldestPercentAsync"/>
+    /// through <see cref="ContextCompactor.ForceCompactAsync(AgentSession, AgentOptions, CancellationToken)"/>, <see cref="ContextCompactor.CompactOldestPercentAsync(AgentSession, AgentOptions, int, CancellationToken)"/>
     /// or <see cref="ContextCompactor.CompactIfNeededAsync(AgentSession, AgentOptions, CancellationToken)"/>,
     /// and every chunk of chunked summarisation — plus every model call a sub-agent makes, which is
     /// forwarded live by <see cref="SubAgentManager"/> as <see cref="UsageSource.SubAgent"/>, or as

@@ -1,4 +1,3 @@
-#pragma warning disable CS1591
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Http.Resilience;
@@ -46,7 +45,7 @@ public static class ChatClientFactory
     /// absent or whitespace.</returns>
     /// <remarks>
     /// This is the single shared resolver for the Copilot path: both
-    /// <see cref="CreateCopilotClient"/> and <see cref="IsTokenAvailable"/> consult it, so the
+    /// <see cref="CreateCopilotClient(string)"/> and <see cref="IsTokenAvailable"/> consult it, so the
     /// factory's token selection and the public availability report can never diverge.
     /// </remarks>
     internal static string? ResolveCopilotToken()
@@ -831,7 +830,7 @@ public static class ChatClientFactory
     /// <see cref="HttpClient"/> over the production handler chain (resilience → Copilot handler →
     /// reasoning-effort mapping with <see cref="CopilotExtraHighMapping"/>) with an injectable
     /// terminal handler and an injectable inner-client factory, exactly as the production
-    /// <see cref="CreateCopilotClient"/> does apart from the token/endpoint wiring. Has no token
+    /// <see cref="CreateCopilotClient(string, HttpMessageHandler?)"/> does apart from the token/endpoint wiring. Has no token
     /// dependency.
     /// </summary>
     /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
@@ -958,11 +957,14 @@ public static class ChatClientFactory
     /// Order matters: the Copilot handler rewrites the request body first (tool-call argument
     /// fix-ups / responses-API input reconstruction), then the mapping handler translates
     /// <c>extra_high</c> into the provider spelling on the final body, then the endpoint handler
-    /// (when <paramref name="endpointToken"/> is given) points the request at the token's discovered
+    /// (when an endpoint token is given) points the request at the token's discovered
     /// endpoint, and the terminal handler transmits it. The endpoint handler sits <b>beneath</b> the
     /// resilience handler on purpose: Polly re-sends the same request instance per attempt, so every
     /// retry passes through it and reaches the same resolved host.
     /// </remarks>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
     private static HttpMessageHandler CreateCopilotHandlerChain(
         bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler)
         => CreateCopilotHandlerChain(useResponsesApi, extraHighMapping, terminalHandler, out _);
