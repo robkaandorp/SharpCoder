@@ -61,7 +61,26 @@ public sealed class ContextCompactor
     /// with <see cref="UsageSource.Compaction"/> into <paramref name="session"/>'s cumulative usage
     /// and the host's <see cref="AgentOptions.OnUsage"/> callback.
     /// </para>
+    /// <para>
+    /// A single-call summarization failure is logged as a warning and gives <c>false</c>, leaving
+    /// the history unchanged. For chunked summarization, behavior depends on
+    /// <c>substituteNullSummary</c>: when <c>true</c>, a failed chunk is logged and its section is
+    /// replaced with the fallback text "No summary available for this section." before continuing;
+    /// the history may include that fallback. When <c>false</c>, a failed chunk gives <c>false</c>
+    /// without substituting a fallback.
+    /// </para>
     /// </summary>
+    /// <param name="session">The session whose history should be compacted.</param>
+    /// <param name="options">Agent options governing thresholds and callbacks.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if compaction was performed; otherwise <c>false</c>.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
+    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
+    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
+    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
+    /// summarization failure instead.
+    /// </exception>
     public Task<bool> CompactIfNeededAsync(
         AgentSession session,
         AgentOptions options,
@@ -122,6 +141,13 @@ public sealed class ContextCompactor
             session.LastKnownContextTokens = 0;
             return true;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation of this operation's own token is not a compaction failure:
+            // propagate it. History has not been mutated (mutation happens only after the
+            // summary call(s) complete), so the caller observes an unchanged session.
+            throw;
+        }
         catch (System.Exception ex)
         {
             _logger.LogWarning(ex, "Context compaction failed, continuing with full history");
@@ -176,10 +202,22 @@ public sealed class ContextCompactor
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// <c>true</c> if compaction succeeded; otherwise <c>false</c> when there are too few messages
-    /// to compact, summarization produced no content, or an exception occurred.
+    /// to compact, summarization produced no content, or summarization failed. A single-call
+    /// summarization failure is logged as a warning. For chunked summarization, behavior depends
+    /// on <c>substituteNullSummary</c>: when <c>false</c>, a failed chunk returns <c>false</c>
+    /// without logging or substituting a fallback; when <c>true</c>, the failed chunk is logged,
+    /// its section is replaced with the fallback text "No summary available for this section.",
+    /// and processing continues.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown when <paramref name="percent"/> is less than 1 or greater than 95.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
+    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
+    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
+    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
+    /// summarization failure instead.
     /// </exception>
     public Task<bool> CompactOldestPercentAsync(
         AgentSession session,
@@ -270,6 +308,13 @@ public sealed class ContextCompactor
             session.LastKnownContextTokens = 0;
             return true;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation of this operation's own token is not a compaction failure:
+            // propagate it. History has not been mutated (mutation happens only after the
+            // summary call(s) complete), so the caller observes an unchanged session.
+            throw;
+        }
         catch (System.Exception ex)
         {
             _logger.LogWarning(ex, "Oldest-percent context compaction failed, returning false");
@@ -303,9 +348,19 @@ public sealed class ContextCompactor
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// <c>true</c> if compaction succeeded (summarization returned content);
-    /// <c>false</c> if there was nothing to compact or summarization produced no content.
-    /// Exceptions from the summarization client are propagated to the caller.
+    /// <c>false</c> if there was nothing to compact, summarization produced no content, or
+    /// summarization failed. A single-call summarization exception is caught, logged as a warning,
+    /// and gives <c>false</c>; a failed chunked summarization call (with
+    /// <c>substituteNullSummary</c> set to <c>false</c>) is caught and gives <c>false</c> without
+    /// logging.
     /// </returns>
+    /// <exception cref="OperationCanceledException">
+    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
+    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
+    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
+    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
+    /// summarization failure instead.
+    /// </exception>
     public Task<bool> ForceCompactAsync(
         AgentSession session,
         AgentOptions options,
@@ -339,8 +394,10 @@ public sealed class ContextCompactor
 
         try
         {
-            // Exceptions from the summarization client are now caught and logged
-            // instead of propagating to the caller.
+            // Single-call summarization exceptions are caught and logged instead of
+            // propagating to the caller. A failed chunk returns false without logging;
+            // an OperationCanceledException while ct is cancelled is rethrown by the
+            // filtered catch below.
             var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
                 messages, startIndex, options.CompactionRetainRecent, options,
                 substituteNullSummary: false, ResolveRecorder(recorder, session, options), ct);
@@ -359,6 +416,13 @@ public sealed class ContextCompactor
 
             session.LastKnownContextTokens = 0;
             return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation of this operation's own token is not a compaction failure:
+            // propagate it. History has not been mutated (mutation happens only after the
+            // summary call(s) complete), so the caller observes an unchanged session.
+            throw;
         }
         catch (System.Exception ex)
         {
@@ -379,7 +443,23 @@ public sealed class ContextCompactor
     /// </param>
     /// <param name="options">Agent options governing thresholds and callbacks.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns><c>true</c> if compaction was performed; otherwise <c>false</c>.</returns>
+    /// <returns>
+    /// <c>true</c> if compaction was performed. For a single-call summarization failure, the
+    /// failure is logged as a warning and the method returns <c>false</c>. For chunked
+    /// summarization, behavior depends on <c>substituteNullSummary</c>: when <c>true</c>, a failed
+    /// chunk is logged, its section is replaced with the fallback text
+    /// "No summary available for this section.", and processing continues; the method may return
+    /// <c>true</c> with that fallback in the compacted history. When <c>false</c>, a failed chunk
+    /// returns <c>false</c> without substituting a fallback.
+    /// </returns>
+    /// <exception cref="OperationCanceledException">
+    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
+    /// flight). The history (both <paramref name="messages"/> and the session's) is left
+    /// unchanged and <see cref="AgentOptions.OnCompacted"/> is not invoked. An
+    /// <see cref="OperationCanceledException"/> raised by the summarization client while
+    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
+    /// summarization failure instead.
+    /// </exception>
     public Task<bool> CompactIfNeededAsync(
         AgentSession? session,
         IList<ChatMessage> messages,
@@ -490,6 +570,13 @@ public sealed class ContextCompactor
             if (session != null)
                 session.LastKnownContextTokens = 0;
             return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation of this operation's own token is not a compaction failure:
+            // propagate it. History has not been mutated (mutation happens only after the
+            // summary call(s) complete), so the caller observes an unchanged session.
+            throw;
         }
         catch (System.Exception ex)
         {
@@ -695,6 +782,14 @@ public sealed class ContextCompactor
 
                 var response = await recordingClient.GetResponseAsync(promptMessages, cancellationToken: ct);
                 raw = response.Text;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Caller cancellation stops the chunk loop immediately: no fallback text and
+                // no further chunk calls. A client-originated OperationCanceledException while
+                // ct is NOT cancelled (e.g. an HTTP timeout) still falls through to the
+                // failure handling below.
+                throw;
             }
             catch (System.Exception ex)
             {

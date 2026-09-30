@@ -996,4 +996,396 @@ public class CompactionUsageAccountingTests
         Assert.Equal(3_600, session.InputTokensUsed);
         Assert.Equal(70, session.OutputTokensUsed);
     }
+
+    // ========================================================================
+    // 9. Cancellation propagation: a cancelled caller token is not a failed compaction
+    // ========================================================================
+
+    /// <summary>
+    /// Scripted summarisation client for the cancellation tests. Calls before
+    /// <c>failOnCall</c> succeed with fixed usage. On call <c>failOnCall</c> it either cancels the
+    /// caller's token deterministically inside the call and then observes it
+    /// (<see cref="FailureMode.CancelCaller"/>), or throws a <see cref="TaskCanceledException"/>
+    /// WITHOUT touching the caller's token (<see cref="FailureMode.ClientTimeout"/>, the shape of an
+    /// HttpClient timeout). Later calls succeed again. No wall-clock timing is involved.
+    /// </summary>
+    private sealed class CancellingCompactionClient : IChatClient
+    {
+        internal enum FailureMode { CancelCaller, ClientTimeout }
+
+        private readonly CancellationTokenSource _callerCts;
+        private readonly int _failOnCall;
+        private readonly FailureMode _mode;
+        private int _calls;
+
+        internal CancellingCompactionClient(CancellationTokenSource callerCts, int failOnCall, FailureMode mode)
+        {
+            _callerCts = callerCts;
+            _failOnCall = failOnCall;
+            _mode = mode;
+        }
+
+        internal int CallCount => Volatile.Read(ref _calls);
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            var index = Interlocked.Increment(ref _calls) - 1;
+            if (index == _failOnCall)
+            {
+                if (_mode == FailureMode.CancelCaller)
+                {
+                    _callerCts.Cancel();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    // Fail loudly if the compactor did not pass the caller's token to the call.
+                    throw new InvalidOperationException("The summary call did not receive the caller's token.");
+                }
+
+                // Client-originated cancellation (e.g. an HTTP timeout) while the caller's token
+                // is NOT cancelled.
+                throw new TaskCanceledException("simulated client-side timeout");
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, $"Chunk summary {index}."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+                Usage = new UsageDetails { InputTokenCount = 10, OutputTokenCount = 1 }
+            });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException("Compaction never streams.");
+
+        public object? GetService(Type serviceType, object? serviceKey = null)
+            => serviceType == typeof(ChatClientMetadata)
+                ? new ChatClientMetadata("cancelling-fake", new Uri("https://example.invalid"), "compaction-model")
+                : null;
+
+        public void Dispose() { }
+    }
+
+    private static AgentSession ChunkableSession(string id, int messageCount = 12)
+    {
+        var session = AgentSession.Create(id);
+        for (var i = 0; i < messageCount; i++)
+        {
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Message-{i}: " + new string('x', 500)));
+        }
+
+        return session;
+    }
+
+    /// <summary>
+    /// Options whose tiny compaction budget (225 tokens) forces the chunked path: every ~127-token
+    /// message becomes its own chunk. The heuristic estimate (~1_500 tokens) exceeds the 500-token
+    /// auto-compaction threshold.
+    /// </summary>
+    private static AgentOptions ChunkedOptions() => new()
+    {
+        WorkDirectory = Path.GetTempPath(),
+        MaxContextTokens = 1_000,
+        CompactionMaxTokens = 300,
+        CompactionThreshold = 0.5,
+        CompactionRetainRecent = 2,
+        Logger = NullLogger.Instance
+    };
+
+    /// <summary>
+    /// Asserts the "no partial result" contract after a cancelled compaction: the same history
+    /// list instance holding the same message instances, no OnCompacted, unchanged exact token count.
+    /// </summary>
+    private static void AssertSessionUnchanged(
+        AgentSession session, IList<ChatMessage> originalList, ChatMessage[] originalMessages,
+        long originalLastKnown, int compactedCallbacks)
+    {
+        Assert.Same(originalList, session.MessageHistory);
+        Assert.Equal(originalMessages.Length, session.MessageHistory.Count);
+        for (var i = 0; i < originalMessages.Length; i++)
+            Assert.Same(originalMessages[i], session.MessageHistory[i]);
+        Assert.DoesNotContain(session.MessageHistory, m => (m.Text ?? string.Empty).Contains("[CONTEXT SUMMARY"));
+        Assert.Equal(0, compactedCallbacks);
+        Assert.Equal(originalLastKnown, session.LastKnownContextTokens);
+    }
+
+    /// <summary>
+    /// Runs one public compaction entry point whose single summary call cancels the caller's token,
+    /// and asserts propagation, the unchanged session, no OnCompacted, and exactly one recorded
+    /// Compaction call (via OnUsage and via session.Usage).
+    /// </summary>
+    private static async Task AssertCancelledDuringSummaryCall(
+        Func<ContextCompactor, AgentSession, AgentOptions, CancellationToken, Task> compact,
+        long lastKnownContextTokens)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = new CancellingCompactionClient(cts, failOnCall: 0, CancellingCompactionClient.FailureMode.CancelCaller);
+        var compactor = new ContextCompactor(client);
+        var session = LargeSession(12);
+        session.LastKnownContextTokens = lastKnownContextTokens;
+        var options = CompactionOptions();
+
+        var events = new List<UsageEvent>();
+        options.OnUsage = events.Add;
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var originalList = session.MessageHistory;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => compact(compactor, session, options, cts.Token));
+
+        Assert.Equal(1, client.CallCount);
+        AssertSessionUnchanged(session, originalList, originalMessages, lastKnownContextTokens, compactedCallbacks);
+
+        var recorded = Assert.Single(events);
+        Assert.Equal(UsageSource.Compaction, recorded.Source);
+        Assert.Equal(1, recorded.Usage.Calls);
+        var entry = SingleEntry(session.Usage, UsageSource.Compaction);
+        Assert.Equal(1, entry.Usage.Calls);
+        Assert.Equal(1, session.Usage.Total.Calls);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_CancelledDuringSummaryCall_ThrowsAndLeavesSessionUnchanged()
+        => await AssertCancelledDuringSummaryCall(
+            (compactor, session, options, ct) => compactor.CompactIfNeededAsync(session, options, ct),
+            lastKnownContextTokens: 90_000); // above the 80_000 threshold
+
+    [Fact]
+    public async Task CompactOldestPercentAsync_CancelledDuringSummaryCall_ThrowsAndLeavesSessionUnchanged()
+        => await AssertCancelledDuringSummaryCall(
+            (compactor, session, options, ct) => compactor.CompactOldestPercentAsync(session, options, 50, ct),
+            lastKnownContextTokens: 1_234);
+
+    [Fact]
+    public async Task ForceCompactAsync_CancelledDuringSummaryCall_ThrowsAndLeavesSessionUnchanged()
+        => await AssertCancelledDuringSummaryCall(
+            (compactor, session, options, ct) => compactor.ForceCompactAsync(session, options, ct),
+            lastKnownContextTokens: 1_234);
+
+    [Fact]
+    public async Task CompactIfNeededAsync_LiveMessagesWithSession_CancelledDuringSummaryCall_LeavesBothListsUnchanged()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = new CancellingCompactionClient(cts, failOnCall: 0, CancellingCompactionClient.FailureMode.CancelCaller);
+        var compactor = new ContextCompactor(client);
+        var session = LargeSession(12);
+        session.LastKnownContextTokens = 90_000; // above the 80_000 threshold
+        var options = CompactionOptions();
+
+        var liveMessages = new List<ChatMessage> { new ChatMessage(ChatRole.System, "system") };
+        liveMessages.AddRange(session.MessageHistory);
+        var originalLive = liveMessages.ToArray();
+
+        var events = new List<UsageEvent>();
+        options.OnUsage = events.Add;
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var originalList = session.MessageHistory;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => compactor.CompactIfNeededAsync(session, liveMessages, options, cts.Token));
+
+        Assert.Equal(1, client.CallCount);
+        AssertSessionUnchanged(session, originalList, originalMessages, 90_000, compactedCallbacks);
+
+        // The live list is untouched too: same length, same message instances in the same order.
+        Assert.Equal(originalLive.Length, liveMessages.Count);
+        for (var i = 0; i < originalLive.Length; i++)
+            Assert.Same(originalLive[i], liveMessages[i]);
+
+        var recorded = Assert.Single(events);
+        Assert.Equal(UsageSource.Compaction, recorded.Source);
+        Assert.Equal(1, recorded.Usage.Calls);
+        Assert.Equal(1, SingleEntry(session.Usage, UsageSource.Compaction).Usage.Calls);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_ChunkedAutoCompaction_CancelledOnSecondChunk_StopsWithoutFallback()
+    {
+        // substituteNullSummary: true path (auto-compaction). The first chunk call succeeds, the
+        // second cancels the caller's token: the loop must stop right there — no fallback text for
+        // the cancelled chunk and no third call.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = new CancellingCompactionClient(cts, failOnCall: 1, CancellingCompactionClient.FailureMode.CancelCaller);
+        var compactor = new ContextCompactor(client);
+        var session = ChunkableSession("chunked-cancel-session");
+        var options = ChunkedOptions();
+
+        var events = new List<UsageEvent>();
+        options.OnUsage = events.Add;
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var originalList = session.MessageHistory;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => compactor.CompactIfNeededAsync(session, options, cts.Token));
+
+        // Exactly two calls: the successful first chunk and the cancelled second one.
+        Assert.Equal(2, client.CallCount);
+        Assert.Equal(2, events.Count);
+        Assert.All(events, e => Assert.Equal(UsageSource.Compaction, e.Source));
+        var entry = SingleEntry(session.Usage, UsageSource.Compaction);
+        Assert.Equal(2, entry.Usage.Calls);
+        Assert.Equal(10, entry.Usage.InputTokens); // only the successful first chunk reported usage
+
+        AssertSessionUnchanged(session, originalList, originalMessages, 0, compactedCallbacks);
+    }
+
+    [Fact]
+    public async Task ForceCompactAsync_ClientCancellationWhileCallerTokenNotCancelled_ReturnsFalse()
+    {
+        // A TaskCanceledException from the client while the caller's token is NOT cancelled (an
+        // HttpClient timeout) is still a summarisation failure: logged, false, history unchanged.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = new CancellingCompactionClient(cts, failOnCall: 0, CancellingCompactionClient.FailureMode.ClientTimeout);
+        var compactor = new ContextCompactor(client);
+        var session = LargeSession(12);
+        var options = CompactionOptions();
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        var compacted = await compactor.ForceCompactAsync(session, options, cts.Token);
+
+        Assert.False(compacted);
+        Assert.False(cts.IsCancellationRequested);
+        Assert.Equal(1, client.CallCount);
+        Assert.Equal(0, compactedCallbacks);
+        Assert.Equal(originalMessages, session.MessageHistory);
+        Assert.Equal(1, SingleEntry(session.Usage, UsageSource.Compaction).Usage.Calls);
+    }
+
+    [Fact]
+    public async Task CompactIfNeededAsync_ChunkedClientCancellationWhileCallerTokenNotCancelled_UsesFallbackText()
+    {
+        // Same timeout shape inside the chunk loop on the substituteNullSummary: true path: the
+        // failing chunk gets the fallback text and the remaining chunks are still summarised.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = new CancellingCompactionClient(cts, failOnCall: 1, CancellingCompactionClient.FailureMode.ClientTimeout);
+        var compactor = new ContextCompactor(client);
+        var session = ChunkableSession("chunked-timeout-session");
+        var options = ChunkedOptions();
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var compacted = await compactor.CompactIfNeededAsync(session, options, cts.Token);
+
+        Assert.True(compacted);
+        Assert.False(cts.IsCancellationRequested);
+        Assert.True(client.CallCount > 2, $"Every chunk should still be summarised, got {client.CallCount} calls.");
+        Assert.Equal(1, compactedCallbacks);
+
+        var summary = session.MessageHistory[0].Text!;
+        Assert.Contains("[CONTEXT SUMMARY", summary);
+        Assert.Contains("Chunk summary 0.", summary);
+        Assert.Contains("Chunk summary 2.", summary);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(summary, "No summary available for this section\\."));
+        Assert.Equal(client.CallCount, SingleEntry(session.Usage, UsageSource.Compaction).Usage.Calls);
+    }
+
+    /// <summary>
+    /// Streaming main client whose first round fails with a context-overflow error (so the agent
+    /// force-compacts) and whose later rounds would finish with text.
+    /// </summary>
+    private sealed class OverflowThenTextStreamingClient : IChatClient
+    {
+        private int _calls;
+
+        internal int StreamingCallCount => Volatile.Read(ref _calls);
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("This test drives the streaming path.");
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var index = Interlocked.Increment(ref _calls) - 1;
+            await Task.Yield();
+
+            if (index == 0)
+                throw new InvalidOperationException("model_max_prompt_tokens_exceeded: prompt is too large");
+
+            yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent("All done.")]);
+            yield return new ChatResponseUpdate { FinishReason = ChatFinishReason.Stop };
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public async Task ExecuteStreamingAsync_ForcedCompactionCancelled_ThrowsWithoutErrorCompletion()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var compactionClient = new CancellingCompactionClient(cts, failOnCall: 0, CancellingCompactionClient.FailureMode.CancelCaller);
+        var mainClient = new OverflowThenTextStreamingClient();
+
+        var options = ExecutionOptions(); // 200_000-token window: the pre-run check cannot trigger
+        options.ShowToolCallsInStream = true;
+        options.CompactionClient = compactionClient;
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var session = LargeSession(6);
+        var originalList = session.MessageHistory;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        await using var agent = new CodingAgent(mainClient, options);
+
+        var updates = new List<StreamingUpdate>();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var update in agent.ExecuteStreamingAsync(session, "go", cts.Token))
+                updates.Add(update);
+        });
+
+        // The overflow round ran, the forced compaction's summary call cancelled, and nothing was
+        // retried or reported as an error result.
+        Assert.Equal(1, mainClient.StreamingCallCount);
+        Assert.Equal(1, compactionClient.CallCount);
+        Assert.DoesNotContain(updates, u => u.Kind == StreamingUpdateKind.Completed && u.Result?.Status == "Error");
+        Assert.DoesNotContain(updates, u => u.Kind == StreamingUpdateKind.Completed);
+
+        AssertSessionUnchanged(session, originalList, originalMessages, 0, compactedCallbacks);
+        Assert.Equal(1, CallsForSource(session.Usage, UsageSource.Compaction));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_AutoCompactionCancelled_ThrowsOperationCanceled()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var compactionClient = new CancellingCompactionClient(cts, failOnCall: 0, CancellingCompactionClient.FailureMode.CancelCaller);
+        var mainClient = new MainAgentClient("main-model");
+
+        var options = ExecutionOptions();
+        options.CompactionClient = compactionClient;
+        options.MaxContextTokens = 1_000;
+        var compactedCallbacks = 0;
+        options.OnCompacted = _ => compactedCallbacks++;
+
+        var session = LargeSession(12);
+        session.LastKnownContextTokens = 900; // above the 500 threshold
+        var originalList = session.MessageHistory;
+        var originalMessages = session.MessageHistory.ToArray();
+
+        await using var agent = new CodingAgent(mainClient, options);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => agent.ExecuteAsync(session, "go", cts.Token));
+
+        // The cancelled compaction stopped the execution before any agent round.
+        Assert.Equal(1, compactionClient.CallCount);
+        Assert.Equal(0, mainClient.CallCount);
+        AssertSessionUnchanged(session, originalList, originalMessages, 900, compactedCallbacks);
+        Assert.Equal(1, CallsForSource(session.Usage, UsageSource.Compaction));
+    }
 }
