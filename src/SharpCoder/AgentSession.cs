@@ -41,6 +41,16 @@ public sealed class AgentSession
     public long OutputTokensUsed { get; set; }
 
     /// <summary>
+    /// The synchronisation root guarding this session's cumulative usage state — the
+    /// <see cref="InputTokensUsed"/> / <see cref="OutputTokensUsed"/> counters and the
+    /// <see cref="Usage"/> summary. <see cref="UsageRecorder.Record"/> holds it while it applies a
+    /// recorded call, because a sub-agent forwards its model calls to the recorder of the execution
+    /// that started it from the sub-agent's OWN thread, so one session can be updated from two
+    /// threads at once.
+    /// </summary>
+    internal object UsageSyncRoot { get; } = new object();
+
+    /// <summary>
     /// Cumulative per-call usage of this session, grouped by source and model, over every recorded
     /// model call. Updated as each call ends, so a host polling the session mid-run sees current
     /// totals. Persisted by <see cref="SaveAsync"/> and restored by <see cref="LoadAsync"/>; session

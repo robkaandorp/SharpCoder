@@ -172,7 +172,8 @@ public sealed class CodingAgent : IAsyncDisposable
                 Summary = info.Summary,
                 Error = info.Error,
                 InputTokens = info.InputTokens,
-                OutputTokens = info.OutputTokens
+                OutputTokens = info.OutputTokens,
+                Usage = info.Usage?.Clone()
             };
             try
             {
@@ -240,7 +241,7 @@ public sealed class CodingAgent : IAsyncDisposable
             await _compactor.CompactIfNeededAsync(session, _options, recorder, ct);
         }
 
-        var chatOptions = BuildChatOptions(ct);
+        var chatOptions = BuildChatOptions(recorder, ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, recordingClient) = BuildWrappedClientWithRecord(recorder);
@@ -364,7 +365,7 @@ public sealed class CodingAgent : IAsyncDisposable
             yield break;
         }
 
-        var chatOptions = BuildChatOptions(ct);
+        var chatOptions = BuildChatOptions(recorder, ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
         var (wrappedClient, recordingClient) = BuildWrappedClientWithRecord(recorder);
@@ -478,7 +479,7 @@ public sealed class CodingAgent : IAsyncDisposable
         UsageRecorder recorder,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        var chatOptions = BuildChatOptions(ct);
+        var chatOptions = BuildChatOptions(recorder, ct);
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CodingAgent));
         var messages = BuildMessages(session, userMessage, images);
@@ -717,7 +718,16 @@ public sealed class CodingAgent : IAsyncDisposable
         return line;
     }
 
-    private ChatOptions BuildChatOptions(CancellationToken ct)
+    /// <summary>
+    /// Builds the options for one model request of one execution.
+    /// </summary>
+    /// <param name="recorder">
+    /// The calling execution's usage recorder. It is bound to the sub-agent tools built here, so
+    /// every sub-agent those tools start forwards its model calls into THIS execution's usage
+    /// accounting (summary, session and <see cref="AgentOptions.OnUsage"/>).
+    /// </param>
+    /// <param name="ct">The execution's cancellation token, passed to the sub-agent tools.</param>
+    private ChatOptions BuildChatOptions(UsageRecorder recorder, CancellationToken ct)
     {
         var chatOptions = new ChatOptions
         {
@@ -776,7 +786,7 @@ public sealed class CodingAgent : IAsyncDisposable
                 throw new ObjectDisposedException(nameof(CodingAgent));
             if (manager != null && _subAgentSnapshot != null)
             {
-                foreach (var tool in SubAgentTools.BuildTools(manager, _subAgentSnapshot, ct))
+                foreach (var tool in SubAgentTools.BuildTools(manager, _subAgentSnapshot, ct, recorder))
                     chatOptions.Tools.Add(tool);
             }
         }

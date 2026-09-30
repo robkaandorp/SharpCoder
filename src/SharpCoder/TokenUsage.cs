@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
@@ -133,7 +134,7 @@ public sealed class TokenUsage
 
 /// <summary>
 /// Classifies the model call a recorded usage event came from, so that the cost of the agent loop
-/// can be told apart from the cost of context compaction and (in a later release) sub-agents.
+/// can be told apart from the cost of context compaction and from the cost of sub-agents.
 /// </summary>
 public enum UsageSource
 {
@@ -144,14 +145,17 @@ public enum UsageSource
     Compaction,
 
     /// <summary>
-    /// A call made by a sub-agent session. Declared for a later release; not produced by this
-    /// version of SharpCoder.
+    /// A call made by a sub-agent session: every model call a sub-agent makes is forwarded to the
+    /// usage accounting of the parent execution that started it, labelled with this source, with the
+    /// sub-agent's own model, and with the sub-agent's id in <see cref="UsageEvent.SubAgentId"/>.
     /// </summary>
     SubAgent,
 
     /// <summary>
-    /// A compaction call made inside a sub-agent session. Declared for a later release; not
-    /// produced by this version of SharpCoder.
+    /// A compaction call made inside a sub-agent session: the sub-agent forwarding map translates the
+    /// child's <see cref="Compaction"/> events to this source. A sub-agent execution is stateless
+    /// today, so it never compacts and no event of this source can appear in a summary yet; were one
+    /// to be produced it would be forwarded exactly like <see cref="SubAgent"/>.
     /// </summary>
     SubAgentCompaction
 }
@@ -383,8 +387,10 @@ public sealed class UsageEvent
     /// is a copy of <paramref name="usage"/>, so the caller's instance is never mutated.
     /// </param>
     /// <param name="subAgentId">
-    /// The sub-agent the call belongs to, when the call was made by a sub-agent. Always <c>null</c>
-    /// in this version of SharpCoder; sub-agent forwarding is a later release.
+    /// The sub-agent the call belongs to, when the call was made by a sub-agent; <c>null</c> for
+    /// parent-agent, compaction and host-initiated calls. Sub-agent calls are forwarded by
+    /// <see cref="SubAgentManager"/> with the sub-agent's id (for example <c>sub-1</c>) and the
+    /// mapped source <see cref="UsageSource.SubAgent"/> or <see cref="UsageSource.SubAgentCompaction"/>.
     /// </param>
     public UsageEvent(UsageSource source, string? model, TokenUsage? usage, string? subAgentId = null)
     {
@@ -414,7 +420,9 @@ public sealed class UsageEvent
 
     /// <summary>
     /// The sub-agent session the call belongs to, or <c>null</c> for parent-agent, compaction and
-    /// host-initiated calls. Always <c>null</c> in this version of SharpCoder.
+    /// host-initiated calls. Sub-agent calls forwarded by <see cref="SubAgentManager"/> always carry
+    /// the sub-agent's id here (<c>sub-1</c>, <c>sub-2</c>, …); a sub-agent whose run never started
+    /// makes no call and therefore forwards nothing.
     /// </summary>
     public string? SubAgentId { get; }
 
@@ -440,6 +448,12 @@ public sealed class UsageEvent
 /// executions sharing ONE <see cref="AgentSession"/> concurrently remain unsupported — exactly as
 /// they were before this mechanism existed — and their calls would interleave in that shared
 /// session's totals.
+/// </para>
+/// <para>
+/// A recorder can be shared across threads: <see cref="SubAgentManager"/> binds each sub-agent it
+/// starts to the recorder of the parent execution that started it, and forwards every sub-agent
+/// call here from the sub-agent's own thread. The session update therefore takes the session's
+/// <see cref="AgentSession.UsageSyncRoot"/>, so concurrent recording cannot lose a token count.
 /// </para>
 /// <para>
 /// The host callback is invoked outside every internal lock, and an exception it throws is caught
@@ -472,6 +486,12 @@ internal sealed class UsageRecorder
     /// session's cumulative usage (when there is a session) and raises
     /// <see cref="AgentOptions.OnUsage"/>.
     /// <para>
+    /// The session's cumulative counters and <see cref="AgentSession.Usage"/> are updated under the
+    /// session's <see cref="AgentSession.UsageSyncRoot"/>, because sub-agents forward their calls to
+    /// the recorder of the parent execution from the sub-agent's own thread: two threads can record
+    /// into one session at the same time, and the lock keeps every count.
+    /// </para>
+    /// <para>
     /// This method never throws: a host handler that throws is caught, and both the handler
     /// invocation and the best-effort warning written for it are contained, so a failing handler —
     /// or a failing logger — can never fail or alter the model call being recorded.
@@ -487,9 +507,14 @@ internal sealed class UsageRecorder
         var session = _session;
         if (session is not null)
         {
-            session.Usage.Add(usageEvent);
-            session.InputTokensUsed += usageEvent.Usage.InputTokens;
-            session.OutputTokensUsed += usageEvent.Usage.OutputTokens;
+            // Taken only for the session update, and released before the host callback: a host
+            // handler may call back into SharpCoder (and read the session) without deadlocking.
+            lock (session.UsageSyncRoot)
+            {
+                session.Usage.Add(usageEvent);
+                session.InputTokensUsed += usageEvent.Usage.InputTokens;
+                session.OutputTokensUsed += usageEvent.Usage.OutputTokens;
+            }
         }
 
         // Never inside a lock: a host handler may call back into SharpCoder.
@@ -556,6 +581,15 @@ internal sealed class UsageRecorder
 /// <see cref="AgentSession.LastKnownContextTokens"/> (the latest round's context size — never a sum).
 /// </para>
 /// <para>
+/// A sub-agent's client is wrapped the same way — by the child execution itself, with
+/// <see cref="UsageSource.Agent"/>/<see cref="UsageSource.Compaction"/> — and the child's
+/// <see cref="AgentOptions.OnUsage"/> forwarder installed by <see cref="SubAgentManager"/> maps the
+/// recorded call to <see cref="UsageSource.SubAgent"/>/<see cref="UsageSource.SubAgentCompaction"/>,
+/// sets <see cref="UsageEvent.SubAgentId"/> and passes the event to the parent execution's recorder.
+/// The model is left as recorded here: it comes from the calling client's
+/// <see cref="ChatClientMetadata"/> default model, falling back to the model the response reported.
+/// </para>
+/// <para>
 /// For a streaming call, usage is summed over every <see cref="UsageContent"/> received before the
 /// enumeration ended; because providers may split usage across several updates, each optional count
 /// counts as "reported" when at least one update carried a value, which keeps the reported-calls
@@ -573,7 +607,11 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
     /// <param name="inner">The client whose calls are recorded.</param>
     /// <param name="recorder">The recorder that receives one event per ended call.</param>
     /// <param name="source">The source classification for the recorded calls.</param>
-    /// <param name="subAgentId">The sub-agent id for the recorded calls; always <c>null</c> today.</param>
+    /// <param name="subAgentId">
+    /// The sub-agent id carried by the recorded calls, or <c>null</c> for calls that do not belong to
+    /// a sub-agent. Callers that wrap a sub-agent's own client pass <c>null</c> here: the manager's
+    /// forwarder stamps <see cref="UsageEvent.SubAgentId"/> on the way to the parent recorder.
+    /// </param>
     internal UsageRecordingChatClient(IChatClient inner, UsageRecorder recorder, UsageSource source = UsageSource.Agent, string? subAgentId = null)
         : base(inner)
     {

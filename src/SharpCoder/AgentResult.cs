@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.AI;
+using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
@@ -41,6 +42,14 @@ public sealed class AgentResult
     /// result was built, so later activity never mutates it. Populated for <c>Success</c>,
     /// <c>MaxStepsReached</c> and <c>Error</c> results (including usage recorded before the
     /// failure); it stays empty only when no call was recorded.
+    /// <para>
+    /// A snapshot is detached, so it is a point-in-time view: sub-agents started by this execution
+    /// keep forwarding their calls into this execution's recorder after it returned, and those calls
+    /// are recorded into the session and reported through <see cref="AgentOptions.OnUsage"/>, but
+    /// they never change this already-returned snapshot. To see a sub-agent's own totals, read
+    /// <see cref="SubAgentInfo.Usage"/> (or <c>input_tokens</c>/<c>output_tokens</c> from
+    /// <c>await_sub_agents</c>).
+    /// </para>
     /// </summary>
     public UsageSummary TokenUsage { get; set; } = new UsageSummary();
 

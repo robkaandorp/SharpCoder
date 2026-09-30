@@ -109,16 +109,24 @@ public sealed class AgentOptions
     /// that call ends — however it ends (a completed response, a failure, or a stream disposed
     /// early; a call that reported no usage arrives with zero tokens). Use it to report usage live.
     /// <para>
-    /// Events arrive from every source SharpCoder produces today: agent-loop rounds
+    /// Events arrive from every source SharpCoder produces: agent-loop rounds
     /// (<see cref="UsageSource.Agent"/>) and context-compaction summary calls
     /// (<see cref="UsageSource.Compaction"/>) — including compaction a host triggers directly
     /// through <see cref="ContextCompactor.ForceCompactAsync"/>, <see cref="ContextCompactor.CompactOldestPercentAsync"/>
     /// or <see cref="ContextCompactor.CompactIfNeededAsync(AgentSession, AgentOptions, CancellationToken)"/>,
-    /// and every chunk of chunked summarisation. Sub-agent usage
-    /// (<see cref="UsageSource.SubAgent"/> and <see cref="UsageSource.SubAgentCompaction"/>) is
-    /// declared in <see cref="UsageSource"/> but is not produced yet; forwarding it is the
-    /// follow-up goal sharpcoder-subagent-usage-forwarding, so in this version
-    /// <see cref="UsageEvent.SubAgentId"/> is always <c>null</c>.
+    /// and every chunk of chunked summarisation — plus every model call a sub-agent makes, which is
+    /// forwarded live by <see cref="SubAgentManager"/> as <see cref="UsageSource.SubAgent"/>, or as
+    /// <see cref="UsageSource.SubAgentCompaction"/> for a compaction call inside a sub-agent, with
+    /// the sub-agent's id in <see cref="UsageEvent.SubAgentId"/>. Sub-agent events are recorded into
+    /// the session and reported here whenever they arrive, including after the parent execution
+    /// returned.
+    /// </para>
+    /// <para>
+    /// <strong>Handlers must be thread-safe.</strong> Sub-agents run on background threads, so this
+    /// callback can be invoked concurrently from several threads at once — from this agent's own
+    /// execution and from every running sub-agent that has calls ending at the same moment — and an
+    /// invocation can arrive after the enclosing <c>ExecuteAsync</c> call has already returned.
+    /// Guard handler state accordingly.
     /// </para>
     /// <para>
     /// The callback is invoked outside any internal lock, and an exception it throws is caught and
