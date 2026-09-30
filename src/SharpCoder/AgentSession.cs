@@ -96,16 +96,11 @@ public sealed class AgentSession
                     if (content is TextContent tc)
                         chars += tc.Text?.Length ?? 0;
                     else if (content is FunctionCallContent fc)
-                        chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
+                        chars += UsageEstimator.EstimateCallLength(fc);
                     else if (content is FunctionResultContent fr)
-                        chars += EstimateResultLength(fr);
-                    else if (content is DataContent dc)
-                    {
-                        var mt = dc.MediaType ?? string.Empty;
-                        if (mt.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
-                            mt.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
-                            imageCount++;
-                    }
+                        chars += UsageEstimator.EstimateResultLength(fr);
+                    else if (content is DataContent dc && UsageEstimator.IsImageOrPdf(dc))
+                        imageCount++;
                 }
             }
             return chars / 4 + imageCount * ImageTokenEstimate; // ~4 chars per token heuristic
@@ -207,24 +202,6 @@ public sealed class AgentSession
     {
         MessageHistory.Clear();
         LastKnownContextTokens = 0;
-    }
-
-    private static long EstimateArgumentsLength(FunctionCallContent fc)
-    {
-        if (fc.Arguments == null) return 0;
-        long len = 0;
-        foreach (var kvp in fc.Arguments)
-        {
-            len += kvp.Key?.Length ?? 0;
-            len += kvp.Value?.ToString()?.Length ?? 0;
-        }
-        return len;
-    }
-
-    private static long EstimateResultLength(FunctionResultContent fr)
-    {
-        if (fr.Result == null) return 0;
-        return fr.Result.ToString()?.Length ?? 0;
     }
 
     // Use AIJsonUtilities.DefaultOptions which has built-in converters for

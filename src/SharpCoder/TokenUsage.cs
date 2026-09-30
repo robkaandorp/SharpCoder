@@ -16,7 +16,12 @@ namespace SharpCoder;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every count here is an exact sum of values the providers reported; nothing is estimated.
+/// Every count here is an exact sum of values the providers reported — with one exception:
+/// <see cref="Estimated"/>. <see cref="InputTokens"/>, <see cref="OutputTokens"/>,
+/// <see cref="CachedInputTokens"/>, <see cref="ReasoningTokens"/> and the call counters stay exact
+/// provider values; <see cref="Estimated"/> is the only estimated part, an approximate split of the
+/// exact input and output counts into categories (system prompt, tool definitions, conversation
+/// text, tool calls and results, reasoning, images; output text, tool calls and reasoning).
 /// </para>
 /// <para>
 /// "Not reported" is deliberately distinguishable from zero: <see cref="CachedInputTokens"/> and
@@ -68,6 +73,21 @@ public sealed class TokenUsage
     /// </summary>
     public int ReasoningReportedCalls { get; set; }
 
+    private EstimatedTokenBreakdown _estimated = new EstimatedTokenBreakdown();
+
+    /// <summary>
+    /// An ESTIMATED per-category split of <see cref="InputTokens"/> and <see cref="OutputTokens"/> —
+    /// the only estimated part of this type; every other count is exact. Never <c>null</c>:
+    /// assigning <c>null</c> (or loading data written before this property existed) yields an empty
+    /// estimate with zero estimated calls. See <see cref="EstimatedTokenBreakdown"/> for how the
+    /// estimate is made and which exact invariants it keeps.
+    /// </summary>
+    public EstimatedTokenBreakdown Estimated
+    {
+        get => _estimated;
+        set => _estimated = value ?? new EstimatedTokenBreakdown();
+    }
+
     /// <summary>
     /// Adds the counts of <paramref name="other"/> into this instance and returns this instance,
     /// so that calls can be chained. <c>null</c> is ignored.
@@ -85,11 +105,15 @@ public sealed class TokenUsage
         Calls += other.Calls;
         CachedInputReportedCalls += other.CachedInputReportedCalls;
         ReasoningReportedCalls += other.ReasoningReportedCalls;
+        Estimated.Add(other.Estimated);
         return this;
     }
 
-    /// <summary>Creates a detached copy of this instance; later changes to either do not affect the other.</summary>
-    /// <returns>A new <see cref="TokenUsage"/> with the same counts.</returns>
+    /// <summary>
+    /// Creates a detached deep copy of this instance, <see cref="Estimated"/> included; later
+    /// changes to either do not affect the other.
+    /// </summary>
+    /// <returns>A new <see cref="TokenUsage"/> with the same counts and estimate.</returns>
     public TokenUsage Clone() => new TokenUsage
     {
         InputTokens = InputTokens,
@@ -98,7 +122,8 @@ public sealed class TokenUsage
         ReasoningTokens = ReasoningTokens,
         Calls = Calls,
         CachedInputReportedCalls = CachedInputReportedCalls,
-        ReasoningReportedCalls = ReasoningReportedCalls
+        ReasoningReportedCalls = ReasoningReportedCalls,
+        Estimated = Estimated.Clone()
     };
 
     /// <summary>
@@ -384,7 +409,9 @@ public sealed class UsageEvent
     /// <param name="usage">
     /// The call's usage; <c>null</c> is treated as a zero-token call. Because an event describes
     /// exactly one call, the stored usage always has <see cref="TokenUsage.Calls"/> set to 1 — this
-    /// is a copy of <paramref name="usage"/>, so the caller's instance is never mutated.
+    /// is a copy of <paramref name="usage"/> (its <see cref="TokenUsage.Estimated"/> breakdown
+    /// included), so the caller's instance is never mutated and later changes to it never reach the
+    /// event.
     /// </param>
     /// <param name="subAgentId">
     /// The sub-agent the call belongs to, when the call was made by a sub-agent; <c>null</c> for
@@ -405,7 +432,8 @@ public sealed class UsageEvent
             ReasoningTokens = usage?.ReasoningTokens ?? 0,
             Calls = 1,
             CachedInputReportedCalls = usage?.CachedInputReportedCalls ?? 0,
-            ReasoningReportedCalls = usage?.ReasoningReportedCalls ?? 0
+            ReasoningReportedCalls = usage?.ReasoningReportedCalls ?? 0,
+            Estimated = usage?.Estimated?.Clone() ?? new EstimatedTokenBreakdown()
         };
     }
 
@@ -542,6 +570,23 @@ internal sealed class UsageRecorder
     }
 
     /// <summary>
+    /// Reports that estimating the <see cref="TokenUsage.Estimated"/> breakdown of a call failed.
+    /// The call is then recorded without an estimate. Never throws: the best-effort warning is
+    /// contained so a failing logger cannot fail the model call either.
+    /// </summary>
+    internal void ReportEstimationFailure(Exception ex)
+    {
+        try
+        {
+            _logger.LogWarning(ex, "Estimating the token usage breakdown of a model call failed; the call is recorded without an estimate.");
+        }
+        catch
+        {
+            // Swallowed deliberately: estimation must never fail the call being recorded.
+        }
+    }
+
+    /// <summary>
     /// Resolves the model a client sends its calls to, from the client's
     /// <see cref="ChatClientMetadata"/>; <c>null</c> when the client exposes none. A client whose
     /// metadata lookup throws is reported as unknown rather than failing the run, and the
@@ -595,6 +640,15 @@ internal sealed class UsageRecorder
 /// counts as "reported" when at least one update carried a value, which keeps the reported-calls
 /// counters at one per call.
 /// </para>
+/// <para>
+/// Every recorded call also carries its <see cref="TokenUsage.Estimated"/> breakdown, computed by
+/// <see cref="UsageEstimator"/> from the request passed to the inner client and from the response
+/// messages (or, when streaming, from the updates actually received — an early-ended stream is
+/// estimated from what arrived). A request whose messages are not already a materialised collection
+/// is materialised once and that same list is passed to the inner client. Estimation is contained
+/// exactly like <see cref="UsageRecorder.Record"/>: a failure is logged and the call is recorded
+/// without an estimate; it can never fail or alter the model call.
+/// </para>
 /// </remarks>
 internal sealed class UsageRecordingChatClient : DelegatingChatClient
 {
@@ -631,9 +685,16 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
         IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, CancellationToken ct = default)
     {
         ChatResponse? response = null;
+        long[]? inputWeights = null;
+        Exception? estimationFailure = null;
         try
         {
-            response = await InnerClient.GetResponseAsync(messages, chatOptions, ct).ConfigureAwait(false);
+            // Materialised at most once, and this same instance goes to the inner client, so a
+            // one-shot sequence is never enumerated twice.
+            var materialised = Materialise(messages);
+            inputWeights = MeasureInput(materialised, chatOptions, ref estimationFailure);
+
+            response = await InnerClient.GetResponseAsync(materialised, chatOptions, ct).ConfigureAwait(false);
             return response;
         }
         finally
@@ -642,8 +703,17 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
             if (usage?.InputTokenCount is long inputTokens)
                 LastRoundInputTokens = inputTokens;
 
+            var tokenUsage = TokenUsage.FromSingleCall(usage);
+            tokenUsage.Estimated = BuildEstimate(
+                inputWeights,
+                estimationFailure,
+                usage?.InputTokenCount,
+                usage?.OutputTokenCount,
+                usage?.ReasoningTokenCount,
+                response);
+
             _recorder.Record(new UsageEvent(
-                _source, ResolveModel(response?.ModelId), TokenUsage.FromSingleCall(usage), _subAgentId));
+                _source, ResolveModel(response?.ModelId), tokenUsage, _subAgentId));
         }
     }
 
@@ -654,10 +724,17 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
     {
         var usage = new CallUsageAccumulator();
         string? responseModelId = null;
+        long[]? inputWeights = null;
+        Exception? estimationFailure = null;
 
         try
         {
-            await foreach (var update in InnerClient.GetStreamingResponseAsync(messages, chatOptions, ct).WithCancellation(ct))
+            // Materialised at most once, and this same instance goes to the inner client, so a
+            // one-shot sequence is never enumerated twice.
+            var materialised = Materialise(messages);
+            inputWeights = MeasureInput(materialised, chatOptions, ref estimationFailure);
+
+            await foreach (var update in InnerClient.GetStreamingResponseAsync(materialised, chatOptions, ct).WithCancellation(ct))
             {
                 if (!string.IsNullOrWhiteSpace(update.ModelId)) responseModelId = update.ModelId;
                 usage.Add(update);
@@ -667,12 +744,107 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
         finally
         {
             // Reached on completion, on failure, and when the consumer disposes the enumeration
-            // early: either way the call is recorded exactly once, with whatever usage arrived.
+            // early: either way the call is recorded exactly once, with whatever usage arrived —
+            // and the estimate describes exactly the updates that arrived.
             if (usage.InputReported)
                 LastRoundInputTokens = usage.InputTokens;
 
+            var tokenUsage = usage.ToTokenUsage();
+            tokenUsage.Estimated = BuildStreamingEstimate(inputWeights, estimationFailure, usage);
+
             _recorder.Record(new UsageEvent(
-                _source, ResolveModel(responseModelId), usage.ToTokenUsage(), _subAgentId));
+                _source, ResolveModel(responseModelId), tokenUsage, _subAgentId));
+        }
+    }
+
+    /// <summary>
+    /// Returns <paramref name="messages"/> itself when it is already a materialised collection
+    /// (<see cref="IList{T}"/> or <see cref="IReadOnlyCollection{T}"/>), otherwise enumerates it
+    /// exactly once into a list. <c>null</c> is passed through untouched for the inner client to
+    /// handle as it always did.
+    /// </summary>
+    private static IEnumerable<ChatMessage> Materialise(IEnumerable<ChatMessage> messages)
+    {
+        if (messages is null || messages is IList<ChatMessage> || messages is IReadOnlyCollection<ChatMessage>)
+            return messages!;
+        return new List<ChatMessage>(messages);
+    }
+
+    /// <summary>
+    /// Measures the request's input weights; a failure is captured in
+    /// <paramref name="estimationFailure"/> (and the call later recorded without an estimate)
+    /// instead of escaping into the model call.
+    /// </summary>
+    private static long[]? MeasureInput(IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, ref Exception? estimationFailure)
+    {
+        try
+        {
+            return UsageEstimator.MeasureInput(messages, chatOptions);
+        }
+        catch (Exception ex)
+        {
+            estimationFailure = ex;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Builds the estimate of a non-streaming call. Never throws: any failure (including one
+    /// captured earlier while measuring the input) is logged and yields an empty estimate, so the
+    /// call is recorded without an estimate and its outcome is unaffected.
+    /// </summary>
+    private EstimatedTokenBreakdown BuildEstimate(
+        long[]? inputWeights, Exception? estimationFailure,
+        long? inputTokens, long? outputTokens, long? reasoningTokens, ChatResponse? response)
+    {
+        try
+        {
+            if (estimationFailure is not null)
+            {
+                _recorder.ReportEstimationFailure(estimationFailure);
+                return new EstimatedTokenBreakdown();
+            }
+
+            var outputWeights = new UsageEstimator.OutputWeights();
+            if (outputTokens.HasValue)
+                outputWeights.Add(response?.Messages);
+
+            return UsageEstimator.Estimate(inputWeights, inputTokens, outputTokens, reasoningTokens, outputWeights);
+        }
+        catch (Exception ex)
+        {
+            _recorder.ReportEstimationFailure(ex);
+            return new EstimatedTokenBreakdown();
+        }
+    }
+
+    /// <summary>
+    /// Builds the estimate of a streaming call from everything the accumulator received. Never
+    /// throws: any failure is logged and yields an empty estimate.
+    /// </summary>
+    private EstimatedTokenBreakdown BuildStreamingEstimate(
+        long[]? inputWeights, Exception? estimationFailure, CallUsageAccumulator usage)
+    {
+        try
+        {
+            var failure = estimationFailure ?? usage.EstimationFailure;
+            if (failure is not null)
+            {
+                _recorder.ReportEstimationFailure(failure);
+                return new EstimatedTokenBreakdown();
+            }
+
+            return UsageEstimator.Estimate(
+                inputWeights,
+                usage.InputReported ? usage.InputTokens : null,
+                usage.OutputReported ? usage.OutputTokens : null,
+                usage.ReasoningReported ? usage.ReasoningTokens : null,
+                usage.OutputWeights);
+        }
+        catch (Exception ex)
+        {
+            _recorder.ReportEstimationFailure(ex);
+            return new EstimatedTokenBreakdown();
         }
     }
 
@@ -694,8 +866,11 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
         private long _cachedInputTokens;
         private long _reasoningTokens;
         private bool _inputReported;
+        private bool _outputReported;
         private bool _cachedInputReported;
         private bool _reasoningReported;
+        private readonly UsageEstimator.OutputWeights _outputWeights = new UsageEstimator.OutputWeights();
+        private Exception? _estimationFailure;
 
         /// <summary>True when at least one update reported an input token count.</summary>
         internal bool InputReported => _inputReported;
@@ -703,9 +878,45 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
         /// <summary>The summed input token count of this call so far.</summary>
         internal long InputTokens => _inputTokens;
 
-        /// <summary>Adds every usage item carried by <paramref name="update"/>.</summary>
+        /// <summary>True when at least one update reported an output token count.</summary>
+        internal bool OutputReported => _outputReported;
+
+        /// <summary>The summed output token count of this call so far.</summary>
+        internal long OutputTokens => _outputTokens;
+
+        /// <summary>True when at least one update reported a reasoning token count.</summary>
+        internal bool ReasoningReported => _reasoningReported;
+
+        /// <summary>The summed reasoning token count of this call so far.</summary>
+        internal long ReasoningTokens => _reasoningTokens;
+
+        /// <summary>Output character weights of every update received so far.</summary>
+        internal UsageEstimator.OutputWeights OutputWeights => _outputWeights;
+
+        /// <summary>
+        /// The first failure raised while measuring output weights, or <c>null</c>. Once set, the
+        /// call is recorded without an estimate and no further weights are measured.
+        /// </summary>
+        internal Exception? EstimationFailure => _estimationFailure;
+
+        /// <summary>
+        /// Adds every usage item carried by <paramref name="update"/>, and the output character
+        /// weights of its contents (contained: a measuring failure is captured, never thrown).
+        /// </summary>
         internal void Add(ChatResponseUpdate update)
         {
+            if (_estimationFailure is null)
+            {
+                try
+                {
+                    _outputWeights.Add(update.Contents);
+                }
+                catch (Exception ex)
+                {
+                    _estimationFailure = ex;
+                }
+            }
+
             foreach (var content in update.Contents)
             {
                 var details = (content as UsageContent)?.Details;
@@ -718,7 +929,10 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
                 }
 
                 if (details.OutputTokenCount is long outputTokens)
+                {
                     _outputTokens += outputTokens;
+                    _outputReported = true;
+                }
 
                 if (details.CachedInputTokenCount is long cachedInputTokens)
                 {
