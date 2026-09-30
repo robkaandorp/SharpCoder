@@ -240,6 +240,10 @@ public sealed class SubAgentManager : IAsyncDisposable
     public event Action<SubAgentInfo>? SubAgentChanged;
 
     /// <summary>Creates a new sub-agent manager.</summary>
+    /// <param name="options">Configuration for available models, limits, defaults, and optional image root.</param>
+    /// <param name="defaultClient">Fallback client used when no model-specific client is selected.</param>
+    /// <param name="parentOptions">Parent agent configuration; its capabilities bound those available to sub-agents.</param>
+    /// <param name="logger">Optional logger; null uses the parent logger, then a no-op logger.</param>
     /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
     /// <exception cref="ArgumentException">Thrown when the model catalog is invalid.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when limits or timeouts are invalid.</exception>
@@ -340,7 +344,13 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// options' <see cref="AgentOptions.OnUsage"/> only (no session).
     /// </para>
     /// </summary>
-    /// <exception cref="ObjectDisposedException">Thrown when the manager has been disposed.</exception>
+    /// <param name="request">The requested task and optional model, capabilities, timeout, and attachments.</param>
+    /// <param name="ct">Cancels waiting for a concurrency slot; it does not cancel an accepted sub-agent.</param>
+    /// <returns>The accepted sub-agent snapshot, or a failed snapshot with an empty ID when validation fails.</returns>
+    /// <exception cref="ArgumentNullException">Propagated through the returned task when <paramref name="request"/> is null.</exception>
+    /// <exception cref="ObjectDisposedException">Propagated through the returned task when the manager is disposed before or while a slot is acquired.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> cancels the wait for a concurrency slot.</exception>
+    /// <exception cref="ArgumentException">Propagated through the returned task when a configured client factory or post-slot startup callback throws this exception.</exception>
     public Task<SubAgentInfo> StartAsync(SubAgentRequest request, CancellationToken ct = default)
         => StartAsync(request, _fallbackUsageSink, ct);
 
@@ -812,6 +822,8 @@ public sealed class SubAgentManager : IAsyncDisposable
     }
 
     /// <summary>Returns a snapshot of one or all tracked sub-agents. Unknown IDs return an empty list.</summary>
+    /// <param name="id">Sub-agent ID to look up; null returns all currently tracked sub-agents.</param>
+    /// <returns>A list containing the matching snapshot, all snapshots, or an empty list for an unknown ID.</returns>
     public IReadOnlyList<SubAgentInfo> GetStatus(string? id = null)
     {
         if (id is null)
@@ -831,6 +843,10 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// Awaits the specified sub-agents (or all currently tracked ones) and returns their final snapshots.
     /// Never throws for failed or timed-out sub-agents.
     /// </summary>
+    /// <param name="ids">IDs to await; null awaits all sub-agents tracked when the call begins. Unknown IDs are ignored.</param>
+    /// <param name="ct">Cancels this wait without cancelling the sub-agents.</param>
+    /// <returns>Final snapshots for the tracked sub-agents selected by <paramref name="ids"/>.</returns>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> cancels a wait that has not already completed.</exception>
     public async Task<IReadOnlyList<SubAgentInfo>> AwaitAsync(IEnumerable<string>? ids = null, CancellationToken ct = default)
     {
         List<Entry> targets;

@@ -886,6 +886,9 @@ public sealed class ContextCompactor
     /// portion are moved into the "old" portion. This prevents orphaned tool results
     /// (role=tool without a preceding assistant tool_calls) which crash some LLM APIs.
     /// </summary>
+    /// <param name="messages">Message sequence whose split boundary is to be adjusted.</param>
+    /// <param name="splitPoint">Requested boundary index; negative values become zero.</param>
+    /// <returns>The adjusted boundary, advanced past tool-result messages at its start and capped at the message count.</returns>
     public static int AdjustSplitPoint(IList<ChatMessage> messages, int splitPoint)
     {
         if (splitPoint < 0) splitPoint = 0;

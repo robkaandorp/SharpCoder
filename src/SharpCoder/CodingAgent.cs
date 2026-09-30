@@ -194,6 +194,12 @@ public sealed class CodingAgent : IAsyncDisposable
     /// Execute a task as a single-turn (stateless) conversation.
     /// For multi-turn, use the overload that accepts an <see cref="AgentSession"/>.
     /// </summary>
+    /// <param name="taskDescription">The task to perform in a stateless single-turn conversation.</param>
+    /// <param name="ct">Cancels the execution.</param>
+    /// <returns>The execution result, with status <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown on call when the agent is already disposed; if disposal occurs after the wrapper guard, raised through the returned task by the async overload's disposal checks.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when execution is cancelled.</exception>
+    /// <exception cref="HttpRequestException">Propagated through the returned task when a model request fails with an HTTP error.</exception>
     public Task<AgentResult> ExecuteAsync(string taskDescription, CancellationToken ct = default)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -205,6 +211,13 @@ public sealed class CodingAgent : IAsyncDisposable
     /// Execute a task as a single-turn (stateless) conversation with optional image attachments.
     /// For multi-turn, use the overload that accepts an <see cref="AgentSession"/>.
     /// </summary>
+    /// <param name="taskDescription">The task to perform in a stateless single-turn conversation.</param>
+    /// <param name="images">Optional image attachments included with the user message; null or empty sends no images.</param>
+    /// <param name="ct">Cancels the execution.</param>
+    /// <returns>The execution result, with status <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown on call when the agent is already disposed; if disposal occurs after the wrapper guard, raised through the returned task by the async overload's disposal checks.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when execution is cancelled.</exception>
+    /// <exception cref="HttpRequestException">Propagated through the returned task when a model request fails with an HTTP error.</exception>
     public Task<AgentResult> ExecuteAsync(string taskDescription, IReadOnlyList<ImageAttachment>? images, CancellationToken ct)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -216,6 +229,13 @@ public sealed class CodingAgent : IAsyncDisposable
     /// Execute a task within a session, preserving conversation history across calls.
     /// Pass null for a stateless single-turn execution.
     /// </summary>
+    /// <param name="session">Conversation state to preserve across calls; null runs statelessly.</param>
+    /// <param name="userMessage">The message to send to the model.</param>
+    /// <param name="ct">Cancels the execution.</param>
+    /// <returns>The execution result, with status <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown on call when the agent is already disposed; if disposal occurs after the wrapper guard, raised through the returned task by the async overload's disposal checks.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when execution is cancelled.</exception>
+    /// <exception cref="HttpRequestException">Propagated through the returned task when a model request fails with an HTTP error.</exception>
     public Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -228,6 +248,14 @@ public sealed class CodingAgent : IAsyncDisposable
     /// with optional image attachments.
     /// Pass null for a stateless single-turn execution.
     /// </summary>
+    /// <param name="session">Conversation state to preserve across calls; null runs statelessly.</param>
+    /// <param name="userMessage">The message to send to the model.</param>
+    /// <param name="images">Optional image attachments included with the user message; null or empty sends no images.</param>
+    /// <param name="ct">Cancels the execution.</param>
+    /// <returns>The execution result, with status <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>; handled failures are returned with status <c>Error</c>.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown through the returned task when this agent is disposed before or during execution.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when execution is cancelled.</exception>
+    /// <exception cref="HttpRequestException">Propagated through the returned task when a model request fails with an HTTP error.</exception>
     public async Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, IReadOnlyList<ImageAttachment>? images, CancellationToken ct)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -327,6 +355,13 @@ public sealed class CodingAgent : IAsyncDisposable
     /// Execute a task with streaming, yielding incremental text updates as they arrive.
     /// The final update has <see cref="StreamingUpdateKind.Completed"/> with the full <see cref="AgentResult"/>.
     /// </summary>
+    /// <param name="session">Conversation state to preserve across calls; null runs statelessly.</param>
+    /// <param name="userMessage">The message to send to the model.</param>
+    /// <param name="ct">Cancels stream enumeration and execution.</param>
+    /// <returns>An update sequence whose final update is <see cref="StreamingUpdateKind.Completed"/> with the complete <see cref="AgentResult"/>.</returns>
+    /// <exception cref="ObjectDisposedException">Raised by the first <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> when the agent is disposed before enumeration begins or is disposed during execution.</exception>
+    /// <exception cref="OperationCanceledException">Propagated by <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> during enumeration when execution is cancelled, potentially after earlier updates were yielded.</exception>
+    /// <exception cref="HttpRequestException">Propagated by <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> during enumeration when a model request fails with an HTTP error, potentially after earlier updates were yielded.</exception>
     public IAsyncEnumerable<StreamingUpdate> ExecuteStreamingAsync(
         AgentSession? session,
         string userMessage,
@@ -340,6 +375,14 @@ public sealed class CodingAgent : IAsyncDisposable
     /// with optional image attachments.
     /// The final update has <see cref="StreamingUpdateKind.Completed"/> with the full <see cref="AgentResult"/>.
     /// </summary>
+    /// <param name="session">Conversation state to preserve across calls; null runs statelessly.</param>
+    /// <param name="userMessage">The message to send to the model.</param>
+    /// <param name="images">Optional image attachments included with the user message; null or empty sends no images.</param>
+    /// <param name="ct">Cancels stream enumeration and execution.</param>
+    /// <returns>An update sequence whose final update is <see cref="StreamingUpdateKind.Completed"/> with the complete <see cref="AgentResult"/>.</returns>
+    /// <exception cref="ObjectDisposedException">Raised on the first <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> when the agent is disposed before enumeration begins or is disposed during execution.</exception>
+    /// <exception cref="OperationCanceledException">Propagated by <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> during enumeration when execution is cancelled, potentially after earlier updates were yielded.</exception>
+    /// <exception cref="HttpRequestException">Propagated by <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> during enumeration when a model request fails with an HTTP error; it may occur after earlier updates were yielded.</exception>
     public async IAsyncEnumerable<StreamingUpdate> ExecuteStreamingAsync(
         AgentSession? session,
         string userMessage,

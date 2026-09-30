@@ -33,6 +33,7 @@ public static class ChatClientFactory
     /// OAuth access token stored in the database without this shared class depending on the main
     /// project.
     /// </summary>
+    /// <param name="provider">Callback supplying the Copilot token; null or whitespace results fall back to environment variables.</param>
     public static void SetTokenProvider(Func<string?> provider) => _tokenProvider = provider;
 
     /// <summary>
@@ -401,6 +402,9 @@ public static class ChatClientFactory
     /// The model string may include a provider prefix (e.g. "copilot/claude-sonnet-4.6").
     /// Reasoning effort is applied at the <see cref="ChatOptions"/> level, not via the model name.
     /// </summary>
+    /// <param name="modelOverride">Optional model ID, optionally prefixed with a recognized provider and slash, such as <c>copilot/claude-sonnet-4.6</c>; null or empty selects provider defaults.</param>
+    /// <returns>A client configured for the selected provider and model.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the selected Ollama Cloud provider lacks <c>OLLAMA_API_KEY</c>, the GitHub provider has no non-whitespace <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>, the Copilot provider has no non-whitespace OAuth token or <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>, or the resolved provider is unknown.</exception>
     public static IChatClient Create(string? modelOverride = null)
     {
         var (provider, model) = ParseProviderAndModel(modelOverride);
@@ -495,6 +499,8 @@ public static class ChatClientFactory
     /// "claude-sonnet-4.6" → (env LLM_PROVIDER, "claude-sonnet-4.6")
     /// null → (env LLM_PROVIDER, null)
     /// </summary>
+    /// <param name="modelOverride">Optional provider/model string; only recognized provider prefixes before the first slash are extracted.</param>
+    /// <returns>The selected provider and model, using <c>LLM_PROVIDER</c> (or <c>copilot</c>) when no recognized prefix is supplied.</returns>
     public static (string provider, string? model) ParseProviderAndModel(string? modelOverride)
     {
         var defaultProvider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
@@ -518,6 +524,8 @@ public static class ChatClientFactory
     /// <summary>
     /// Models that must use the /responses endpoint instead of /chat/completions.
     /// </summary>
+    /// <param name="model">Model ID to inspect.</param>
+    /// <returns><see langword="true"/> when the model begins, case-insensitively, with <c>gpt-5</c>, <c>gpt-6</c>, <c>o3</c>, or <c>o4</c>.</returns>
     public static bool RequiresResponsesEndpoint(string model)
     {
         return model.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)

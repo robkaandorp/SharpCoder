@@ -108,6 +108,9 @@ public sealed class AgentSession
     }
 
     /// <summary>Save session state to a JSON file.</summary>
+    /// <param name="filePath">Destination JSON file path; missing parent directories are created.</param>
+    /// <param name="ct">Cancels the asynchronous file write.</param>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled during the write.</exception>
     public async Task SaveAsync(string filePath, CancellationToken ct = default)
     {
         var dir = Path.GetDirectoryName(filePath);
@@ -132,6 +135,12 @@ public sealed class AgentSession
     }
 
     /// <summary>Load session state from a JSON file.</summary>
+    /// <param name="filePath">Path of the JSON session file to load.</param>
+    /// <param name="ct">Cancels the asynchronous file read.</param>
+    /// <returns>The session restored from the file.</returns>
+    /// <exception cref="FileNotFoundException">Propagated through the returned task when the file does not exist.</exception>
+    /// <exception cref="InvalidOperationException">Propagated through the returned task when deserialization produces no session data.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled during the read.</exception>
     public static async Task<AgentSession> LoadAsync(string filePath, CancellationToken ct = default)
     {
         if (!File.Exists(filePath))
@@ -158,6 +167,8 @@ public sealed class AgentSession
     }
 
     /// <summary>Create a new empty session.</summary>
+    /// <param name="sessionId">Optional session identifier; null generates a new GUID in compact form.</param>
+    /// <returns>A new empty session with the specified or generated identifier.</returns>
     public static AgentSession Create(string? sessionId = null)
     {
         return new AgentSession
