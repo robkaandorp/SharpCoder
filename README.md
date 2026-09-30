@@ -26,14 +26,17 @@ GitHub Copilot provider requests use the per-account API endpoint advertised by 
 
 ```bash
 dotnet add package SharpCoder
+# OllamaSharp is the provider client used below; any IChatClient works.
+dotnet add package OllamaSharp
 ```
 
 ```csharp
 using Microsoft.Extensions.AI;
+using OllamaSharp;
 using SharpCoder;
 
 // Use any IChatClient — OpenAI, Ollama, Azure, etc.
-IChatClient chatClient = new OllamaChatClient("http://localhost:11434", "qwen2.5-coder");
+IChatClient chatClient = new OllamaApiClient(new Uri("http://localhost:11434"), "qwen2.5-coder");
 
 var agent = new CodingAgent(chatClient, new AgentOptions
 {
@@ -96,9 +99,10 @@ You can also attach images directly to any turn when your own code loads or capt
 
 ```csharp
 using Microsoft.Extensions.AI;
+using OllamaSharp;
 using SharpCoder;
 
-IChatClient chatClient = new OllamaChatClient("http://localhost:11434", "llama3.2-vision");
+IChatClient chatClient = new OllamaApiClient(new Uri("http://localhost:11434"), "llama3.2-vision");
 var agent = new CodingAgent(chatClient, new AgentOptions
 {
     WorkDirectory = "/path/to/project",
@@ -132,10 +136,11 @@ Delegate self-contained subtasks — codebase analysis, large-text summarization
 
 ```csharp
 using Microsoft.Extensions.AI;
+using OllamaSharp;
 using SharpCoder;
 using SharpCoder.SubAgents;
 
-IChatClient mainClient = new OllamaChatClient("http://localhost:11434", "qwen2.5-coder");
+IChatClient mainClient = new OllamaApiClient(new Uri("http://localhost:11434"), "qwen2.5-coder");
 
 var agent = new CodingAgent(mainClient, new AgentOptions
 {
@@ -151,7 +156,7 @@ var agent = new CodingAgent(mainClient, new AgentOptions
             new SubAgentModelInfo("llama3.2", "Fast summarizer", 128_000),
             new SubAgentModelInfo("qwen2.5-coder", "Coding specialist", 131_072)
         },
-        ClientFactory = modelId => new OllamaChatClient("http://localhost:11434", modelId)
+        ClientFactory = modelId => new OllamaApiClient(new Uri("http://localhost:11434"), modelId)
     }
 });
 
@@ -216,7 +221,7 @@ var agent = new CodingAgent(mainClient, new AgentOptions
         {
             new SubAgentModelInfo("llama3.2-vision", "Vision-capable analyzer", 128_000)
         },
-        ClientFactory = modelId => new OllamaChatClient("http://localhost:11434", modelId)
+        ClientFactory = modelId => new OllamaApiClient(new Uri("http://localhost:11434"), modelId)
     }
 });
 
@@ -296,7 +301,7 @@ var options = new AgentOptions
     EnableAutoCompaction = true,  // enabled by default
 
     // Optional: separate (cheaper) model for context compaction summaries
-    CompactionClient = new OllamaChatClient("http://localhost:11434", "llama3.2"),
+    CompactionClient = new OllamaApiClient(new Uri("http://localhost:11434"), "llama3.2"),
 
     // Optional: compaction model's context window (enables chunked compaction when set)
     CompactionMaxTokens = 16_000, // compaction model's context window; null = use MaxContextTokens
@@ -388,7 +393,7 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 - Use `OnCompacting` / `OnCompacted` callbacks to hook into the compaction lifecycle — e.g. to show a loading indicator before the summarisation call starts.
 - **Separate compaction model** — Configure `CompactionClient` to use a cheaper/smaller model (e.g., `llama3.2` via Ollama) just for context compaction summaries. When not set, the main `IChatClient` is used (backward compatible).
 - **Chunked compaction** — When `CompactionMaxTokens` is set and old messages exceed that budget, they are split into token-budgeted chunks and each chunk is summarized separately. The per-chunk summaries are concatenated into one summary message. This prevents the compaction model from overflowing when it has a smaller context window than the main model. When `CompactionMaxTokens` is null (default), all old messages are summarized in a single call (existing behavior).
-- **Cancellation** — If a summary call throws `OperationCanceledException` while the caller's token is cancelled, compaction rethrows it without changing history or `LastKnownContextTokens` or invoking `OnCompacted`; the attempted call is still recorded in usage, and chunked summarization stops without fallback text. No-op paths (such as auto-compaction disabled or too few messages) may still return `false` with a cancelled token; client-originated cancellation/timeout failures while the caller's token is not cancelled are handled by path: single-call summarization logs and returns `false`; automatic chunked paths log and substitute fallback text, while chunked `CompactOldestPercentAsync`/`ForceCompactAsync` return `false` without logging or fallback text.
+- **Cancellation** — When a summarization call throws `OperationCanceledException` while the caller's token is cancelled, compaction rethrows it without changing history or `LastKnownContextTokens` or invoking `OnCompacted`; the attempted call is still recorded in usage, and chunked summarization stops without fallback text. Exceptions from `OnCompacting`/`OnCompacted` are not covered by this guarantee. No-op paths (such as auto-compaction disabled or too few messages) may still return `false` with a cancelled token; client-originated cancellation/timeout failures while the caller's token is not cancelled are handled by path: single-call summarization logs and returns `false`; automatic chunked paths log and substitute fallback text, while chunked `CompactOldestPercentAsync`/`ForceCompactAsync` return `false` without logging or fallback text.
 - **Partial compaction** — `CompactOldestPercentAsync(session, options, percent, ct)` summarizes only the oldest X% of tokens, keeping the newest portion verbatim. Gentler than full compaction — preserves more recent context with full fidelity while reducing token usage.
 
 ## Skills

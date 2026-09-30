@@ -78,11 +78,13 @@ public sealed class ContextCompactor
     /// <param name="ct">Cancellation token.</param>
     /// <returns><c>true</c> if compaction was performed; otherwise <c>false</c>.</returns>
     /// <exception cref="OperationCanceledException">
-    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
-    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
-    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
-    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
-    /// summarization failure instead.
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
     /// </exception>
     public Task<bool> CompactIfNeededAsync(
         AgentSession session,
@@ -146,9 +148,9 @@ public sealed class ContextCompactor
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Cancellation of this operation's own token is not a compaction failure:
-            // propagate it. History has not been mutated (mutation happens only after the
-            // summary call(s) complete), so the caller observes an unchanged session.
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
             throw;
         }
         catch (System.Exception ex)
@@ -216,11 +218,13 @@ public sealed class ContextCompactor
     /// Thrown when <paramref name="percent"/> is less than 1 or greater than 95.
     /// </exception>
     /// <exception cref="OperationCanceledException">
-    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
-    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
-    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
-    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
-    /// summarization failure instead.
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
     /// </exception>
     public Task<bool> CompactOldestPercentAsync(
         AgentSession session,
@@ -313,9 +317,9 @@ public sealed class ContextCompactor
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Cancellation of this operation's own token is not a compaction failure:
-            // propagate it. History has not been mutated (mutation happens only after the
-            // summary call(s) complete), so the caller observes an unchanged session.
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
             throw;
         }
         catch (System.Exception ex)
@@ -358,11 +362,13 @@ public sealed class ContextCompactor
     /// logging.
     /// </returns>
     /// <exception cref="OperationCanceledException">
-    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
-    /// flight). The history is left unchanged and <see cref="AgentOptions.OnCompacted"/> is not
-    /// invoked. An <see cref="OperationCanceledException"/> raised by the summarization client while
-    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
-    /// summarization failure instead.
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
     /// </exception>
     public Task<bool> ForceCompactAsync(
         AgentSession session,
@@ -422,9 +428,9 @@ public sealed class ContextCompactor
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Cancellation of this operation's own token is not a compaction failure:
-            // propagate it. History has not been mutated (mutation happens only after the
-            // summary call(s) complete), so the caller observes an unchanged session.
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
             throw;
         }
         catch (System.Exception ex)
@@ -456,12 +462,14 @@ public sealed class ContextCompactor
     /// returns <c>false</c> without substituting a fallback.
     /// </returns>
     /// <exception cref="OperationCanceledException">
-    /// Thrown when <paramref name="ct"/> is cancelled (including while a summary call is in
-    /// flight). The history (both <paramref name="messages"/> and the session's) is left
-    /// unchanged and <see cref="AgentOptions.OnCompacted"/> is not invoked. An
-    /// <see cref="OperationCanceledException"/> raised by the summarization client while
-    /// <paramref name="ct"/> is not cancelled (for example an HTTP timeout) is treated as a
-    /// summarization failure instead.
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, the history, <paramref name="messages"/>, the session's
+    /// <see cref="AgentSession.LastKnownContextTokens"/> and <see cref="AgentOptions.OnCompacted"/>
+    /// are untouched; the attempted call is still recorded in usage. No-op paths may return
+    /// <c>false</c> with an already-cancelled token. Exceptions from
+    /// <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are not
+    /// covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
     /// </exception>
     public Task<bool> CompactIfNeededAsync(
         AgentSession? session,
@@ -576,9 +584,9 @@ public sealed class ContextCompactor
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Cancellation of this operation's own token is not a compaction failure:
-            // propagate it. History has not been mutated (mutation happens only after the
-            // summary call(s) complete), so the caller observes an unchanged session.
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history and the live list have not been mutated;
+            // callback exceptions are not covered by that guarantee.
             throw;
         }
         catch (System.Exception ex)

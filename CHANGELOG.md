@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - **Token under-count** — Streaming and tool-calling executions previously counted only the last round's usage. `AgentSession.InputTokensUsed`/`OutputTokensUsed` now sum every recorded call, including compaction calls. `SubAgentInfo.InputTokens`/`OutputTokens` and the `input_tokens`/`output_tokens` returned by `await_sub_agents` now sum all calls made by that sub-agent. Reported totals will be higher than in 0.21.x for the same workload.
+- **Documentation accuracy** — README Ollama samples now use OllamaSharp's `OllamaApiClient`; compaction-cancellation XML docs describe the cancellation guarantee accurately.
 
 ### Changed
 
