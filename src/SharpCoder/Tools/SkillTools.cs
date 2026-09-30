@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 
 namespace SharpCoder.Tools;
 
+/// <summary>Provides tools for discovering and loading workspace skills.</summary>
 public sealed class SkillTools
 {
     private readonly string _workingDirectory;
@@ -16,11 +17,17 @@ public sealed class SkillTools
     private static readonly Regex NameRegex = new Regex(@"^name:\s*(.+)$", RegexOptions.Multiline | RegexOptions.Compiled);
     private static readonly Regex DescriptionRegex = new Regex(@"^description:\s*(.+)$", RegexOptions.Multiline | RegexOptions.Compiled);
 
+    /// <summary>Creates skill tools that search the specified workspace.</summary>
+    /// <param name="workingDirectory">Workspace root containing the <c>.github/skills</c> directory.</param>
     public SkillTools(string workingDirectory)
     {
         _workingDirectory = workingDirectory;
     }
 
+    /// <summary>Reads a skill file from the workspace skills directory.</summary>
+    /// <param name="name">Skill name without the <c>.md</c> extension.</param>
+    /// <param name="ct">Token used to cancel the file read.</param>
+    /// <returns>The skill contents or an error message when the skill cannot be found or read.</returns>
     [Description("Load a specialized skill that provides domain-specific instructions and workflows. Before using a skill, verify it exists using list_skills.")]
     public async Task<string> load_skill(
         [Description("The name of the skill to load (without the .md extension)")] string name,
@@ -41,6 +48,9 @@ public sealed class SkillTools
         }
     }
 
+    /// <summary>Lists skill names and descriptions found in the workspace skills directory.</summary>
+    /// <param name="ct">Token accepted for tool-call compatibility; listing currently completes synchronously.</param>
+    /// <returns>A summary of available skills or <c>No skills found.</c>.</returns>
     [Description("Lists all available skills in the project.")]
     public Task<string> list_skills(CancellationToken ct = default)
     {

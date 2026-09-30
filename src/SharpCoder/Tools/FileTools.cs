@@ -10,11 +10,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SharpCoder.Tools;
 
+/// <summary>Provides file read, write, edit, and search operations rooted in a configured working directory.</summary>
 public sealed class FileTools
 {
     private readonly string _workingDirectory;
     private readonly ILogger _logger;
 
+    /// <summary>Creates file tools rooted at the specified working directory.</summary>
+    /// <param name="workingDirectory">Root directory that bounds file operations.</param>
+    /// <param name="logger">Optional logger for file-operation diagnostics.</param>
     public FileTools(string workingDirectory, ILogger? logger = null)
     {
         _workingDirectory = workingDirectory;
@@ -27,6 +31,12 @@ public sealed class FileTools
             ?? throw new UnauthorizedAccessException($"Path '{path}' escapes the work directory.");
     }
 
+    /// <summary>Reads a section of a file under the working directory, prefixing each returned line with its 1-based line number.</summary>
+    /// <param name="filePath">Relative or absolute file path, resolved within the working directory.</param>
+    /// <param name="offset">1-based starting line; values below 1 are treated as 1.</param>
+    /// <param name="limit">Maximum lines to return; values below 1 are treated as 1. Defaults to 2000.</param>
+    /// <param name="ct">Token used to cancel the file read.</param>
+    /// <returns>Numbered file lines, an end-of-file continuation hint, or an error message.</returns>
     [Description("Read a file from the local filesystem. Returns contents with each line prefixed by its line number. Use offset to read specific sections.")]
     public async Task<string> read_file(
         [Description("The relative or absolute path to the file")] string filePath,
@@ -77,6 +87,11 @@ public sealed class FileTools
         }
     }
 
+    /// <summary>Creates or completely overwrites a file under the working directory, creating parent directories as needed.</summary>
+    /// <param name="filePath">Relative or absolute file path, resolved within the working directory.</param>
+    /// <param name="content">Complete replacement content to write.</param>
+    /// <param name="ct">Token used to cancel the write.</param>
+    /// <returns>A success message or an error message.</returns>
     [Description("Writes new content to a file, completely overwriting it. Do not use this to modify existing files - use edit_file instead.")]
     public async Task<string> write_file(
         [Description("The relative or absolute path to the file")] string filePath,
@@ -102,6 +117,12 @@ public sealed class FileTools
         }
     }
 
+    /// <summary>Replaces one exact, unique text occurrence in a file under the working directory.</summary>
+    /// <param name="filePath">Relative or absolute file path, resolved within the working directory.</param>
+    /// <param name="oldString">Non-empty text that must occur exactly once in the file.</param>
+    /// <param name="newString">Text inserted in place of the matched content.</param>
+    /// <param name="ct">Token used to cancel file reads and writes.</param>
+    /// <returns>A success message or an error message describing why the replacement was not made.</returns>
     [Description("Performs exact string replacements in files. The oldString must exactly match the file content, including whitespace and indentation. Only one occurrence is replaced per call.")]
     public async Task<string> edit_file(
         [Description("The relative or absolute path to the file")] string filePath,
@@ -157,6 +178,9 @@ public sealed class FileTools
         }
     }
 
+    /// <summary>Finds files matching a glob-like pattern under the working directory, returning at most 100 paths.</summary>
+    /// <param name="pattern">Pattern to match, such as <c>**/*.cs</c>; search roots outside the working directory are rejected.</param>
+    /// <returns>Relative matching paths, a no-results message, or an error message.</returns>
     [Description("Searches for files matching a glob pattern.")]
     public string glob(
         [Description("The glob pattern (e.g. '**/*.cs' or 'src/**/*.ts')")] string pattern)
@@ -240,6 +264,11 @@ public sealed class FileTools
         }
     }
 
+    /// <summary>Searches files under the working directory for lines matching a regular expression.</summary>
+    /// <param name="pattern">Regular expression applied separately to each line.</param>
+    /// <param name="include">Optional file-name pattern; brace extensions such as <c>*.{ts,tsx}</c> are also supported.</param>
+    /// <param name="ct">Token used to cancel enumeration and reads.</param>
+    /// <returns>Matching paths and numbered lines, a no-results message, or an error message.</returns>
     [Description("Searches file contents using regular expressions.")]
     public async Task<string> grep(
         [Description("The regex pattern to search for in file contents")] string pattern,

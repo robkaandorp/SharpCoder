@@ -29,11 +29,34 @@ public sealed class SubAgentInfo
     /// <summary>The error message, if the sub-agent failed.</summary>
     public string? Error { get; set; }
 
-    /// <summary>Input token usage, if reported.</summary>
+    /// <summary>
+    /// Input token usage, if reported. Populated from <see cref="Usage"/> whenever at least one of
+    /// the sub-agent's model calls was recorded, and <c>null</c> otherwise — so it is the sum over
+    /// all of the sub-agent's calls, not the usage of its last one.
+    /// </summary>
     public long? InputTokens { get; set; }
 
-    /// <summary>Output token usage, if reported.</summary>
+    /// <summary>
+    /// Output token usage, if reported. Populated from <see cref="Usage"/> whenever at least one of
+    /// the sub-agent's model calls was recorded, and <c>null</c> otherwise — so it is the sum over
+    /// all of the sub-agent's calls, not the usage of its last one.
+    /// </summary>
     public long? OutputTokens { get; set; }
+
+    /// <summary>
+    /// The running total of every model call this sub-agent made that has been forwarded to the
+    /// parent's usage accounting so far — a detached snapshot, so later activity never changes it.
+    /// This includes calls that failed, were cancelled, or timed out after the provider had already
+    /// reported usage.
+    /// <para>
+    /// It is <c>null</c> only while no call has been recorded: a validation failure (which produces
+    /// a standalone Failed snapshot with an empty <see cref="Id"/>), a run cancelled before its
+    /// first call ended, or the Running snapshot of a sub-agent whose first call is still in flight.
+    /// Snapshots taken from <see cref="SubAgentManager.GetStatus"/> report the totals recorded up to
+    /// that moment, so a running sub-agent's totals grow as its calls end.
+    /// </para>
+    /// </summary>
+    public TokenUsage? Usage { get; set; }
 
     /// <summary>
     /// Truncates <paramref name="value"/> to <paramref name="max"/> characters,

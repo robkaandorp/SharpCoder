@@ -39,10 +39,14 @@ public sealed class StreamingUpdate
     }
 
     /// <summary>Creates a text delta update containing a chunk of the assistant's response.</summary>
+    /// <param name="text">Text chunk carried by the update.</param>
+    /// <returns>A text-delta update containing <paramref name="text"/>.</returns>
     public static StreamingUpdate TextDelta(string text) =>
         new(StreamingUpdateKind.TextDelta, text, null);
 
     /// <summary>Creates a completion update with the final agent result.</summary>
+    /// <param name="result">Final result of the agent execution.</param>
+    /// <returns>A completion update carrying <paramref name="result"/>.</returns>
     public static StreamingUpdate Completed(AgentResult result) =>
         new(StreamingUpdateKind.Completed, null, result);
 }

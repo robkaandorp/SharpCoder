@@ -1,0 +1,963 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using SharpCoder.SubAgents;
+
+namespace SharpCoder;
+
+/// <summary>
+/// Token counts summed over one or more model calls.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every count here is an exact sum of values the providers reported — with one exception:
+/// <see cref="Estimated"/>. <see cref="InputTokens"/>, <see cref="OutputTokens"/>,
+/// <see cref="CachedInputTokens"/>, <see cref="ReasoningTokens"/> and the call counters stay exact
+/// provider values; <see cref="Estimated"/> is the only estimated part, an approximate split of the
+/// exact input and output counts into categories (system prompt, tool definitions, conversation
+/// text, tool calls and results, reasoning, images; output text, tool calls and reasoning).
+/// </para>
+/// <para>
+/// "Not reported" is deliberately distinguishable from zero: <see cref="CachedInputTokens"/> and
+/// <see cref="ReasoningTokens"/> sum only the calls that actually reported a value, and
+/// <see cref="CachedInputReportedCalls"/> / <see cref="ReasoningReportedCalls"/> say how many calls
+/// did. A provider that never reports cached tokens (Ollama, for example) therefore leaves both the
+/// sum and the counter at zero, while a provider that reports a cached count of zero increments the
+/// counter. Consumers must check the counters before treating a zero sum as a measurement.
+/// </para>
+/// <para>
+/// A call that returned no usage information at all still counts in <see cref="Calls"/> (with zero
+/// tokens) and does not increment the reported-calls counters.
+/// </para>
+/// </remarks>
+public sealed class TokenUsage
+{
+    /// <summary>Input tokens summed over the calls being counted.</summary>
+    public long InputTokens { get; set; }
+
+    /// <summary>Output tokens summed over the calls being counted.</summary>
+    public long OutputTokens { get; set; }
+
+    /// <summary>
+    /// Cached (prompt-cache) input tokens summed over the calls that reported a cached count.
+    /// Check <see cref="CachedInputReportedCalls"/> to tell "not reported" apart from "zero".
+    /// </summary>
+    public long CachedInputTokens { get; set; }
+
+    /// <summary>
+    /// Reasoning tokens summed over the calls that reported a reasoning count.
+    /// Check <see cref="ReasoningReportedCalls"/> to tell "not reported" apart from "zero".
+    /// </summary>
+    public long ReasoningTokens { get; set; }
+
+    /// <summary>
+    /// Number of model calls being counted, including calls that reported no usage information.
+    /// </summary>
+    public int Calls { get; set; }
+
+    /// <summary>
+    /// Number of calls that reported a cached input token count — that is, the number of calls
+    /// whose cached input count contributed to <see cref="CachedInputTokens"/>.
+    /// </summary>
+    public int CachedInputReportedCalls { get; set; }
+
+    /// <summary>
+    /// Number of calls that reported a reasoning token count — that is, the number of calls
+    /// whose reasoning count contributed to <see cref="ReasoningTokens"/>.
+    /// </summary>
+    public int ReasoningReportedCalls { get; set; }
+
+    private EstimatedTokenBreakdown _estimated = new EstimatedTokenBreakdown();
+
+    /// <summary>
+    /// An ESTIMATED per-category split of <see cref="InputTokens"/> and <see cref="OutputTokens"/> —
+    /// the only estimated part of this type; every other count is exact. Never <c>null</c>:
+    /// assigning <c>null</c> (or loading data written before this property existed) yields an empty
+    /// estimate with zero estimated calls. See <see cref="EstimatedTokenBreakdown"/> for how the
+    /// estimate is made and which exact invariants it keeps.
+    /// </summary>
+    public EstimatedTokenBreakdown Estimated
+    {
+        get => _estimated;
+        set => _estimated = value ?? new EstimatedTokenBreakdown();
+    }
+
+    /// <summary>
+    /// Adds the counts of <paramref name="other"/> into this instance and returns this instance,
+    /// so that calls can be chained. <c>null</c> is ignored.
+    /// </summary>
+    /// <param name="other">The usage to add; may be <c>null</c>.</param>
+    /// <returns>This instance, with <paramref name="other"/>'s counts added.</returns>
+    public TokenUsage Add(TokenUsage? other)
+    {
+        if (other is null) return this;
+
+        InputTokens += other.InputTokens;
+        OutputTokens += other.OutputTokens;
+        CachedInputTokens += other.CachedInputTokens;
+        ReasoningTokens += other.ReasoningTokens;
+        Calls += other.Calls;
+        CachedInputReportedCalls += other.CachedInputReportedCalls;
+        ReasoningReportedCalls += other.ReasoningReportedCalls;
+        Estimated.Add(other.Estimated);
+        return this;
+    }
+
+    /// <summary>
+    /// Creates a detached deep copy of this instance, <see cref="Estimated"/> included; later
+    /// changes to either do not affect the other.
+    /// </summary>
+    /// <returns>A new <see cref="TokenUsage"/> with the same counts and estimate.</returns>
+    public TokenUsage Clone() => new TokenUsage
+    {
+        InputTokens = InputTokens,
+        OutputTokens = OutputTokens,
+        CachedInputTokens = CachedInputTokens,
+        ReasoningTokens = ReasoningTokens,
+        Calls = Calls,
+        CachedInputReportedCalls = CachedInputReportedCalls,
+        ReasoningReportedCalls = ReasoningReportedCalls,
+        Estimated = Estimated.Clone()
+    };
+
+    /// <summary>
+    /// Counts one model call described by a single <see cref="UsageDetails"/> (or by no details at
+    /// all, for a call that reported nothing): <see cref="Calls"/> is one, the token counts come
+    /// from the details, and the reported-calls counters are incremented only when the
+    /// corresponding optional count was present.
+    /// </summary>
+    internal static TokenUsage FromSingleCall(UsageDetails? details) => new TokenUsage
+    {
+        InputTokens = details?.InputTokenCount ?? 0,
+        OutputTokens = details?.OutputTokenCount ?? 0,
+        CachedInputTokens = details?.CachedInputTokenCount ?? 0,
+        ReasoningTokens = details?.ReasoningTokenCount ?? 0,
+        Calls = 1,
+        CachedInputReportedCalls = details?.CachedInputTokenCount.HasValue == true ? 1 : 0,
+        ReasoningReportedCalls = details?.ReasoningTokenCount.HasValue == true ? 1 : 0
+    };
+
+    /// <summary>Renders the counts and their completeness, e.g. <c>2 call(s): input=25000, output=30</c>.</summary>
+    public override string ToString()
+    {
+        var sb = new StringBuilder();
+        sb.Append(Calls).Append(" call(s): input=").Append(InputTokens);
+        sb.Append(", output=").Append(OutputTokens);
+        sb.Append(", cachedInput=").Append(CachedInputTokens);
+        if (CachedInputReportedCalls == 0) sb.Append(" (not reported)");
+        sb.Append(", reasoning=").Append(ReasoningTokens);
+        if (ReasoningReportedCalls == 0) sb.Append(" (not reported)");
+        return sb.ToString();
+    }
+}
+
+/// <summary>
+/// Classifies the model call a recorded usage event came from, so that the cost of the agent loop
+/// can be told apart from the cost of context compaction and from the cost of sub-agents.
+/// </summary>
+public enum UsageSource
+{
+    /// <summary>A call made by the agent loop itself.</summary>
+    Agent,
+
+    /// <summary>A context-compaction summarisation call.</summary>
+    Compaction,
+
+    /// <summary>
+    /// A call made by a sub-agent session: every model call a sub-agent makes is forwarded to the
+    /// usage accounting of the parent execution that started it, labelled with this source, with the
+    /// sub-agent's own model, and with the sub-agent's id in <see cref="UsageEvent.SubAgentId"/>.
+    /// </summary>
+    SubAgent,
+
+    /// <summary>
+    /// A compaction call made inside a sub-agent session: the sub-agent forwarding map translates the
+    /// child's <see cref="Compaction"/> events to this source. A sub-agent execution is stateless
+    /// today, so it never compacts and no event of this source can appear in a summary yet; were one
+    /// to be produced it would be forwarded exactly like <see cref="SubAgent"/>.
+    /// </summary>
+    SubAgentCompaction
+}
+
+/// <summary>
+/// One aggregated usage bucket of a <see cref="UsageSummary"/>: all recorded calls that share the
+/// same <see cref="Source"/> and <see cref="Model"/>.
+/// </summary>
+public sealed class UsageEntry
+{
+    /// <summary>The source the calls in this entry came from.</summary>
+    public UsageSource Source { get; set; }
+
+    /// <summary>
+    /// The model the calls in this entry were sent to, or <c>null</c> when neither the client's
+    /// <see cref="ChatClientMetadata"/> nor the responses identified one.
+    /// </summary>
+    public string? Model { get; set; }
+
+    /// <summary>The summed usage of the calls in this entry.</summary>
+    public TokenUsage Usage { get; set; } = new TokenUsage();
+
+    /// <summary>Creates an empty entry; used by serializers.</summary>
+    public UsageEntry()
+    {
+    }
+
+    /// <summary>Creates an entry for the given source, model and summed usage.</summary>
+    /// <param name="source">The source the calls came from.</param>
+    /// <param name="model">The model the calls were sent to; <c>null</c> when unknown.</param>
+    /// <param name="usage">The summed usage; <c>null</c> is treated as empty.</param>
+    public UsageEntry(UsageSource source, string? model, TokenUsage? usage)
+    {
+        Source = source;
+        Model = model;
+        Usage = usage ?? new TokenUsage();
+    }
+
+    /// <summary>Creates a detached copy of this entry.</summary>
+    internal UsageEntry Clone()
+    {
+        var usage = Usage;
+        return new UsageEntry(Source, Model, usage is null ? new TokenUsage() : usage.Clone());
+    }
+}
+
+/// <summary>
+/// A thread-safe accumulation of recorded model-call usage, grouped into one
+/// <see cref="UsageEntry"/> per (source, model) pair, plus a <see cref="Total"/> over all of them.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Entries are keyed by the pair (source, model): the same model used under two sources produces
+/// two entries, and two models under one source produce two entries as well.
+/// </para>
+/// <para>
+/// <see cref="Add"/> is thread-safe and loses no updates. Snapshots taken through
+/// <see cref="Snapshot"/> or the <see cref="Entries"/> getter are detached deep copies, so later
+/// additions never change a snapshot that was already handed out.
+/// </para>
+/// <para>
+/// The type is JSON-serialisable (entries and total are public properties with a public setter or
+/// a computed value), which is what <see cref="AgentSession"/> uses to persist cumulative usage.
+/// </para>
+/// </remarks>
+public sealed class UsageSummary
+{
+    private readonly object _sync = new object();
+    private readonly List<UsageEntry> _entries = new List<UsageEntry>();
+
+    /// <summary>Creates an empty summary.</summary>
+    public UsageSummary()
+    {
+    }
+
+    /// <summary>Creates a summary from the given entries, deep-copying each one.</summary>
+    /// <param name="entries">The entries to copy; may be <c>null</c>.</param>
+    public UsageSummary(IEnumerable<UsageEntry>? entries)
+    {
+        if (entries is null) return;
+        foreach (var entry in entries)
+        {
+            if (entry is null) continue;
+            _entries.Add(entry.Clone());
+        }
+    }
+
+    /// <summary>
+    /// The per-(source, model) entries, as a detached deep copy — mutating the returned list or its
+    /// entries does not affect this summary. Setting the property replaces all entries with deep
+    /// copies of the supplied entries (serializers use this path).
+    /// </summary>
+    public IReadOnlyList<UsageEntry> Entries
+    {
+        get
+        {
+            lock (_sync) return CopyEntriesUnlocked();
+        }
+        set
+        {
+            lock (_sync)
+            {
+                _entries.Clear();
+                if (value is null) return;
+                foreach (var entry in value)
+                {
+                    if (entry is null) continue;
+                    _entries.Add(entry.Clone());
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The sum over all entries, freshly computed and detached. On an empty summary this is an
+    /// all-zero <see cref="TokenUsage"/> with <see cref="TokenUsage.Calls"/> = 0.
+    /// </summary>
+    public TokenUsage Total
+    {
+        get
+        {
+            lock (_sync)
+            {
+                var total = new TokenUsage();
+                foreach (var entry in _entries)
+                {
+                    total.Add(entry.Usage);
+                }
+                return total;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records one model call: its usage is added to the entry matching its source and model,
+    /// creating that entry when it does not exist yet, or to <see cref="Total"/> alone when there
+    /// are no entries. Thread-safe; concurrent additions never lose an update.
+    /// </summary>
+    /// <param name="usageEvent">The recorded call; <c>null</c> is ignored.</param>
+    public void Add(UsageEvent usageEvent)
+    {
+        if (usageEvent is null) return;
+
+        lock (_sync)
+        {
+            UsageEntry? entry = null;
+            foreach (var candidate in _entries)
+            {
+                if (candidate.Source == usageEvent.Source && string.Equals(candidate.Model, usageEvent.Model, StringComparison.Ordinal))
+                {
+                    entry = candidate;
+                    break;
+                }
+            }
+
+            if (entry is null)
+            {
+                entry = new UsageEntry(usageEvent.Source, usageEvent.Model, new TokenUsage());
+                _entries.Add(entry);
+            }
+
+            entry.Usage ??= new TokenUsage();
+            entry.Usage.Add(usageEvent.Usage);
+        }
+    }
+
+    /// <summary>
+    /// Creates a detached deep copy of this summary — entries and totals included. The copy never
+    /// changes afterwards, no matter how many events are added to this summary.
+    /// </summary>
+    /// <returns>A new, independent <see cref="UsageSummary"/>.</returns>
+    public UsageSummary Snapshot()
+    {
+        lock (_sync) return new UsageSummary(CopyEntriesUnlocked());
+    }
+
+    /// <summary>Renders the total and the per-(source, model) breakdown for diagnostics.</summary>
+    public override string ToString()
+    {
+        var sb = new StringBuilder();
+        sb.Append(Total.ToString());
+        foreach (var entry in Entries)
+        {
+            sb.Append(" | ").Append(entry.Source).Append('/').Append(entry.Model ?? "(unknown)").Append(": ").Append(entry.Usage.ToString());
+        }
+        return sb.ToString();
+    }
+
+    private List<UsageEntry> CopyEntriesUnlocked()
+    {
+        var copy = new List<UsageEntry>(_entries.Count);
+        foreach (var entry in _entries)
+        {
+            copy.Add(entry.Clone());
+        }
+        return copy;
+    }
+}
+
+/// <summary>
+/// One recorded model call: a single request sent to a model client — one
+/// <c>GetResponseAsync</c> call or one <c>GetStreamingResponseAsync</c> enumeration.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A call is recorded exactly once, when it ends, whichever way it ends: a completed response is
+/// recorded with the usage it reported, and a call that threw, or whose stream was disposed early,
+/// is recorded with the usage received so far (zero when none arrived). A call that reported no
+/// usage still counts in <see cref="TokenUsage.Calls"/> and does not increment the reported-calls
+/// counters.
+/// </para>
+/// <para>
+/// Transport-level retries performed inside a provider's HTTP handler are invisible to SharpCoder
+/// and are therefore not counted as separate calls.
+/// </para>
+/// <para>
+/// <see cref="Usage"/> describes exactly this one call, so <see cref="TokenUsage.Calls"/> of a
+/// freshly recorded event is always 1.
+/// </para>
+/// </remarks>
+public sealed class UsageEvent
+{
+    /// <summary>Creates an event for a single recorded call.</summary>
+    /// <param name="source">The source of the call.</param>
+    /// <param name="model">The model the call was sent to; null/whitespace becomes <c>null</c>.</param>
+    /// <param name="usage">
+    /// The call's usage; <c>null</c> is treated as a zero-token call. Because an event describes
+    /// exactly one call, the stored usage always has <see cref="TokenUsage.Calls"/> set to 1 — this
+    /// is a copy of <paramref name="usage"/> (its <see cref="TokenUsage.Estimated"/> breakdown
+    /// included), so the caller's instance is never mutated and later changes to it never reach the
+    /// event.
+    /// </param>
+    /// <param name="subAgentId">
+    /// The sub-agent the call belongs to, when the call was made by a sub-agent; <c>null</c> for
+    /// parent-agent, compaction and host-initiated calls. Sub-agent calls are forwarded by
+    /// <see cref="SubAgentManager"/> with the sub-agent's id (for example <c>sub-1</c>) and the
+    /// mapped source <see cref="UsageSource.SubAgent"/> or <see cref="UsageSource.SubAgentCompaction"/>.
+    /// </param>
+    public UsageEvent(UsageSource source, string? model, TokenUsage? usage, string? subAgentId = null)
+    {
+        Source = source;
+        Model = string.IsNullOrWhiteSpace(model) ? null : model;
+        SubAgentId = subAgentId;
+        Usage = new TokenUsage
+        {
+            InputTokens = usage?.InputTokens ?? 0,
+            OutputTokens = usage?.OutputTokens ?? 0,
+            CachedInputTokens = usage?.CachedInputTokens ?? 0,
+            ReasoningTokens = usage?.ReasoningTokens ?? 0,
+            Calls = 1,
+            CachedInputReportedCalls = usage?.CachedInputReportedCalls ?? 0,
+            ReasoningReportedCalls = usage?.ReasoningReportedCalls ?? 0,
+            Estimated = usage?.Estimated?.Clone() ?? new EstimatedTokenBreakdown()
+        };
+    }
+
+    /// <summary>The source of the recorded call.</summary>
+    public UsageSource Source { get; }
+
+    /// <summary>
+    /// The model the call was sent to: the calling client's <see cref="ChatClientMetadata"/>
+    /// default model when known, otherwise the model the response reported, otherwise <c>null</c>.
+    /// </summary>
+    public string? Model { get; }
+
+    /// <summary>
+    /// The sub-agent session the call belongs to, or <c>null</c> for parent-agent, compaction and
+    /// host-initiated calls. Sub-agent calls forwarded by <see cref="SubAgentManager"/> always carry
+    /// the sub-agent's id here (<c>sub-1</c>, <c>sub-2</c>, …); a sub-agent whose run never started
+    /// makes no call and therefore forwards nothing.
+    /// </summary>
+    public string? SubAgentId { get; }
+
+    /// <summary>The usage of this single call; <see cref="TokenUsage.Calls"/> is 1.</summary>
+    public TokenUsage Usage { get; }
+
+    /// <summary>Renders the event for diagnostics, e.g. <c>Agent/model-x: 1 call(s): input=1000, output=10</c>.</summary>
+    public override string ToString()
+        => $"{Source}/{Model ?? "(unknown)"}: {Usage.ToString()}";
+}
+
+/// <summary>
+/// The one shared recording mechanism behind every model call SharpCoder makes: callers pass each
+/// recorded <see cref="UsageEvent"/> here, and it fans the event out to the execution-local
+/// summary, the session (cumulative usage plus the legacy cumulative token counters) and the host's
+/// <see cref="AgentOptions.OnUsage"/> callback.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Exactly one recorder exists per execution, so two overlapping executions on one agent never mix
+/// their usage. Session-level state (cumulative counters and <see cref="AgentSession.Usage"/>) is
+/// updated as each call ends, so a host polling a session mid-run sees current totals; two
+/// executions sharing ONE <see cref="AgentSession"/> concurrently remain unsupported — exactly as
+/// they were before this mechanism existed — and their calls would interleave in that shared
+/// session's totals.
+/// </para>
+/// <para>
+/// A recorder can be shared across threads: <see cref="SubAgentManager"/> binds each sub-agent it
+/// starts to the recorder of the parent execution that started it, and forwards every sub-agent
+/// call here from the sub-agent's own thread. The session update therefore takes the session's
+/// <see cref="AgentSession.UsageSyncRoot"/>, so concurrent recording cannot lose a token count.
+/// </para>
+/// <para>
+/// The host callback is invoked outside every internal lock, and an exception it throws is caught
+/// and logged — it can never fail or alter the run.
+/// </para>
+/// </remarks>
+internal sealed class UsageRecorder
+{
+    private readonly UsageSummary _summary = new UsageSummary();
+    private readonly AgentSession? _session;
+    private readonly AgentOptions _options;
+    private readonly ILogger _logger;
+
+    /// <summary>Creates a recorder that accumulates into its own execution-local summary.</summary>
+    /// <param name="options">Agent options; the <see cref="AgentOptions.OnUsage"/> callback is read from it per call.</param>
+    /// <param name="session">The session to update, or <c>null</c> for a stateless execution.</param>
+    /// <param name="logger">Logger used for callback failures and metadata lookup failures.</param>
+    internal UsageRecorder(AgentOptions options, AgentSession? session, ILogger? logger)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _session = session;
+        _logger = logger ?? NullLogger.Instance;
+    }
+
+    /// <summary>The execution-local summary of every call this execution recorded.</summary>
+    internal UsageSummary Summary => _summary;
+
+    /// <summary>
+    /// Records one ended model call exactly once: adds it to the execution summary, adds it to the
+    /// session's cumulative usage (when there is a session) and raises
+    /// <see cref="AgentOptions.OnUsage"/>.
+    /// <para>
+    /// The session's cumulative counters and <see cref="AgentSession.Usage"/> are updated under the
+    /// session's <see cref="AgentSession.UsageSyncRoot"/>, because sub-agents forward their calls to
+    /// the recorder of the parent execution from the sub-agent's own thread: two threads can record
+    /// into one session at the same time, and the lock keeps every count.
+    /// </para>
+    /// <para>
+    /// This method never throws: a host handler that throws is caught, and both the handler
+    /// invocation and the best-effort warning written for it are contained, so a failing handler —
+    /// or a failing logger — can never fail or alter the model call being recorded.
+    /// </para>
+    /// </summary>
+    /// <param name="usageEvent">The recorded call; <c>null</c> is ignored.</param>
+    internal void Record(UsageEvent usageEvent)
+    {
+        if (usageEvent is null) return;
+
+        _summary.Add(usageEvent);
+
+        var session = _session;
+        if (session is not null)
+        {
+            // Taken only for the session update, and released before the host callback: a host
+            // handler may call back into SharpCoder (and read the session) without deadlocking.
+            lock (session.UsageSyncRoot)
+            {
+                session.Usage.Add(usageEvent);
+                session.InputTokensUsed += usageEvent.Usage.InputTokens;
+                session.OutputTokensUsed += usageEvent.Usage.OutputTokens;
+            }
+        }
+
+        // Never inside a lock: a host handler may call back into SharpCoder.
+        var handler = _options.OnUsage;
+        if (handler is null) return;
+        try
+        {
+            handler(usageEvent);
+        }
+        catch (Exception ex)
+        {
+            // Reporting the host-handler failure is best effort: the logger write gets its OWN
+            // guard, because a logger that throws must not turn this diagnostic into a failure of
+            // an otherwise successful model call (or of a compaction) — nothing at the recording
+            // boundary may ever throw.
+            try
+            {
+                _logger.LogWarning(ex, "CodingAgent.OnUsage handler threw an exception.");
+            }
+            catch
+            {
+                // Swallowed deliberately; see above.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reports that estimating the <see cref="TokenUsage.Estimated"/> breakdown of a call failed.
+    /// The call is then recorded without an estimate. Never throws: the best-effort warning is
+    /// contained so a failing logger cannot fail the model call either.
+    /// </summary>
+    internal void ReportEstimationFailure(Exception ex)
+    {
+        try
+        {
+            _logger.LogWarning(ex, "Estimating the token usage breakdown of a model call failed; the call is recorded without an estimate.");
+        }
+        catch
+        {
+            // Swallowed deliberately: estimation must never fail the call being recorded.
+        }
+    }
+
+    /// <summary>
+    /// Resolves the model a client sends its calls to, from the client's
+    /// <see cref="ChatClientMetadata"/>; <c>null</c> when the client exposes none. A client whose
+    /// metadata lookup throws is reported as unknown rather than failing the run, and the
+    /// best-effort debug write for it is contained so a failing logger cannot throw either.
+    /// </summary>
+    internal string? ResolveClientModel(IChatClient client)
+    {
+        try
+        {
+            return (client.GetService(typeof(ChatClientMetadata)) as ChatClientMetadata)?.DefaultModelId;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                _logger.LogDebug(ex, "ChatClientMetadata lookup failed while recording token usage.");
+            }
+            catch
+            {
+                // Swallowed deliberately: reporting must never fail the run being recorded.
+            }
+
+            return null;
+        }
+    }
+}
+
+/// <summary>
+/// The shared per-call recorder: a chat-client wrapper that reports every call that passes through
+/// it to a <see cref="UsageRecorder"/>, exactly once, when the call ends — however it ends.
+/// </summary>
+/// <remarks>
+/// <para>
+/// One instance is created per execution (or per call site that needs its own classification), so
+/// overlapping executions never mix their usage. The wrapper also captures
+/// <see cref="LastRoundInputTokens"/>, the input token count of the most recent call, which feeds
+/// <see cref="AgentSession.LastKnownContextTokens"/> (the latest round's context size — never a sum).
+/// </para>
+/// <para>
+/// A sub-agent's client is wrapped the same way — by the child execution itself, with
+/// <see cref="UsageSource.Agent"/>/<see cref="UsageSource.Compaction"/> — and the child's
+/// <see cref="AgentOptions.OnUsage"/> forwarder installed by <see cref="SubAgentManager"/> maps the
+/// recorded call to <see cref="UsageSource.SubAgent"/>/<see cref="UsageSource.SubAgentCompaction"/>,
+/// sets <see cref="UsageEvent.SubAgentId"/> and passes the event to the parent execution's recorder.
+/// The model is left as recorded here: it comes from the calling client's
+/// <see cref="ChatClientMetadata"/> default model, falling back to the model the response reported.
+/// </para>
+/// <para>
+/// For a streaming call, usage is summed over every <see cref="UsageContent"/> received before the
+/// enumeration ended; because providers may split usage across several updates, each optional count
+/// counts as "reported" when at least one update carried a value, which keeps the reported-calls
+/// counters at one per call.
+/// </para>
+/// <para>
+/// Every recorded call also carries its <see cref="TokenUsage.Estimated"/> breakdown, computed by
+/// <see cref="UsageEstimator"/> from the request passed to the inner client and from the response
+/// messages (or, when streaming, from the updates actually received — an early-ended stream is
+/// estimated from what arrived). A request whose messages are not already a materialised collection
+/// is materialised once and that same list is passed to the inner client. Estimation is contained
+/// exactly like <see cref="UsageRecorder.Record"/>: a failure is logged and the call is recorded
+/// without an estimate; it can never fail or alter the model call.
+/// </para>
+/// </remarks>
+internal sealed class UsageRecordingChatClient : DelegatingChatClient
+{
+    private readonly UsageRecorder _recorder;
+    private readonly UsageSource _source;
+    private readonly string? _subAgentId;
+    private readonly string? _metadataModelId;
+
+    /// <summary>Creates a recording wrapper around <paramref name="inner"/>.</summary>
+    /// <param name="inner">The client whose calls are recorded.</param>
+    /// <param name="recorder">The recorder that receives one event per ended call.</param>
+    /// <param name="source">The source classification for the recorded calls.</param>
+    /// <param name="subAgentId">
+    /// The sub-agent id carried by the recorded calls, or <c>null</c> for calls that do not belong to
+    /// a sub-agent. Callers that wrap a sub-agent's own client pass <c>null</c> here: the manager's
+    /// forwarder stamps <see cref="UsageEvent.SubAgentId"/> on the way to the parent recorder.
+    /// </param>
+    internal UsageRecordingChatClient(IChatClient inner, UsageRecorder recorder, UsageSource source = UsageSource.Agent, string? subAgentId = null)
+        : base(inner)
+    {
+        _recorder = recorder ?? throw new ArgumentNullException(nameof(recorder));
+        _source = source;
+        _subAgentId = subAgentId;
+        _metadataModelId = recorder.ResolveClientModel(inner);
+    }
+
+    /// <summary>
+    /// Input token count of the most recent call, or <c>null</c> while no call has reported one.
+    /// </summary>
+    internal long? LastRoundInputTokens { get; private set; }
+
+    /// <inheritdoc />
+    public override async Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, CancellationToken ct = default)
+    {
+        ChatResponse? response = null;
+        long[]? inputWeights = null;
+        Exception? estimationFailure = null;
+        try
+        {
+            // Materialised at most once, and this same instance goes to the inner client, so a
+            // one-shot sequence is never enumerated twice.
+            var materialised = Materialise(messages);
+            inputWeights = MeasureInput(materialised, chatOptions, ref estimationFailure);
+
+            response = await InnerClient.GetResponseAsync(materialised, chatOptions, ct).ConfigureAwait(false);
+            return response;
+        }
+        finally
+        {
+            var usage = response?.Usage;
+            if (usage?.InputTokenCount is long inputTokens)
+                LastRoundInputTokens = inputTokens;
+
+            var tokenUsage = TokenUsage.FromSingleCall(usage);
+            tokenUsage.Estimated = BuildEstimate(
+                inputWeights,
+                estimationFailure,
+                usage?.InputTokenCount,
+                usage?.OutputTokenCount,
+                usage?.ReasoningTokenCount,
+                response);
+
+            _recorder.Record(new UsageEvent(
+                _source, ResolveModel(response?.ModelId), tokenUsage, _subAgentId));
+        }
+    }
+
+    /// <inheritdoc />
+    public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? chatOptions,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var usage = new CallUsageAccumulator();
+        string? responseModelId = null;
+        long[]? inputWeights = null;
+        Exception? estimationFailure = null;
+
+        try
+        {
+            // Materialised at most once, and this same instance goes to the inner client, so a
+            // one-shot sequence is never enumerated twice.
+            var materialised = Materialise(messages);
+            inputWeights = MeasureInput(materialised, chatOptions, ref estimationFailure);
+
+            await foreach (var update in InnerClient.GetStreamingResponseAsync(materialised, chatOptions, ct).WithCancellation(ct))
+            {
+                if (!string.IsNullOrWhiteSpace(update.ModelId)) responseModelId = update.ModelId;
+                usage.Add(update);
+                yield return update;
+            }
+        }
+        finally
+        {
+            // Reached on completion, on failure, and when the consumer disposes the enumeration
+            // early: either way the call is recorded exactly once, with whatever usage arrived —
+            // and the estimate describes exactly the updates that arrived.
+            if (usage.InputReported)
+                LastRoundInputTokens = usage.InputTokens;
+
+            var tokenUsage = usage.ToTokenUsage();
+            tokenUsage.Estimated = BuildStreamingEstimate(inputWeights, estimationFailure, usage);
+
+            _recorder.Record(new UsageEvent(
+                _source, ResolveModel(responseModelId), tokenUsage, _subAgentId));
+        }
+    }
+
+    /// <summary>
+    /// Returns <paramref name="messages"/> itself when it is already a materialised collection
+    /// (<see cref="IList{T}"/> or <see cref="IReadOnlyCollection{T}"/>), otherwise enumerates it
+    /// exactly once into a list. <c>null</c> is passed through untouched for the inner client to
+    /// handle as it always did.
+    /// </summary>
+    private static IEnumerable<ChatMessage> Materialise(IEnumerable<ChatMessage> messages)
+    {
+        if (messages is null || messages is IList<ChatMessage> || messages is IReadOnlyCollection<ChatMessage>)
+            return messages!;
+        return new List<ChatMessage>(messages);
+    }
+
+    /// <summary>
+    /// Measures the request's input weights; a failure is captured in
+    /// <paramref name="estimationFailure"/> (and the call later recorded without an estimate)
+    /// instead of escaping into the model call.
+    /// </summary>
+    private static long[]? MeasureInput(IEnumerable<ChatMessage> messages, ChatOptions? chatOptions, ref Exception? estimationFailure)
+    {
+        try
+        {
+            return UsageEstimator.MeasureInput(messages, chatOptions);
+        }
+        catch (Exception ex)
+        {
+            estimationFailure = ex;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Builds the estimate of a non-streaming call. Never throws: any failure (including one
+    /// captured earlier while measuring the input) is logged and yields an empty estimate, so the
+    /// call is recorded without an estimate and its outcome is unaffected.
+    /// </summary>
+    private EstimatedTokenBreakdown BuildEstimate(
+        long[]? inputWeights, Exception? estimationFailure,
+        long? inputTokens, long? outputTokens, long? reasoningTokens, ChatResponse? response)
+    {
+        try
+        {
+            if (estimationFailure is not null)
+            {
+                _recorder.ReportEstimationFailure(estimationFailure);
+                return new EstimatedTokenBreakdown();
+            }
+
+            var outputWeights = new UsageEstimator.OutputWeights();
+            if (outputTokens.HasValue)
+                outputWeights.Add(response?.Messages);
+
+            return UsageEstimator.Estimate(inputWeights, inputTokens, outputTokens, reasoningTokens, outputWeights);
+        }
+        catch (Exception ex)
+        {
+            _recorder.ReportEstimationFailure(ex);
+            return new EstimatedTokenBreakdown();
+        }
+    }
+
+    /// <summary>
+    /// Builds the estimate of a streaming call from everything the accumulator received. Never
+    /// throws: any failure is logged and yields an empty estimate.
+    /// </summary>
+    private EstimatedTokenBreakdown BuildStreamingEstimate(
+        long[]? inputWeights, Exception? estimationFailure, CallUsageAccumulator usage)
+    {
+        try
+        {
+            var failure = estimationFailure ?? usage.EstimationFailure;
+            if (failure is not null)
+            {
+                _recorder.ReportEstimationFailure(failure);
+                return new EstimatedTokenBreakdown();
+            }
+
+            return UsageEstimator.Estimate(
+                inputWeights,
+                usage.InputReported ? usage.InputTokens : null,
+                usage.OutputReported ? usage.OutputTokens : null,
+                usage.ReasoningReported ? usage.ReasoningTokens : null,
+                usage.OutputWeights);
+        }
+        catch (Exception ex)
+        {
+            _recorder.ReportEstimationFailure(ex);
+            return new EstimatedTokenBreakdown();
+        }
+    }
+
+    /// <summary>
+    /// The client's metadata model wins; the model the response reported is the fallback; otherwise
+    /// the call is recorded with no model.
+    /// </summary>
+    private string? ResolveModel(string? responseModelId)
+    {
+        if (!string.IsNullOrWhiteSpace(_metadataModelId)) return _metadataModelId;
+        return string.IsNullOrWhiteSpace(responseModelId) ? null : responseModelId;
+    }
+
+    /// <summary>Sums the usage of ONE streaming call across all of its updates.</summary>
+    private sealed class CallUsageAccumulator
+    {
+        private long _inputTokens;
+        private long _outputTokens;
+        private long _cachedInputTokens;
+        private long _reasoningTokens;
+        private bool _inputReported;
+        private bool _outputReported;
+        private bool _cachedInputReported;
+        private bool _reasoningReported;
+        private readonly UsageEstimator.OutputWeights _outputWeights = new UsageEstimator.OutputWeights();
+        private Exception? _estimationFailure;
+
+        /// <summary>True when at least one update reported an input token count.</summary>
+        internal bool InputReported => _inputReported;
+
+        /// <summary>The summed input token count of this call so far.</summary>
+        internal long InputTokens => _inputTokens;
+
+        /// <summary>True when at least one update reported an output token count.</summary>
+        internal bool OutputReported => _outputReported;
+
+        /// <summary>The summed output token count of this call so far.</summary>
+        internal long OutputTokens => _outputTokens;
+
+        /// <summary>True when at least one update reported a reasoning token count.</summary>
+        internal bool ReasoningReported => _reasoningReported;
+
+        /// <summary>The summed reasoning token count of this call so far.</summary>
+        internal long ReasoningTokens => _reasoningTokens;
+
+        /// <summary>Output character weights of every update received so far.</summary>
+        internal UsageEstimator.OutputWeights OutputWeights => _outputWeights;
+
+        /// <summary>
+        /// The first failure raised while measuring output weights, or <c>null</c>. Once set, the
+        /// call is recorded without an estimate and no further weights are measured.
+        /// </summary>
+        internal Exception? EstimationFailure => _estimationFailure;
+
+        /// <summary>
+        /// Adds every usage item carried by <paramref name="update"/>, and the output character
+        /// weights of its contents (contained: a measuring failure is captured, never thrown).
+        /// </summary>
+        internal void Add(ChatResponseUpdate update)
+        {
+            if (_estimationFailure is null)
+            {
+                try
+                {
+                    _outputWeights.Add(update.Contents);
+                }
+                catch (Exception ex)
+                {
+                    _estimationFailure = ex;
+                }
+            }
+
+            foreach (var content in update.Contents)
+            {
+                var details = (content as UsageContent)?.Details;
+                if (details is null) continue;
+
+                if (details.InputTokenCount is long inputTokens)
+                {
+                    _inputTokens += inputTokens;
+                    _inputReported = true;
+                }
+
+                if (details.OutputTokenCount is long outputTokens)
+                {
+                    _outputTokens += outputTokens;
+                    _outputReported = true;
+                }
+
+                if (details.CachedInputTokenCount is long cachedInputTokens)
+                {
+                    _cachedInputTokens += cachedInputTokens;
+                    _cachedInputReported = true;
+                }
+
+                if (details.ReasoningTokenCount is long reasoningTokens)
+                {
+                    _reasoningTokens += reasoningTokens;
+                    _reasoningReported = true;
+                }
+            }
+        }
+
+        /// <summary>Builds the single-call usage described by everything added so far.</summary>
+        internal TokenUsage ToTokenUsage() => new TokenUsage
+        {
+            InputTokens = _inputTokens,
+            OutputTokens = _outputTokens,
+            CachedInputTokens = _cachedInputTokens,
+            ReasoningTokens = _reasoningTokens,
+            Calls = 1,
+            CachedInputReportedCalls = _cachedInputReported ? 1 : 0,
+            ReasoningReportedCalls = _reasoningReported ? 1 : 0
+        };
+    }
+}

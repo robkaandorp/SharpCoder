@@ -40,7 +40,25 @@ internal static class SubAgentTools
         "If no models are configured, returns a message indicating the default model is used.";
 
     /// <summary>Creates the four sub-agent tools bound to the given manager.</summary>
-    internal static IList<AITool> BuildTools(SubAgentManager manager, SubAgentOptions options, CancellationToken executionCt)
+    /// <param name="manager">The manager that starts, tracks and awaits the sub-agents.</param>
+    /// <param name="options">The sub-agent options this manager was created from.</param>
+    /// <param name="executionCt">
+    /// The calling execution's token: it cancels the wait for a concurrency slot and the
+    /// <c>await_sub_agents</c> wait; it never cancels a sub-agent that was already started.
+    /// </param>
+    /// <param name="usageSink">
+    /// The recorder every sub-agent started through these tools forwards its model calls to — the
+    /// calling execution's own recorder, so sub-agent usage lands in that execution's
+    /// <see cref="AgentResult.TokenUsage"/>, its session and the host's
+    /// <see cref="AgentOptions.OnUsage"/>. <c>null</c> (the default, used by hosts that build the
+    /// tools directly without an execution) falls back to the manager's own sink, which reports to
+    /// <see cref="AgentOptions.OnUsage"/> only.
+    /// </param>
+    internal static IList<AITool> BuildTools(
+        SubAgentManager manager,
+        SubAgentOptions options,
+        CancellationToken executionCt,
+        UsageRecorder? usageSink = null)
     {
         if (manager is null) throw new ArgumentNullException(nameof(manager));
         if (options is null) throw new ArgumentNullException(nameof(options));
@@ -87,7 +105,9 @@ internal static class SubAgentTools
                     request.Images = loadResult.Attachments;
                 }
 
-                info = await manager.StartAsync(request, executionCt).ConfigureAwait(false);
+                info = usageSink is null
+                    ? await manager.StartAsync(request, executionCt).ConfigureAwait(false)
+                    : await manager.StartAsync(request, usageSink, executionCt).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {

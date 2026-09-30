@@ -8,6 +8,7 @@ using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
+/// <summary>Configures the tools, prompts, model behavior, and context management for a <see cref="CodingAgent"/>.</summary>
 public sealed class AgentOptions
 {
     private string _workDirectory = Directory.GetCurrentDirectory();
@@ -31,6 +32,7 @@ public sealed class AgentOptions
         }
     }
 
+    /// <summary>Approximate tool-call budget; enforcement depends on the execution path. The streaming tool path checks the budget between model rounds but processes each round's full tool-call batch, so it can run beyond the configured value. Defaults to 25; reaching the path's limit returns a result with status <c>MaxStepsReached</c>.</summary>
     public int MaxSteps { get; set; } = 25;
 
     /// <summary>
@@ -64,16 +66,25 @@ public sealed class AgentOptions
     /// </summary>
     public Func<string, string>? BashShellArgsFormat { get; set; }
 
+    /// <summary>Registers tools for reading files and searching paths and contents. File paths are checked for lexical containment within <see cref="WorkDirectory"/>, but symlinks and reparse points are not resolved, so a workspace link can allow a read or search to reach a file outside the workspace. Defaults to <see langword="true"/>.</summary>
     public bool EnableFileOps { get; set; } = true;
+    /// <summary>Registers <c>write_file</c> and <c>edit_file</c> in addition to the read/search tools when <see cref="EnableFileOps"/> is enabled. Defaults to <see langword="true"/>.</summary>
     public bool EnableFileWrites { get; set; } = true;
+    /// <summary>Registers tools for listing and loading workspace skills from <c>.github/skills</c>. Defaults to <see langword="true"/>.</summary>
     public bool EnableSkills { get; set; } = true;
     
     // System Prompt settings
+    /// <summary>Replaces the built-in system prompt when non-empty; custom instructions and enabled workspace instructions are appended separately.</summary>
     public string? SystemPrompt { get; set; }
+
+    /// <summary>Optional instructions appended under a <c>Custom Instructions</c> heading in the system prompt.</summary>
     public string? CustomInstructions { get; set; }
+
+    /// <summary>When enabled (the default), appends workspace instruction files found under the work directory to the system prompt.</summary>
     public bool AutoLoadWorkspaceInstructions { get; set; } = true;
 
     // Tools
+    /// <summary>Additional model tools registered alongside the enabled built-in tools.</summary>
     public IList<AITool> CustomTools { get; set; } = new List<AITool>();
 
     // Context management
@@ -102,7 +113,39 @@ public sealed class AgentOptions
     /// </summary>
     public Action<CompactionResult>? OnCompacted { get; set; }
 
+    /// <summary>Logger used for agent, tool, and compaction diagnostics; defaults to <see cref="NullLogger.Instance"/>.</summary>
     public ILogger Logger { get; set; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Optional callback invoked exactly once for every model call the agent records, as soon as
+    /// that call ends — however it ends (a completed response, a failure, or a stream disposed
+    /// early; a call that reported no usage arrives with zero tokens). Use it to report usage live.
+    /// <para>
+    /// Events arrive from every source SharpCoder produces: agent-loop rounds
+    /// (<see cref="UsageSource.Agent"/>) and context-compaction summary calls
+    /// (<see cref="UsageSource.Compaction"/>) — including compaction a host triggers directly
+    /// through <see cref="ContextCompactor.ForceCompactAsync(AgentSession, AgentOptions, CancellationToken)"/>, <see cref="ContextCompactor.CompactOldestPercentAsync(AgentSession, AgentOptions, int, CancellationToken)"/>
+    /// or <see cref="ContextCompactor.CompactIfNeededAsync(AgentSession, AgentOptions, CancellationToken)"/>,
+    /// and every chunk of chunked summarisation — plus every model call a sub-agent makes, which is
+    /// forwarded live by <see cref="SubAgentManager"/> as <see cref="UsageSource.SubAgent"/>, or as
+    /// <see cref="UsageSource.SubAgentCompaction"/> for a compaction call inside a sub-agent, with
+    /// the sub-agent's id in <see cref="UsageEvent.SubAgentId"/>. Sub-agent events are recorded into
+    /// the session and reported here whenever they arrive, including after the parent execution
+    /// returned.
+    /// </para>
+    /// <para>
+    /// <strong>Handlers must be thread-safe.</strong> Sub-agents run on background threads, so this
+    /// callback can be invoked concurrently from several threads at once — from this agent's own
+    /// execution and from every running sub-agent that has calls ending at the same moment — and an
+    /// invocation can arrive after the enclosing <c>ExecuteAsync</c> call has already returned.
+    /// Guard handler state accordingly.
+    /// </para>
+    /// <para>
+    /// The callback is invoked outside any internal lock, and an exception it throws is caught and
+    /// logged: it can never fail or otherwise alter the run.
+    /// </para>
+    /// </summary>
+    public Action<UsageEvent>? OnUsage { get; set; }
 
     /// <summary>
     /// Optional reasoning effort level for models that support extended thinking.

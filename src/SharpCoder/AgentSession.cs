@@ -26,11 +26,38 @@ public sealed class AgentSession
     /// <summary>Total tool calls across all turns in this session.</summary>
     public int TotalToolCalls { get; set; }
 
-    /// <summary>Cumulative input tokens used across all turns.</summary>
+    /// <summary>
+    /// Cumulative input tokens used across all turns.
+    /// Increases by the input tokens of every recorded model call (including calls that reported no
+    /// usage, which contribute zero), so it is the sum over calls — never the last round's value.
+    /// </summary>
     public long InputTokensUsed { get; set; }
 
-    /// <summary>Cumulative output tokens used across all turns.</summary>
+    /// <summary>
+    /// Cumulative output tokens used across all turns.
+    /// Increases by the output tokens of every recorded model call (including calls that reported no
+    /// usage, which contribute zero), so it is the sum over calls — never the last round's value.
+    /// </summary>
     public long OutputTokensUsed { get; set; }
+
+    /// <summary>
+    /// The synchronisation root guarding this session's cumulative usage state — the
+    /// <see cref="InputTokensUsed"/> / <see cref="OutputTokensUsed"/> counters and the
+    /// <see cref="Usage"/> summary. <see cref="UsageRecorder.Record"/> holds it while it applies a
+    /// recorded call, because a sub-agent forwards its model calls to the recorder of the execution
+    /// that started it from the sub-agent's OWN thread, so one session can be updated from two
+    /// threads at once.
+    /// </summary>
+    internal object UsageSyncRoot { get; } = new object();
+
+    /// <summary>
+    /// Cumulative per-call usage of this session, grouped by source and model, over every recorded
+    /// model call. Updated as each call ends, so a host polling the session mid-run sees current
+    /// totals. Persisted by <see cref="SaveAsync"/> and restored by <see cref="LoadAsync"/>; session
+    /// files written before this property existed load with an empty summary; <see cref="Fork"/>
+    /// resets it, like the token counters.
+    /// </summary>
+    public UsageSummary Usage { get; set; } = new UsageSummary();
 
     /// <summary>When this session was created.</summary>
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -69,16 +96,11 @@ public sealed class AgentSession
                     if (content is TextContent tc)
                         chars += tc.Text?.Length ?? 0;
                     else if (content is FunctionCallContent fc)
-                        chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
+                        chars += UsageEstimator.EstimateCallLength(fc);
                     else if (content is FunctionResultContent fr)
-                        chars += EstimateResultLength(fr);
-                    else if (content is DataContent dc)
-                    {
-                        var mt = dc.MediaType ?? string.Empty;
-                        if (mt.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
-                            mt.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
-                            imageCount++;
-                    }
+                        chars += UsageEstimator.EstimateResultLength(fr);
+                    else if (content is DataContent dc && UsageEstimator.IsImageOrPdf(dc))
+                        imageCount++;
                 }
             }
             return chars / 4 + imageCount * ImageTokenEstimate; // ~4 chars per token heuristic
@@ -86,6 +108,9 @@ public sealed class AgentSession
     }
 
     /// <summary>Save session state to a JSON file.</summary>
+    /// <param name="filePath">Destination JSON file path; missing parent directories are created.</param>
+    /// <param name="ct">Cancels the asynchronous file write.</param>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled during the write.</exception>
     public async Task SaveAsync(string filePath, CancellationToken ct = default)
     {
         var dir = Path.GetDirectoryName(filePath);
@@ -101,7 +126,8 @@ public sealed class AgentSession
             CreatedAt = CreatedAt,
             LastActivityAt = LastActivityAt,
             Messages = MessageHistory,
-            LastKnownContextTokens = LastKnownContextTokens
+            LastKnownContextTokens = LastKnownContextTokens,
+            Usage = Usage.Snapshot()
         };
 
         var json = JsonSerializer.Serialize(data, SerializerOptions);
@@ -109,6 +135,12 @@ public sealed class AgentSession
     }
 
     /// <summary>Load session state from a JSON file.</summary>
+    /// <param name="filePath">Path of the JSON session file to load.</param>
+    /// <param name="ct">Cancels the asynchronous file read.</param>
+    /// <returns>The session restored from the file.</returns>
+    /// <exception cref="FileNotFoundException">Propagated through the returned task when the file does not exist.</exception>
+    /// <exception cref="InvalidOperationException">Propagated through the returned task when deserialization produces no session data.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled during the read.</exception>
     public static async Task<AgentSession> LoadAsync(string filePath, CancellationToken ct = default)
     {
         if (!File.Exists(filePath))
@@ -127,11 +159,16 @@ public sealed class AgentSession
             OutputTokensUsed = data.OutputTokensUsed,
             CreatedAt = data.CreatedAt,
             LastActivityAt = data.LastActivityAt,
-            LastKnownContextTokens = data.LastKnownContextTokens
+            LastKnownContextTokens = data.LastKnownContextTokens,
+            // Session files written before Usage existed have no such field: they load with an
+            // empty summary (their stored token counters are preserved above).
+            Usage = data.Usage is null ? new UsageSummary() : new UsageSummary(data.Usage.Entries)
         };
     }
 
     /// <summary>Create a new empty session.</summary>
+    /// <param name="sessionId">Optional session identifier; null generates a new GUID in compact form.</param>
+    /// <returns>A new empty session with the specified or generated identifier.</returns>
     public static AgentSession Create(string? sessionId = null)
     {
         return new AgentSession
@@ -142,9 +179,9 @@ public sealed class AgentSession
 
     /// <summary>
     /// Creates a deep copy of this session with a new session ID, zeroed token counters,
-    /// and fresh timestamps. The message history is deep-copied via JSON serialization so
-    /// mutations to either session's history do not affect the other.
-    /// <c>LastKnownContextTokens</c> is copied from the original.
+    /// a reset <see cref="Usage"/> summary, and fresh timestamps. The message history is
+    /// deep-copied via JSON serialization so mutations to either session's history do not affect
+    /// the other. <c>LastKnownContextTokens</c> is copied from the original.
     /// </summary>
     /// <param name="sessionId">Optional custom session ID for the forked session. If null, a new GUID is generated.</param>
     /// <returns>A new <see cref="AgentSession"/> branched from the current state.</returns>
@@ -164,6 +201,7 @@ public sealed class AgentSession
             TotalToolCalls = 0,
             InputTokensUsed = 0,
             OutputTokensUsed = 0,
+            Usage = new UsageSummary(),
             LastKnownContextTokens = LastKnownContextTokens,
             CreatedAt = now,
             LastActivityAt = now
@@ -175,24 +213,6 @@ public sealed class AgentSession
     {
         MessageHistory.Clear();
         LastKnownContextTokens = 0;
-    }
-
-    private static long EstimateArgumentsLength(FunctionCallContent fc)
-    {
-        if (fc.Arguments == null) return 0;
-        long len = 0;
-        foreach (var kvp in fc.Arguments)
-        {
-            len += kvp.Key?.Length ?? 0;
-            len += kvp.Value?.ToString()?.Length ?? 0;
-        }
-        return len;
-    }
-
-    private static long EstimateResultLength(FunctionResultContent fr)
-    {
-        if (fr.Result == null) return 0;
-        return fr.Result.ToString()?.Length ?? 0;
     }
 
     // Use AIJsonUtilities.DefaultOptions which has built-in converters for
@@ -213,5 +233,11 @@ public sealed class AgentSession
         public DateTimeOffset CreatedAt { get; set; }
         public DateTimeOffset LastActivityAt { get; set; }
         public long LastKnownContextTokens { get; set; }
+
+        /// <summary>
+        /// Cumulative per-call usage. Absent (<c>null</c>) in session files written before the
+        /// field existed; such files load with an empty summary.
+        /// </summary>
+        public UsageSummary? Usage { get; set; }
     }
 }

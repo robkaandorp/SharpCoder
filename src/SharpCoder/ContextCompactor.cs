@@ -19,6 +19,9 @@ public sealed class ContextCompactor
     private readonly IChatClient _client;
     private readonly ILogger _logger;
 
+    /// <summary>Creates a compactor that uses the specified chat client for summaries.</summary>
+    /// <param name="client">The chat client used to generate summaries.</param>
+    /// <param name="logger">Optional logger for compaction diagnostics; when <see langword="null"/>, logging is disabled.</param>
     public ContextCompactor(IChatClient client, ILogger? logger = null)
     {
         _client = client;
@@ -26,13 +29,80 @@ public sealed class ContextCompactor
     }
 
     /// <summary>
+    /// Routes a compaction operation's summary calls through the single shared recording mechanism:
+    /// every call the compaction model answers — or fails — is recorded exactly once with
+    /// <see cref="UsageSource.Compaction"/> and the compaction client's model.
+    /// </summary>
+    /// <param name="recorder">
+    /// The execution-local recorder of the <see cref="CodingAgent"/> execution that triggered this
+    /// compaction, when there is one, so the compaction shows up in that execution's
+    /// <see cref="AgentResult.TokenUsage"/>. <c>null</c> (host-initiated or direct compaction) makes
+    /// the compactor report through its own recorder instead. A recorder supplied by the caller
+    /// already carries that execution's session, so it decides where the calls are recorded; the
+    /// <paramref name="session"/> parameter only matters for the compactor's own fallback recorder.
+    /// </param>
+    /// <param name="session">The session being compacted, so its cumulative usage is updated per call; may be <c>null</c>.</param>
+    /// <param name="options">Agent options supplying the host's <see cref="AgentOptions.OnUsage"/> callback.</param>
+    /// <returns>The recorder that receives this operation's compaction calls.</returns>
+    private UsageRecorder ResolveRecorder(UsageRecorder? recorder, AgentSession? session, AgentOptions options)
+        => recorder ?? new UsageRecorder(options, session, _logger);
+
+    /// <summary>
+    /// Wraps the compaction client in the shared recording wrapper, so every summary call of one
+    /// compaction operation is recorded at call end — completion, failure, or no usage reported at
+    /// all (which still counts as a call with zero tokens).
+    /// </summary>
+    /// <param name="recorder">The recorder that receives the compaction calls.</param>
+    private IChatClient CreateRecordingClient(UsageRecorder recorder)
+        => new UsageRecordingChatClient(_client, recorder, UsageSource.Compaction);
+
+    /// <summary>
     /// Compact message history if estimated tokens exceed the threshold.
     /// Returns true if compaction was performed.
+    /// <para>
+    /// The summarisation call (or calls, when the old history is summarized in chunks) is recorded
+    /// with <see cref="UsageSource.Compaction"/> into <paramref name="session"/>'s cumulative usage
+    /// and the host's <see cref="AgentOptions.OnUsage"/> callback.
+    /// </para>
+    /// <para>
+    /// A single-call summarization failure is logged as a warning and gives <c>false</c>, leaving
+    /// the history unchanged. For chunked summarization, behavior depends on
+    /// <c>substituteNullSummary</c>: when <c>true</c>, a failed chunk is logged and its section is
+    /// replaced with the fallback text "No summary available for this section." before continuing;
+    /// the history may include that fallback. When <c>false</c>, a failed chunk gives <c>false</c>
+    /// without substituting a fallback.
+    /// </para>
     /// </summary>
-    public async Task<bool> CompactIfNeededAsync(
+    /// <param name="session">The session whose history should be compacted.</param>
+    /// <param name="options">Agent options governing thresholds and callbacks.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if compaction was performed; otherwise <c>false</c>.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
+    /// </exception>
+    public Task<bool> CompactIfNeededAsync(
         AgentSession session,
         AgentOptions options,
         CancellationToken ct = default)
+        => CompactIfNeededAsync(session, options, recorder: null, ct);
+
+    /// <summary>
+    /// Overload of <see cref="CompactIfNeededAsync(AgentSession, AgentOptions, CancellationToken)"/>
+    /// that reports this operation's compaction calls to the supplied execution-local
+    /// <paramref name="recorder"/> (creating its own when <c>null</c>), so compaction performed
+    /// during an agent execution also appears in that execution's <see cref="AgentResult.TokenUsage"/>.
+    /// </summary>
+    internal async Task<bool> CompactIfNeededAsync(
+        AgentSession session,
+        AgentOptions options,
+        UsageRecorder? recorder,
+        CancellationToken ct)
     {
         if (!options.EnableAutoCompaction) return false;
 
@@ -58,7 +128,7 @@ public sealed class ContextCompactor
         {
             var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
                 session.MessageHistory, startIndex, options.CompactionRetainRecent, options,
-                substituteNullSummary: true, ct);
+                substituteNullSummary: true, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
 
@@ -75,6 +145,13 @@ public sealed class ContextCompactor
 
             session.LastKnownContextTokens = 0;
             return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
+            throw;
         }
         catch (System.Exception ex)
         {
@@ -119,7 +196,7 @@ public sealed class ContextCompactor
 
     /// <summary>
     /// Compacts the oldest <paramref name="percent"/> percent of the non-system message history,
-    /// preserving the remaining recent messages verbatim. Unlike <see cref="ForceCompactAsync"/>,
+    /// preserving the remaining recent messages verbatim. Unlike <see cref="ForceCompactAsync(AgentSession, AgentOptions, CancellationToken)"/>,
     /// this method determines the split point by token-weighted percentage rather than by a fixed
     /// recent-message count. This is useful for callers (such as CopilotHive) that want to trim
     /// the oldest portion of the conversation without knowing the model's exact context budget.
@@ -130,16 +207,44 @@ public sealed class ContextCompactor
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// <c>true</c> if compaction succeeded; otherwise <c>false</c> when there are too few messages
-    /// to compact, summarization produced no content, or an exception occurred.
+    /// to compact, summarization produced no content, or summarization failed. A single-call
+    /// summarization failure is logged as a warning. For chunked summarization, behavior depends
+    /// on <c>substituteNullSummary</c>: when <c>false</c>, a failed chunk returns <c>false</c>
+    /// without logging or substituting a fallback; when <c>true</c>, the failed chunk is logged,
+    /// its section is replaced with the fallback text "No summary available for this section.",
+    /// and processing continues.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown when <paramref name="percent"/> is less than 1 or greater than 95.
     /// </exception>
-    public async Task<bool> CompactOldestPercentAsync(
+    /// <exception cref="OperationCanceledException">
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
+    /// </exception>
+    public Task<bool> CompactOldestPercentAsync(
         AgentSession session,
         AgentOptions options,
         int percent,
         CancellationToken ct = default)
+        => CompactOldestPercentAsync(session, options, percent, recorder: null, ct);
+
+    /// <summary>
+    /// Overload of <see cref="CompactOldestPercentAsync(AgentSession, AgentOptions, int, CancellationToken)"/>
+    /// that reports this operation's compaction calls to the supplied execution-local
+    /// <paramref name="recorder"/> (creating its own when <c>null</c>), so compaction performed
+    /// during an agent execution also appears in that execution's <see cref="AgentResult.TokenUsage"/>.
+    /// </summary>
+    internal async Task<bool> CompactOldestPercentAsync(
+        AgentSession session,
+        AgentOptions options,
+        int percent,
+        UsageRecorder? recorder,
+        CancellationToken ct)
     {
         if (percent < 1 || percent > 95)
             throw new ArgumentOutOfRangeException(nameof(percent), percent, "Percent must be between 1 and 95.");
@@ -192,7 +297,7 @@ public sealed class ContextCompactor
         {
             var (compacted, compactedMessages, summaryOldCount) = await CompactMessageSliceAsync(
                 messages, startIndex, messages.Count - splitPoint, options,
-                substituteNullSummary: false, ct);
+                substituteNullSummary: false, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
 
@@ -209,6 +314,13 @@ public sealed class ContextCompactor
 
             session.LastKnownContextTokens = 0;
             return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
+            throw;
         }
         catch (System.Exception ex)
         {
@@ -243,13 +355,38 @@ public sealed class ContextCompactor
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// <c>true</c> if compaction succeeded (summarization returned content);
-    /// <c>false</c> if there was nothing to compact or summarization produced no content.
-    /// Exceptions from the summarization client are propagated to the caller.
+    /// <c>false</c> if there was nothing to compact, summarization produced no content, or
+    /// summarization failed. A single-call summarization exception is caught, logged as a warning,
+    /// and gives <c>false</c>; a failed chunked summarization call (with
+    /// <c>substituteNullSummary</c> set to <c>false</c>) is caught and gives <c>false</c> without
+    /// logging.
     /// </returns>
-    public async Task<bool> ForceCompactAsync(
+    /// <exception cref="OperationCanceledException">
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, history, <see cref="AgentSession.LastKnownContextTokens"/> and
+    /// <see cref="AgentOptions.OnCompacted"/> are untouched; the attempted call is still recorded
+    /// in usage. No-op paths may return <c>false</c> with an already-cancelled token. Exceptions
+    /// from <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are
+    /// not covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
+    /// </exception>
+    public Task<bool> ForceCompactAsync(
         AgentSession session,
         AgentOptions options,
         CancellationToken ct = default)
+        => ForceCompactAsync(session, options, recorder: null, ct);
+
+    /// <summary>
+    /// Overload of <see cref="ForceCompactAsync(AgentSession, AgentOptions, CancellationToken)"/>
+    /// that reports this operation's compaction calls to the supplied execution-local
+    /// <paramref name="recorder"/> (creating its own when <c>null</c>), so the force-compaction of a
+    /// context-overflow retry appears in the triggering execution's <see cref="AgentResult.TokenUsage"/>.
+    /// </summary>
+    internal async Task<bool> ForceCompactAsync(
+        AgentSession session,
+        AgentOptions options,
+        UsageRecorder? recorder,
+        CancellationToken ct)
     {
         var messages = session.MessageHistory;
 
@@ -266,11 +403,13 @@ public sealed class ContextCompactor
 
         try
         {
-            // Exceptions from the summarization client are now caught and logged
-            // instead of propagating to the caller.
+            // Single-call summarization exceptions are caught and logged instead of
+            // propagating to the caller. A failed chunk returns false without logging;
+            // an OperationCanceledException while ct is cancelled is rethrown by the
+            // filtered catch below.
             var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
                 messages, startIndex, options.CompactionRetainRecent, options,
-                substituteNullSummary: false, ct);
+                substituteNullSummary: false, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
 
@@ -286,6 +425,13 @@ public sealed class ContextCompactor
 
             session.LastKnownContextTokens = 0;
             return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history has not been mutated; callback exceptions
+            // are not covered by that guarantee.
+            throw;
         }
         catch (System.Exception ex)
         {
@@ -306,12 +452,46 @@ public sealed class ContextCompactor
     /// </param>
     /// <param name="options">Agent options governing thresholds and callbacks.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns><c>true</c> if compaction was performed; otherwise <c>false</c>.</returns>
-    public async Task<bool> CompactIfNeededAsync(
+    /// <returns>
+    /// <c>true</c> if compaction was performed. For a single-call summarization failure, the
+    /// failure is logged as a warning and the method returns <c>false</c>. For chunked
+    /// summarization, behavior depends on <c>substituteNullSummary</c>: when <c>true</c>, a failed
+    /// chunk is logged, its section is replaced with the fallback text
+    /// "No summary available for this section.", and processing continues; the method may return
+    /// <c>true</c> with that fallback in the compacted history. When <c>false</c>, a failed chunk
+    /// returns <c>false</c> without substituting a fallback.
+    /// </returns>
+    /// <exception cref="OperationCanceledException">
+    /// Rethrown when a summarization call throws while <paramref name="ct"/> is cancelled. In that
+    /// case, the history, <paramref name="messages"/>, the session's
+    /// <see cref="AgentSession.LastKnownContextTokens"/> and <see cref="AgentOptions.OnCompacted"/>
+    /// are untouched; the attempted call is still recorded in usage. No-op paths may return
+    /// <c>false</c> with an already-cancelled token. Exceptions from
+    /// <see cref="AgentOptions.OnCompacting"/> or <see cref="AgentOptions.OnCompacted"/> are not
+    /// covered by this guarantee. A client-originated <see cref="OperationCanceledException"/>
+    /// while <paramref name="ct"/> is not cancelled retains the existing summarization-failure handling.
+    /// </exception>
+    public Task<bool> CompactIfNeededAsync(
         AgentSession? session,
         IList<ChatMessage> messages,
         AgentOptions options,
         CancellationToken ct = default)
+        => CompactIfNeededAsync(session, messages, options, recorder: null, ct);
+
+    /// <summary>
+    /// Overload of <see cref="CompactIfNeededAsync(AgentSession?, IList{ChatMessage}, AgentOptions, CancellationToken)"/>
+    /// that reports this operation's compaction calls to the supplied execution-local
+    /// <paramref name="recorder"/> (creating its own when <c>null</c>). When
+    /// <paramref name="session"/> is <c>null</c> the calls are reported only to
+    /// <see cref="AgentOptions.OnUsage"/> and the recorder's own summary — there is no session to
+    /// update.
+    /// </summary>
+    internal async Task<bool> CompactIfNeededAsync(
+        AgentSession? session,
+        IList<ChatMessage> messages,
+        AgentOptions options,
+        UsageRecorder? recorder,
+        CancellationToken ct)
     {
         if (!options.EnableAutoCompaction) return false;
 
@@ -370,7 +550,7 @@ public sealed class ContextCompactor
         {
             var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
                 messages, startIndex, options.CompactionRetainRecent, options,
-                substituteNullSummary: true, ct);
+                substituteNullSummary: true, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
 
@@ -402,6 +582,13 @@ public sealed class ContextCompactor
                 session.LastKnownContextTokens = 0;
             return true;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation during summarization is not a compaction failure: propagate it.
+            // For summary-call cancellation, history and the live list have not been mutated;
+            // callback exceptions are not covered by that guarantee.
+            throw;
+        }
         catch (System.Exception ex)
         {
             _logger.LogWarning(ex, "Mid-loop context compaction failed, continuing with full history");
@@ -425,6 +612,10 @@ public sealed class ContextCompactor
     /// When <c>false</c>, a null/whitespace LLM response causes this method to return
     /// <c>(false, empty)</c> so the caller can signal failure without mutating state.
     /// </param>
+    /// <param name="recorder">
+    /// The recorder for this compaction operation's summary calls; every call (each chunk
+    /// included) is recorded exactly once with <see cref="UsageSource.Compaction"/>.
+    /// </param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// A tuple of <c>(compacted, compactedMessages, oldCount)</c>. When <c>compacted</c> is
@@ -438,6 +629,7 @@ public sealed class ContextCompactor
             int retainCount,
             AgentOptions options,
             bool substituteNullSummary,
+            UsageRecorder recorder,
             CancellationToken ct)
     {
         int nonSkippedCount = messages.Count - startIndex;
@@ -463,7 +655,7 @@ public sealed class ContextCompactor
         if (oldTokens > budget)
         {
             var (success, chunkedSummary, chunksUsed) = await SummarizeInChunksAsync(
-                oldMessages, (int)budget, options, substituteNullSummary, ct);
+                oldMessages, (int)budget, options, substituteNullSummary, recorder, ct);
 
             if (!success)
                 return (false, Array.Empty<ChatMessage>(), 0);
@@ -483,7 +675,10 @@ public sealed class ContextCompactor
 
             options.OnCompacting?.Invoke();
 
-            var summaryResponse = await _client.GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
+            // The summary call goes through the shared recording wrapper (Source = Compaction), so
+            // it is recorded exactly once when it ends — completion or failure alike.
+            var summaryResponse = await CreateRecordingClient(recorder)
+                .GetResponseAsync(summaryPromptMessages, cancellationToken: ct);
             var rawSummary = summaryResponse.Text;
 
             if (string.IsNullOrWhiteSpace(rawSummary))
@@ -536,6 +731,7 @@ public sealed class ContextCompactor
         int budgetTokens,
         AgentOptions options,
         bool substituteNullSummary,
+        UsageRecorder recorder,
         CancellationToken ct)
     {
         var chunks = new List<List<ChatMessage>>();
@@ -578,6 +774,11 @@ public sealed class ContextCompactor
 
         options.OnCompacting?.Invoke();
 
+        // One recording wrapper for the whole chunked operation: every chunk's call is recorded
+        // exactly once (a throwing chunk call records a zero-token call) under
+        // UsageSource.Compaction with the compaction client's model.
+        var recordingClient = CreateRecordingClient(recorder);
+
         var summaries = new List<string>();
         foreach (var chunk in chunks)
         {
@@ -590,8 +791,16 @@ public sealed class ContextCompactor
                     new ChatMessage(ChatRole.User, promptText)
                 };
 
-                var response = await _client.GetResponseAsync(promptMessages, cancellationToken: ct);
+                var response = await recordingClient.GetResponseAsync(promptMessages, cancellationToken: ct);
                 raw = response.Text;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Caller cancellation stops the chunk loop immediately: no fallback text and
+                // no further chunk calls. A client-originated OperationCanceledException while
+                // ct is NOT cancelled (e.g. an HTTP timeout) still falls through to the
+                // failure handling below.
+                throw;
             }
             catch (System.Exception ex)
             {
@@ -685,6 +894,9 @@ public sealed class ContextCompactor
     /// portion are moved into the "old" portion. This prevents orphaned tool results
     /// (role=tool without a preceding assistant tool_calls) which crash some LLM APIs.
     /// </summary>
+    /// <param name="messages">Message sequence whose split boundary is to be adjusted.</param>
+    /// <param name="splitPoint">Requested boundary index; negative values become zero.</param>
+    /// <returns>The adjusted boundary, advanced past tool-result messages at its start and capped at the message count.</returns>
     public static int AdjustSplitPoint(IList<ChatMessage> messages, int splitPoint)
     {
         if (splitPoint < 0) splitPoint = 0;

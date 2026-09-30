@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SharpCoder.Tools;
 
+/// <summary>Runs commands in fresh shell processes and captures their standard output and error.</summary>
 public sealed class BashTools
 {
     /// <summary>
@@ -26,11 +27,21 @@ public sealed class BashTools
     private readonly string? _shellPathOverride;
     private readonly Func<string, string>? _shellArgsFormat;
 
+    /// <summary>Creates shell tools using the platform's default shell.</summary>
+    /// <param name="workingDirectory">Working directory for each command process.</param>
+    /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Defaults to 120000; values less than or equal to zero also use 120000.</param>
+    /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
     public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null)
         : this(workingDirectory, timeoutMs, logger, null, null)
     {
     }
 
+    /// <summary>Creates shell tools with an optional executable and argument formatter override.</summary>
+    /// <param name="workingDirectory">Working directory for each command process.</param>
+    /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Values less than or equal to zero use 120000.</param>
+    /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
+    /// <param name="shellPathOverride">Optional shell executable path; when omitted, the platform default is used.</param>
+    /// <param name="shellArgsFormat">Optional formatter that turns the command into the shell's argument string. When omitted with an override, bash-style <c>-c</c> arguments are used.</param>
     public BashTools(
         string workingDirectory,
         int timeoutMs,
@@ -81,6 +92,10 @@ public sealed class BashTools
     /// Forwards to the timeout-aware overload using the instance default timeout.
     /// This overload is intentionally not the one registered as an LLM tool.
     /// </summary>
+    /// <param name="command">Command text passed to a fresh shell process.</param>
+    /// <param name="ct">Cancels command execution; cancellation is thrown rather than returned as transcript text.</param>
+    /// <returns>The same transcript produced by the timeout-aware overload, using this instance's default timeout.</returns>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when cancellation is requested.</exception>
     public Task<string> execute_bash_command(
         string command,
         CancellationToken ct = default)
@@ -109,6 +124,12 @@ public sealed class BashTools
     /// design and out of scope here.
     /// </para>
     /// </remarks>
+    /// <param name="command">Command text passed to a fresh shell process.</param>
+    /// <param name="ct">Cancels command execution; cancellation is thrown rather than returned as transcript text.</param>
+    /// <param name="timeout_ms">Optional whole-capture timeout in milliseconds; null uses the configured default, and non-positive values are rejected.</param>
+    /// <returns>A command transcript containing captured output and exit status, or truthful timeout/error diagnostics; cancellation is not returned as text.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Propagated through the returned task when <paramref name="timeout_ms"/> is zero or negative; validation occurs before the first await.</exception>
+    /// <exception cref="System.OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled or cancellation is raised during command execution or cleanup.</exception>
     [Description("Executes a given bash command. Each invocation starts a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). The timeout is a deadline over the whole capture: it stays active until the process has exited and its stdout/stderr have been fully drained, so a lingering child holding the output pipes open cannot make the call hang. Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected.")]
     public async Task<string> execute_bash_command(
         [Description("The command to execute")] string command,

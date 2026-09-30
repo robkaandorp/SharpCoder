@@ -1,12 +1,17 @@
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.AI;
+using SharpCoder.SubAgents;
 
 namespace SharpCoder;
 
+/// <summary>Contains the outcome, response content, usage, and diagnostics for an agent execution.</summary>
 public sealed class AgentResult
 {
+    /// <summary>Execution outcome: <c>Success</c>, <c>MaxStepsReached</c>, or <c>Error</c>.</summary>
     public string Status { get; set; } = string.Empty;
+
+    /// <summary>Final assistant text, or an error message when <see cref="Status"/> is <c>Error</c>.</summary>
     public string Message { get; set; } = string.Empty;
 
     /// <summary>
@@ -25,9 +30,32 @@ public sealed class AgentResult
     public ChatFinishReason? FinishReason { get; set; }
 
     /// <summary>
-    /// Token usage for the final response, if reported by the provider.
+    /// <c>UsageDetails</c> of the response the provider returned for the final call of this
+    /// execution, if it reported any. This is the OLD meaning of usage on a result: for a
+    /// single-round execution it is the usage of that one round, and on the paths where
+    /// <c>FunctionInvokingChatClient</c> performs several internal round trips it is the provider's
+    /// aggregate for that final request. It is kept unchanged for compatibility — use
+    /// <see cref="TokenUsage"/> for SharpCoder's own per-call accounting (all rounds, all sources,
+    /// call counts and "was it reported?" counters).
     /// </summary>
     public UsageDetails? Usage { get; set; }
+
+    /// <summary>
+    /// Per-call token usage of this execution: every model call recorded, summed per source and
+    /// model, with the call count. SharpCoder populates it with a detached snapshot taken when the
+    /// result was built, so later activity never mutates it. Populated for <c>Success</c>,
+    /// <c>MaxStepsReached</c> and <c>Error</c> results (including usage recorded before the
+    /// failure); it stays empty only when no call was recorded.
+    /// <para>
+    /// A snapshot is detached, so it is a point-in-time view: sub-agents started by this execution
+    /// keep forwarding their calls into this execution's recorder after it returned, and those calls
+    /// are recorded into the session and reported through <see cref="AgentOptions.OnUsage"/>, but
+    /// they never change this already-returned snapshot. To see a sub-agent's own totals, read
+    /// <see cref="SubAgentInfo.Usage"/> (or <c>input_tokens</c>/<c>output_tokens</c> from
+    /// <c>await_sub_agents</c>).
+    /// </para>
+    /// </summary>
+    public UsageSummary TokenUsage { get; set; } = new UsageSummary();
 
     /// <summary>
     /// Total number of tool calls made during the conversation.

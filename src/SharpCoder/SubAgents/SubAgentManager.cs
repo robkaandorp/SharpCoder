@@ -15,6 +15,25 @@ namespace SharpCoder.SubAgents;
 /// <summary>
 /// Runtime that starts, tracks and awaits sub-agents. Flat design: sub-agents cannot
 /// spawn further sub-agents.
+/// <para>
+/// <strong>Usage forwarding.</strong> Every model call a sub-agent makes is forwarded — live, as the
+/// call ends and exactly once — to the usage accounting of the parent execution whose
+/// <c>start_sub_agent</c> tool call started it: the parent's execution summary, the parent session
+/// when there is one, and the parent's <see cref="AgentOptions.OnUsage"/>. Forwarded events carry
+/// <see cref="UsageSource.SubAgent"/> (or <see cref="UsageSource.SubAgentCompaction"/> for a
+/// compaction call inside the sub-agent), the sub-agent's id in <see cref="UsageEvent.SubAgentId"/>,
+/// the child client's model unchanged and the call's usage unchanged. Each sub-agent also accumulates
+/// its own detached running total, exposed as <see cref="SubAgentInfo.Usage"/>.
+/// </para>
+/// <para>
+/// The parent's recorder is captured when the sub-agent is accepted, so a sub-agent started by one
+/// execution never records into another execution's summary; a manager started directly by a host
+/// (with no execution) forwards to a fallback recorder that reaches the parent options'
+/// <see cref="AgentOptions.OnUsage"/> only. Because a sub-agent runs in the background, events may
+/// arrive after the parent execution returned — they still update the parent session and the host
+/// callback, but they never change the <see cref="AgentResult.TokenUsage"/> snapshot that execution
+/// already returned. Handlers must therefore be thread-safe.
+/// </para>
 /// </summary>
 public sealed class SubAgentManager : IAsyncDisposable
 {
@@ -41,6 +60,13 @@ public sealed class SubAgentManager : IAsyncDisposable
         public IChatClient? OwnedClientForDisposal;
         public int MaxSteps;
 
+        /// <summary>
+        /// The usage sink this sub-agent's model calls are forwarded to: the parent execution's
+        /// recorder, captured when the sub-agent was accepted, or the manager's fallback recorder
+        /// when the manager was started directly by a host (no execution).
+        /// </summary>
+        public UsageRecorder UsageSink = null!;
+
         // Parent-agent configuration, captured at acceptance time so later mutation of the
         // parent AgentOptions cannot affect an already-started sub-agent.
         public string WorkDirectory = string.Empty;
@@ -65,6 +91,12 @@ public sealed class SubAgentManager : IAsyncDisposable
         public long? InputTokens;
         public long? OutputTokens;
 
+        /// <summary>
+        /// Running total of every forwarded call of this sub-agent, or <c>null</c> while none has
+        /// been recorded. Mutated only under <c>lock (this)</c>, together with the snapshot reads.
+        /// </summary>
+        public TokenUsage? Usage;
+
         /// <summary>Fires when the sub-agent's own timeout elapses.</summary>
         public CancellationTokenSource? TimeoutCts;
 
@@ -75,10 +107,36 @@ public sealed class SubAgentManager : IAsyncDisposable
         public readonly TaskCompletionSource<bool> Completion =
             new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        /// <summary>
+        /// Adds one forwarded call to this sub-agent's running total, creating the total on the
+        /// first call. Never throws.
+        /// </summary>
+        public void AddUsage(UsageEvent usageEvent)
+        {
+            lock (this)
+            {
+                var total = Usage;
+                if (total is null)
+                {
+                    total = new TokenUsage();
+                    Usage = total;
+                }
+
+                total.Add(usageEvent.Usage);
+            }
+        }
+
+        /// <summary>
+        /// A detached snapshot of the current state. The token totals are the sub-agent's running
+        /// sums over all forwarded calls when at least one call was recorded, so a running
+        /// sub-agent's snapshot shows the totals recorded so far; <see cref="SubAgentInfo.Usage"/>
+        /// stays <c>null</c> until the first call is recorded.
+        /// </summary>
         public SubAgentInfo Snapshot()
         {
             lock (this)
             {
+                var usage = Usage;
                 return new SubAgentInfo
                 {
                     Id = Id,
@@ -89,8 +147,13 @@ public sealed class SubAgentManager : IAsyncDisposable
                     Status = (SubAgentStatus)Status,
                     Summary = Summary,
                     Error = Error,
-                    InputTokens = InputTokens,
-                    OutputTokens = OutputTokens
+                    // The running total wins whenever a call was recorded: it is the sum over ALL of
+                    // this sub-agent's calls, not the final round's usage. Only when nothing was
+                    // recorded does the snapshot keep the previous behaviour (the child result's own
+                    // usage, which is null in every such case).
+                    InputTokens = usage?.InputTokens ?? InputTokens,
+                    OutputTokens = usage?.OutputTokens ?? OutputTokens,
+                    Usage = usage?.Clone()
                 };
             }
         }
@@ -104,6 +167,14 @@ public sealed class SubAgentManager : IAsyncDisposable
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private int _counter;
     private int _disposed;
+
+    /// <summary>
+    /// The sink used for a sub-agent started directly by a host through the public
+    /// <see cref="StartAsync(SubAgentRequest, CancellationToken)"/> (no parent execution to bind
+    /// to). It reaches the parent options' <see cref="AgentOptions.OnUsage"/> only — there is no
+    /// session to update — so directly-started sub-agents still report their usage live.
+    /// </summary>
+    private readonly UsageRecorder _fallbackUsageSink;
 
     /// <summary>
     /// Test seam: whether this manager has been disposed.
@@ -169,6 +240,10 @@ public sealed class SubAgentManager : IAsyncDisposable
     public event Action<SubAgentInfo>? SubAgentChanged;
 
     /// <summary>Creates a new sub-agent manager.</summary>
+    /// <param name="options">Configuration for available models, limits, defaults, and optional image root.</param>
+    /// <param name="defaultClient">Fallback client used when no model-specific client is selected.</param>
+    /// <param name="parentOptions">Parent agent configuration; its capabilities bound those available to sub-agents.</param>
+    /// <param name="logger">Optional logger; null uses the parent logger, then a no-op logger.</param>
     /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
     /// <exception cref="ArgumentException">Thrown when the model catalog is invalid.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when limits or timeouts are invalid.</exception>
@@ -205,6 +280,7 @@ public sealed class SubAgentManager : IAsyncDisposable
         }
 
         _slots = new SemaphoreSlim(options.MaxConcurrentSubAgents, options.MaxConcurrentSubAgents);
+        _fallbackUsageSink = new UsageRecorder(parentOptions, session: null, _logger);
     }
 
     /// <summary>
@@ -262,11 +338,46 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// <summary>
     /// Starts a sub-agent. Blocks until a concurrency slot is available.
     /// Validation failures return a standalone failed <see cref="SubAgentInfo"/> with an empty Id.
+    /// <para>
+    /// This overload is for a host starting a sub-agent with no parent execution to bind to: the
+    /// sub-agent's model calls are forwarded to the fallback sink, which reports them to the parent
+    /// options' <see cref="AgentOptions.OnUsage"/> only (no session).
+    /// </para>
     /// </summary>
+    /// <param name="request">The requested task and optional model, capabilities, timeout, and attachments.</param>
+    /// <param name="ct">Cancels waiting for a concurrency slot; it does not cancel an accepted sub-agent.</param>
+    /// <returns>The accepted sub-agent snapshot, or a failed snapshot with an empty ID when validation fails.</returns>
+    /// <exception cref="ArgumentNullException">Propagated through the returned task when <paramref name="request"/> is null.</exception>
+    /// <exception cref="ObjectDisposedException">Propagated through the returned task when the manager is disposed before or while a slot is acquired.</exception>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> cancels the wait for a concurrency slot.</exception>
+    /// <exception cref="ArgumentException">Propagated through the returned task when a configured client factory or post-slot startup callback throws this exception.</exception>
+    public Task<SubAgentInfo> StartAsync(SubAgentRequest request, CancellationToken ct = default)
+        => StartAsync(request, _fallbackUsageSink, ct);
+
+    /// <summary>
+    /// Starts a sub-agent whose model calls are forwarded to <paramref name="usageSink"/>.
+    /// <para>
+    /// This is the overload <see cref="CodingAgent"/> uses: it passes the recorder of the execution
+    /// whose <c>start_sub_agent</c> tool call started the sub-agent, so every sub-agent call lands in
+    /// that execution's summary, in its session (when it has one) and in the host's
+    /// <see cref="AgentOptions.OnUsage"/>. The sink is captured here, at acceptance time, exactly
+    /// like the rest of the per-run snapshot, so a later execution can never adopt a sub-agent that
+    /// was already started.
+    /// </para>
+    /// <para>
+    /// Validation failures return a standalone failed <see cref="SubAgentInfo"/> with an empty Id and
+    /// a <c>null</c> <see cref="SubAgentInfo.Usage"/>, and never touch the sink.
+    /// </para>
+    /// </summary>
+    /// <param name="request">The sub-agent request; snapshotted at acceptance time.</param>
+    /// <param name="usageSink">The recorder this sub-agent's model calls are forwarded to.</param>
+    /// <param name="ct">Cancels the wait for a concurrency slot; it does NOT cancel the started sub-agent.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="request"/> or <paramref name="usageSink"/> is null.</exception>
     /// <exception cref="ObjectDisposedException">Thrown when the manager has been disposed.</exception>
-    public async Task<SubAgentInfo> StartAsync(SubAgentRequest request, CancellationToken ct = default)
+    internal async Task<SubAgentInfo> StartAsync(SubAgentRequest request, UsageRecorder usageSink, CancellationToken ct = default)
     {
         if (request is null) throw new ArgumentNullException(nameof(request));
+        if (usageSink is null) throw new ArgumentNullException(nameof(usageSink));
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(SubAgentManager));
 
@@ -347,6 +458,7 @@ public sealed class SubAgentManager : IAsyncDisposable
                 Client = client,
                 OwnedClientForDisposal = ownedClient,
                 MaxSteps = _options.MaxSteps,
+                UsageSink = usageSink,
                 WorkDirectory = _workDirectorySnapshot,
                 MaxContextTokens = _parentOptions.MaxContextTokens,
                 CompactionClient = _parentOptions.CompactionClient,
@@ -525,6 +637,12 @@ public sealed class SubAgentManager : IAsyncDisposable
             if (spec.SystemPrompt != null)
                 subOptions.SystemPrompt = spec.SystemPrompt;
 
+            // The child's own usage reporting is forwarded to the parent execution's recorder, as
+            // the child's calls end (live). The parent's OnUsage delegate is NEVER assigned to the
+            // child: the child gets this forwarder, which stamps the sub-agent id, maps the source
+            // and records into the bound sink.
+            subOptions.OnUsage = usageEvent => ForwardUsage(entry, spec, usageEvent);
+
             OnSubAgentOptionsCreated?.Invoke(subOptions);
 
             var agent = new CodingAgent(spec.Client, subOptions);
@@ -590,6 +708,69 @@ public sealed class SubAgentManager : IAsyncDisposable
     }
 
     /// <summary>
+    /// The child's <see cref="AgentOptions.OnUsage"/> handler: forwards ONE ended sub-agent model
+    /// call to this sub-agent's bound parent recorder, exactly once, and adds it to the sub-agent's
+    /// own running total.
+    /// <para>
+    /// The handler runs on the child's thread while the child execution records a call, so it can
+    /// never throw: <see cref="UsageRecorder.Record"/> already contains host-handler, session and
+    /// logging failures, and the sub-agent total is updated under the entry's own lock, but the
+    /// whole body is guarded anyway so no forwarding failure — including a failure of the parent run
+    /// — can ever escape into the child (or the parent) execution.
+    /// </para>
+    /// </summary>
+    /// <param name="entry">The sub-agent whose call ended.</param>
+    /// <param name="spec">The run snapshot holding the bound sink.</param>
+    /// <param name="usageEvent">The child's recorded call; never <c>null</c>.</param>
+    private void ForwardUsage(Entry entry, RunSpec spec, UsageEvent usageEvent)
+    {
+        try
+        {
+            entry.AddUsage(usageEvent);
+            spec.UsageSink.Record(MapChildUsage(entry.Id, usageEvent));
+        }
+        catch (Exception ex)
+        {
+            // Deliberately swallowed (best effort, with its own guard): reporting a sub-agent's
+            // usage must never fail the sub-agent's model call, nor the parent's run.
+            try
+            {
+                _logger.LogWarning(ex, "Failed to forward usage of sub-agent {Id}.", entry.Id);
+            }
+            catch
+            {
+                // Swallowed deliberately; see above.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Maps one child-execution usage event onto the sub-agent event forwarded to the parent: the
+    /// child's <see cref="UsageSource.Agent"/> becomes <see cref="UsageSource.SubAgent"/> and its
+    /// <see cref="UsageSource.Compaction"/> becomes <see cref="UsageSource.SubAgentCompaction"/>; the
+    /// child's model and the call's usage are copied unchanged (the child's recording client already
+    /// resolved the model from the child client's <see cref="ChatClientMetadata"/>, falling back to
+    /// the response model); and <see cref="UsageEvent.SubAgentId"/> is set to the sub-agent id.
+    /// <para>
+    /// Any other source is mapped to <see cref="UsageSource.SubAgent"/>: a child execution only
+    /// produces <see cref="UsageSource.Agent"/> and <see cref="UsageSource.Compaction"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="subAgentId">The sub-agent id the call belongs to (for example <c>sub-1</c>).</param>
+    /// <param name="usageEvent">The child's recorded call.</param>
+    /// <returns>The event to record into the parent execution's recorder.</returns>
+    internal static UsageEvent MapChildUsage(string subAgentId, UsageEvent usageEvent)
+    {
+        var source = usageEvent.Source switch
+        {
+            UsageSource.Compaction => UsageSource.SubAgentCompaction,
+            _ => UsageSource.SubAgent
+        };
+
+        return new UsageEvent(source, usageEvent.Model, usageEvent.Usage, subAgentId);
+    }
+
+    /// <summary>
     /// Records the terminal outcome of a sub-agent. The first terminal transition wins and is
     /// never overwritten. Terminal fields and history eviction are applied BEFORE waiters are
     /// signalled so an <see cref="AwaitAsync"/> continuation always observes a consistent state.
@@ -641,6 +822,8 @@ public sealed class SubAgentManager : IAsyncDisposable
     }
 
     /// <summary>Returns a snapshot of one or all tracked sub-agents. Unknown IDs return an empty list.</summary>
+    /// <param name="id">Sub-agent ID to look up; null returns all currently tracked sub-agents.</param>
+    /// <returns>A list containing the matching snapshot, all snapshots, or an empty list for an unknown ID.</returns>
     public IReadOnlyList<SubAgentInfo> GetStatus(string? id = null)
     {
         if (id is null)
@@ -660,6 +843,10 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// Awaits the specified sub-agents (or all currently tracked ones) and returns their final snapshots.
     /// Never throws for failed or timed-out sub-agents.
     /// </summary>
+    /// <param name="ids">IDs to await; null awaits all sub-agents tracked when the call begins. Unknown IDs are ignored.</param>
+    /// <param name="ct">Cancels this wait without cancelling the sub-agents.</param>
+    /// <returns>Final snapshots for the tracked sub-agents selected by <paramref name="ids"/>.</returns>
+    /// <exception cref="OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> cancels a wait that has not already completed.</exception>
     public async Task<IReadOnlyList<SubAgentInfo>> AwaitAsync(IEnumerable<string>? ids = null, CancellationToken ct = default)
     {
         List<Entry> targets;
@@ -756,7 +943,8 @@ public sealed class SubAgentManager : IAsyncDisposable
                 Summary = info.Summary,
                 Error = info.Error,
                 InputTokens = info.InputTokens,
-                OutputTokens = info.OutputTokens
+                OutputTokens = info.OutputTokens,
+                Usage = info.Usage?.Clone()
             };
             try
             {
