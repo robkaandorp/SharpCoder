@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.22.0] — 2026-09-30
+
+### Added
+
+- **Per-call usage accounting** — Added `TokenUsage`, `UsageSource` (`Agent`, `Compaction`, `SubAgent`, `SubAgentCompaction`), `UsageEntry`, `UsageSummary` and `UsageEvent`. `TokenUsage` sums input, output, cached-input and reasoning tokens, counts calls, and tracks `CachedInputReportedCalls` and `ReasoningReportedCalls`. `AgentResult.TokenUsage` is a detached snapshot for `Success`, `MaxStepsReached` and `Error` results. `AgentSession.Usage` accumulates calls, is persisted by `SaveAsync`/`LoadAsync` (older session files load with an empty summary), and resets on `Fork()`. `AgentOptions.OnUsage` runs once as each recorded model call ends, including failed calls and early-disposed streams; it can run concurrently or after `ExecuteAsync` returns, so handlers must be thread-safe. Handler exceptions are caught and logged without affecting the run.
+- **Sub-agent usage forwarding** — Every sub-agent model call is forwarded live to the parent accounting as `SubAgent` with `UsageEvent.SubAgentId`, and recorded in the parent session even after the parent execution returns; `SubAgentInfo.Usage` exposes the sub-agent's running totals. `SubAgentCompaction` is a supported forwarding classification, but sub-agent executions are currently stateless and do not compact.
+- **Estimated token breakdown** — `TokenUsage.Estimated` (`EstimatedTokenBreakdown`) provides estimates for input categories (system prompt, tool definitions, user text, assistant text, tool calls, tool results, reasoning and images) and output categories (text, tool calls and reasoning). Estimates are scaled to provider-reported totals for calls that contributed an estimate; category sums therefore cover only those calls, not necessarily every recorded call. `InputEstimatedCalls` and `OutputEstimatedCalls` indicate coverage. When a provider reports reasoning tokens, that count is used for `OutputReasoning`, capped at the call's output-token count.
+- **XML documentation** — Both packages ship XML documentation files for IntelliSense; public members are documented, including parameters, returns and exception timing at the main entry points.
+
+### Fixed
+
+- **Token under-count** — Streaming and tool-calling executions previously counted only the last round's usage. `AgentSession.InputTokensUsed`/`OutputTokensUsed` now sum every recorded call, including compaction calls. `SubAgentInfo.InputTokens`/`OutputTokens` and the `input_tokens`/`output_tokens` returned by `await_sub_agents` now sum all calls made by that sub-agent. Reported totals will be higher than in 0.21.x for the same workload.
+
+### Changed
+
+- **Compaction cancellation** — If a summarization call throws `OperationCanceledException` while the caller's token is cancelled, both `CompactIfNeededAsync` overloads, `CompactOldestPercentAsync` and `ForceCompactAsync` rethrow it rather than returning `false`. In that case, conversation history and `LastKnownContextTokens` remain unchanged, `OnCompacted` is not invoked, and the attempted summary call remains recorded in usage accounting. Chunked summarization stops without attempting further chunks or substituting fallback text after such a cancellation. There is no up-front cancellation check, so no-op paths (for example, auto-compaction disabled or too few messages) may still return `false` with a cancelled token. For client-originated cancellation/timeout failures while the caller's token is not cancelled, single-call summarization paths log and return `false`; automatic chunked paths log and substitute fallback text, while chunked `CompactOldestPercentAsync`/`ForceCompactAsync` return `false` without logging or fallback text.
+
+### Compatibility
+
+- `AgentResult.Usage` (`UsageDetails`) remains the provider/framework usage returned for the final response; on `FunctionInvokingChatClient` paths it may aggregate that request's internal round trips. It excludes compaction and sub-agent calls and is not a consistent per-execution total. Use `AgentResult.TokenUsage` for SharpCoder's consistent per-call totals across sources.
+
 ## [0.21.1] — 2026-09-26
 
 ### Fixed
