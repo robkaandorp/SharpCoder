@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [0.22.1] — 2026-10-04
 
+### Changed
+
+- **Consumer-facing library dependencies:** `Microsoft.Extensions.AI` 10.9.0 → 10.10.0; `Microsoft.Extensions.AI.OpenAI` 10.9.0 → 10.10.0; `Microsoft.Extensions.Http.Resilience` 10.9.0 → 10.10.0; `Microsoft.Extensions.Logging.Abstractions` 10.0.11 → 10.0.12; `OllamaSharp` 5.4.30 → 5.5.0.
+- **Test dependencies:** replaced `coverlet.collector` 10.0.1 with `Microsoft.Testing.Extensions.CodeCoverage` 18.11.2; `Microsoft.NET.Test.Sdk` 18.9.0 → 18.10.1; `xunit.runner.visualstudio` 3.1.5 → 4.0.0; `xunit.v3` 3.2.2 → 4.0.1.
+- Tests now run in Microsoft.Testing.Platform (MTP) mode, enabled by the repository `global.json`.
+
 ### Fixed
 
 - **Bash output cap** — Each of stdout and stderr is capped independently at about 50,000 characters in completed and interrupted (timeout/error) transcripts. Oversized streams keep the head and tail with one explicit marker line between them stating the omitted character count, the stream's total character and line counts, and advising you to redirect output to a file and read it with `grep`, `tail`/`head`, or `read_file` with `offset`/`limit`. This prevents oversized tool output from flooding the agent's conversation and breaking sessions, as happened when build/test logs of several megabytes were returned whole. Output headers, the exit-code line, and cleanup diagnostics are never cut.

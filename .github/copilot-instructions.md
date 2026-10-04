@@ -28,13 +28,23 @@ dotnet build   --configuration Release
 dotnet test    --configuration Release --no-build
 ```
 
-Run a **single test** (xUnit v3 via `Microsoft.NET.Test.Sdk`):
+Tests use xUnit v3 4.x on Microsoft.Testing.Platform, enabled by the repository
+`global.json` test-runner setting. The full command above was verified: 1,122
+passed, 0 failed, 0 skipped. To run a targeted class (verified: 42 tests):
 
 ```bash
-dotnet test tests/SharpCoder.Tests --filter "FullyQualifiedName~CodingAgentTests.MethodName"
-# or by display name
-dotnet test tests/SharpCoder.Tests --filter "DisplayName~fragment"
+dotnet test tests/SharpCoder.Tests --filter-class '*CodingAgentTests'
 ```
+
+Or select tests by namespace (verified: 729 tests):
+
+```bash
+dotnet test tests/SharpCoder.Tests --filter-namespace 'SharpCoder.Tests'
+```
+
+MTP filter options replace VSTest's `--filter "FullyQualifiedName~…"` and
+`DisplayName~…` syntax. `--filter-method` selects matching method names; see the
+test skill for verified filtering examples and counts.
 
 There is no separate lint step — `TreatWarningsAsErrors` is enabled across the
 solution's projects, so any new warning fails the build. CI
