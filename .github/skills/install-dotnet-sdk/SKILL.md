@@ -1,38 +1,42 @@
 ---
 name: install-dotnet-sdk
-description: How to install the .NET SDK in a fresh environment. Use this when dotnet commands are not available.
+description: Use this skill when `dotnet` is not found (exit 127) before building or testing.
 ---
 
-# Install SDK Skill
+# Install .NET SDK
 
-## .NET SDK Installation
+## Check
 
-Check if already installed:
+Run:
 
 ```bash
-dotnet --version
+command -v dotnet && dotnet --list-sdks
+"$HOME/.dotnet/dotnet" --list-sdks
 ```
 
-If not installed:
+If a channel 10.0 SDK is listed by the first check, stop — nothing to install. If an SDK is listed only by the second check, it is on disk but not on `PATH`; only the Environment step is needed.
+
+## Install (once per container)
+
+Download the installer to a file so download failures are visible, then run it:
 
 ```bash
-curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0
-export DOTNET_ROOT="$HOME/.dotnet"
-export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
+curl -fsSL --retry 5 --retry-delay 2 -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh && bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet"
 ```
 
-## C# Language Server
+## Environment
 
-Install `csharp-ls` for code intelligence (go-to-definition, diagnostics):
+CopilotHive worker images already set `DOTNET_ROOT=/root/.dotnet` and put `/root/.dotnet` and `/root/.dotnet/tools` on `PATH`, so no export is needed there. Each `execute_bash_command` call is a fresh shell. In other environments, prefix every `dotnet` command in the same call with:
 
 ```bash
-dotnet tool install --global csharp-ls
+export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH";
 ```
 
 ## Verify
 
+In a new shell call, run:
+
 ```bash
 dotnet --version
 dotnet --list-sdks
-csharp-ls --version
 ```
