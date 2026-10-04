@@ -21,6 +21,25 @@ public sealed class BashTools
     /// </summary>
     internal const int CleanupAllowanceMs = 5000;
 
+    /// <summary>
+    /// Fixed cap (in characters, roughly 12k tokens) applied <em>separately</em> to captured
+    /// standard output and captured standard error before either stream is placed in a command
+    /// transcript. A stream at or below this length is returned unchanged; a longer stream keeps
+    /// its head and its tail with one marker block between them.
+    /// <para>
+    /// This is deliberately not a configuration surface: a single oversized transcript (a whole
+    /// 3.9-million-character test log returned verbatim by the model's shell tool) previously
+    /// flooded an agent conversation and broke the session.
+    /// </para>
+    /// </summary>
+    internal const int MaxStreamOutputChars = 50_000;
+
+    /// <summary>Marker line that closes the retained head of a capped stream.</summary>
+    private const string CappedHeadMarker = "--- OUTPUT CAPPED: HEAD ---";
+
+    /// <summary>Marker line that opens the retained tail of a capped stream.</summary>
+    private const string CappedTailMarker = "--- OUTPUT CAPPED: TAIL ---";
+
     private readonly string _workingDirectory;
     private readonly int _timeoutMs;
     private readonly ILogger _logger;
@@ -130,7 +149,7 @@ public sealed class BashTools
     /// <returns>A command transcript containing captured output and exit status, or truthful timeout/error diagnostics; cancellation is not returned as text.</returns>
     /// <exception cref="ArgumentOutOfRangeException">Propagated through the returned task when <paramref name="timeout_ms"/> is zero or negative; validation occurs before the first await.</exception>
     /// <exception cref="System.OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled or cancellation is raised during command execution or cleanup.</exception>
-    [Description("Executes a given bash command. Each invocation starts a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). The timeout is a deadline over the whole capture: it stays active until the process has exited and its stdout/stderr have been fully drained, so a lingering child holding the output pipes open cannot make the call hang. Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected.")]
+    [Description("Executes a given bash command. Each invocation starts a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). The timeout is a deadline over the whole capture: it stays active until the process has exited and its stdout/stderr have been fully drained, so a lingering child holding the output pipes open cannot make the call hang. Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected. Long output is shortened to its head and tail with an explicit marker in between; redirect large output to a file and read it back with grep, tail/head, or read_file with offset/limit.")]
     public async Task<string> execute_bash_command(
         [Description("The command to execute")] string command,
         CancellationToken ct,
@@ -494,14 +513,96 @@ public sealed class BashTools
     // Result construction
     // ------------------------------------------------------------------
 
+    /// <summary>
+    /// Applies the fixed per-stream cap to one captured stream (stdout or stderr).
+    /// <para>
+    /// A stream of at most <see cref="MaxStreamOutputChars"/> characters is returned unchanged.
+    /// A longer stream keeps its head and its tail — build/test summaries and exit information live
+    /// at the end — with a small marker block in between stating how much was omitted, the stream's
+    /// total character and line counts, and how to read the whole output instead. The head and the
+    /// tail are half the cap each, give or take the single character that keeps a UTF-16 surrogate
+    /// pair from being separated at a boundary: a boundary that would fall inside a pair is moved so
+    /// the pair belongs to the omitted middle, never to a retained half.
+    /// </para>
+    /// </summary>
+    internal static string CapStreamOutput(string text)
+    {
+        if (text.Length <= MaxStreamOutputChars)
+        {
+            return text;
+        }
+
+        // Half the cap each, so the retained halves together stay within the cap. MaxStreamOutputChars
+        // is a fixed 50,000, so each half is far from either end of a stream that exceeds it.
+        var headLength = MaxStreamOutputChars / 2;
+        var tailLength = MaxStreamOutputChars - headLength;
+        var tailStart = text.Length - tailLength;
+
+        // A boundary inside a surrogate pair would leave a lone surrogate in the transcript and make
+        // the stream invalid UTF-16. The head therefore gives up its last character, and the tail its
+        // first, so the affected pair falls wholly inside the omitted middle. Since each half is half
+        // the cap, the two adjustments can never make the retained halves overlap.
+        if (char.IsHighSurrogate(text[headLength - 1]) && char.IsLowSurrogate(text[headLength]))
+        {
+            headLength--;
+        }
+
+        if (char.IsLowSurrogate(text[tailStart]) && char.IsHighSurrogate(text[tailStart - 1]))
+        {
+            tailStart++;
+        }
+
+        // A long stream need not end its head on a line boundary, so keep the marker block on its own
+        // lines either way. This newline is formatting only and is not part of the counts below.
+        var sb = new StringBuilder(headLength + tailLength + 512);
+        sb.Append(text, 0, headLength);
+        if (sb[sb.Length - 1] != '\n')
+        {
+            sb.AppendLine();
+        }
+
+        sb.AppendLine(CappedHeadMarker);
+        sb.AppendLine(
+            $"--- OUTPUT OMITTED: {tailStart - headLength} of {text.Length} characters were removed from the middle of this stream (total lines: {CountStreamLines(text)}). " +
+            "Redirect the output to a file and read it with grep, tail/head, or read_file with offset/limit. ---");
+        sb.AppendLine(CappedTailMarker);
+        sb.Append(text, tailStart, text.Length - tailStart);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Counts the lines of a captured stream: one per <c>'\n'</c>, plus one for a final line that is
+    /// not newline-terminated. An empty stream has no lines.
+    /// </summary>
+    private static int CountStreamLines(string text)
+    {
+        if (text.Length == 0)
+        {
+            return 0;
+        }
+
+        var lines = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\n') lines++;
+        }
+
+        if (text[text.Length - 1] != '\n')
+        {
+            lines++;
+        }
+
+        return lines;
+    }
+
     private static string BuildCompletedResult(
         Process process,
         Task<string>? outputTask,
         Task<string>? errorTask,
         CleanupReport report)
     {
-        var output = CompletedText(outputTask);
-        var error = CompletedText(errorTask);
+        var output = CapStreamOutput(CompletedText(outputTask));
+        var error = CapStreamOutput(CompletedText(errorTask));
         var exitCode = TryGetExitCode(process);
 
         var sb = new StringBuilder();
@@ -552,8 +653,8 @@ public sealed class BashTools
         Task<string>? errorTask,
         CleanupReport? report)
     {
-        var output = CompletedText(outputTask);
-        var error = CompletedText(errorTask);
+        var output = CapStreamOutput(CompletedText(outputTask));
+        var error = CapStreamOutput(CompletedText(errorTask));
 
         var sb = new StringBuilder();
         sb.AppendLine(headline);

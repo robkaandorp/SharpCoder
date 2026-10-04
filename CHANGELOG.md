@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.22.1] — 2026-10-04
+
+### Fixed
+
+- **Bash output cap** — Each of stdout and stderr is capped independently at about 50,000 characters in completed and interrupted (timeout/error) transcripts. Oversized streams keep the head and tail with one explicit marker line between them stating the omitted character count, the stream's total character and line counts, and advising you to redirect output to a file and read it with `grep`, `tail`/`head`, or `read_file` with `offset`/`limit`. This prevents oversized tool output from flooding the agent's conversation and breaking sessions, as happened when build/test logs of several megabytes were returned whole. Output headers, the exit-code line, and cleanup diagnostics are never cut.
+
 ## [0.22.0] — 2026-09-30
 
 ### Added
