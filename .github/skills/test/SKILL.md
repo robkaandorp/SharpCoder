@@ -7,6 +7,8 @@ description: How to run tests and interpret the results. Use this when you need 
 
 ## How to Run Tests
 
+**Prerequisite:** If `command -v dotnet` fails, load and follow the `install-dotnet-sdk` skill first; do not record the exit-127 run as a test result.
+
 Run all tests:
 
 ```bash
@@ -17,44 +19,73 @@ dotnet test SharpCoder.slnx
 
 Before committing a change, run the tests for the touched namespaces/classes as a fast pre-commit self-check:
 
+MTP uses xUnit v3 filter options instead of VSTest's `FullyQualifiedName` filter.
+A class filter selects matching test classes; repeated `--filter-class` options are
+combined as alternatives. These verified examples select 80 and 122 tests,
+respectively:
+
 ```bash
-dotnet test SharpCoder.slnx --filter "FullyQualifiedName~<NamespaceOrTestClass>"
+dotnet test tests/SharpCoder.Tests --filter-class '*ContextCompactorTests'
+dotnet test tests/SharpCoder.Tests --filter-class '*CodingAgentTests' --filter-class '*ContextCompactorTests'
 ```
 
-Join multiple filters with `|` to cover several classes in one run:
+Other supported filter forms can target a namespace, method, or query. This
+namespace example selected 729 tests:
 
 ```bash
-dotnet test SharpCoder.slnx --filter "FullyQualifiedName~ContextCompactorTests|FullyQualifiedName~CodingAgentTests"
+dotnet test tests/SharpCoder.Tests --filter-namespace 'SharpCoder.Tests'
 ```
+
+Use `--filter-method` to select a method name; this verified class-name glob
+selected 80 tests:
+
+```bash
+dotnet test tests/SharpCoder.Tests --filter-method '*ContextCompactorTests*'
+```
+
+`--filter-query` accepts the xUnit v3 query syntax (not a glob); verify query
+syntax before using it. Legacy `--filter "FullyQualifiedName~…"` and the `|`
+join are not supported by MTP here and can make the solution run fail because
+projects with no matching tests return a nonzero exit code.
 
 ## Reading Results
 
-After running tests, look for the test summary line. Example output:
+After running tests, look for the MTP summary. A verified full-suite run produced:
 
 ```
-Passed!  - Failed:     0, Passed:   418, Skipped:     0, Total:   418, Duration: 13s
+Test run summary: Passed!
+  total: 1122
+  failed: 0
+  succeeded: 1122
+  skipped: 0
+  duration: 1m 01s 162ms
 ```
 
 Record:
-- **total_tests**: the Total count
-- **passed_tests**: the Passed count
-- **failed_tests**: the Failed count
+- **total_tests**: `total`
+- **passed_tests**: `succeeded`
+- **failed_tests**: `failed`
 
 ## Opt-in Coverage
 
 Coverage collection is opt-in, not the default:
 
 ```bash
-dotnet test SharpCoder.slnx --collect:"XPlat Code Coverage" --results-directory ./TestResults
+dotnet test SharpCoder.slnx --coverage --coverage-output-format cobertura --results-directory ./TestResults
 ```
 
-For coverage, parse the Cobertura XML in the TestResults directory:
+A verified run produced Cobertura reports under `TestResults/` (one per test
+assembly), for example `TestResults/35f13291-4c52-41ab-9246-365681a18bf6.cobertura.xml`
+and `TestResults/b44360cc-4501-4a82-bc5b-dd39742c2f78.cobertura.xml`. To inspect
+the report, use:
+
 ```bash
-cat TestResults/*/coverage.cobertura.xml | grep '<coverage' | head -1
+cat TestResults/*.cobertura.xml | grep '<coverage' | head -1
 ```
-The `line-rate` attribute is the coverage percentage (0.37 = 37%).
 
-Caveat: the coverage collector has known failure modes (the SIGBUS/exit-135 test-host crash under parallel load; the WebApplicationFactory `BadImageFormatException` family). A coverage run must never be the single gating run; re-run without coverage before concluding anything.
+The `line-rate` attribute is the coverage percentage (0.37 = 37%). The prior
+coverage caveat (SIGBUS/exit-135 under parallel load and WebApplicationFactory
+`BadImageFormatException`) was not re-observed in this MTP coverage run.
 
 ## Writing New Tests
 

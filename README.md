@@ -330,7 +330,7 @@ var options = new AgentOptions
 | `execute_bash_command` | Run shell commands | `EnableBash` |
 | `list_skills` / `load_skill` | Discover and load project skills | `EnableSkills` |
 
-`execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Zero or negative values are rejected before process launch, and each invocation starts a fresh shell process. The original C# caller signature remains compatible. A valid tool call is:
+`execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Zero or negative values are rejected before process launch, and each invocation starts a fresh shell process. The original C# caller signature remains compatible. Each stdout and stderr stream is capped at about 50,000 characters; for full output, redirect it to a file and use `grep` or `tail` to inspect it. A valid tool call is:
 
 ```json
 {"command":"dotnet test --configuration Release", "timeout_ms":900000}
