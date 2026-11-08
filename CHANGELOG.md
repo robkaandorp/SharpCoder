@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.23.0] — 2026-11-07
+
+### Added
+
+- **Host tool authorization** — `AgentOptions.AuthorizeTool` (`Func<ToolAuthorizationContext, CancellationToken, Task<ToolAuthorizationDecision>>?`) and `AgentOptions.ToolAuthorizationCorrelationId` (`string?`) are captured together once when a `CodingAgent` is constructed and remain fixed for its lifetime, including accepted sub-agent children. Later `AgentOptions` mutations affect only agents constructed afterwards. `ToolAuthorizationContext` exposes `ToolName`, `CorrelationId` and a read-only, defensively copied `Arguments` snapshot. `ToolAuthorizationDecision.Allow` permits a call; `Deny(reason)` refuses it with the host-approved reason visible to the model. A denial, callback fault or null decision fails closed before tool side effects; callback-fault details are sanitized and never model-visible on both the manual-streaming and `FunctionInvokingChatClient` paths. Caller cancellation propagates. Every locally invokable tool is guarded: built-in bash, file-operation and skills tools, custom `AIFunction` tools, and all four sub-agent tools. When authorization is enabled, non-`AIFunction` custom tools fail closed at `BuildChatOptions`. With no callback configured, the tool surface and behavior remain byte-identical to previous versions.
+
+### Fixed
+
+- **Delegating-constructor validation regression** — `ToolAuthorizationCapture.Capture` is null-safe, so its null guard no longer shadows `SubAgentManager`'s own `parentOptions` validation; the correct `ParamName` and validation order are restored.
+
 ## [0.22.1] — 2026-10-04
 
 ### Changed

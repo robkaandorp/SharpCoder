@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -146,6 +148,80 @@ public sealed class AgentOptions
     /// </para>
     /// </summary>
     public Action<UsageEvent>? OnUsage { get; set; }
+
+    /// <summary>
+    /// Optional async authorization callback invoked immediately before every locally invokable tool
+    /// SharpCoder registers for the model — custom tools, <c>execute_bash_command</c>,
+    /// <c>read_file</c>/<c>glob</c>/<c>grep</c>, <c>write_file</c>/<c>edit_file</c>,
+    /// <c>load_skill</c>/<c>list_skills</c>, and the sub-agent tools (<c>start_sub_agent</c>,
+    /// <c>await_sub_agents</c>, <c>get_sub_agent_status</c>, <c>list_sub_agent_models</c>).
+    /// Return <see cref="ToolAuthorizationDecision.Allow"/> to let the call run, or
+    /// <see cref="ToolAuthorizationDecision.Deny(string)"/> to refuse it before it produces any side
+    /// effect.
+    /// <para>
+    /// <b>The captured pair is fixed for the agent's lifetime.</b> The delegate and
+    /// <see cref="ToolAuthorizationCorrelationId"/> are captured when each
+    /// <see cref="CodingAgent"/> is constructed. Later changes to this property — setting it,
+    /// clearing it, or replacing it — and later changes to
+    /// <see cref="ToolAuthorizationCorrelationId"/> affect only agents constructed afterwards; an
+    /// existing agent (and every execution it runs) keeps the pair it captured.
+    /// </para>
+    /// <para>
+    /// <b>Denials and faults.</b> A denial is never executed: the model receives a refusal message
+    /// containing the <see cref="ToolAuthorizationDecision.Reason"/> you supplied — that reason is
+    /// host-approved, <b>model-visible</b> text, so never put secrets, stack traces, or internal
+    /// host state in it; when it is <c>null</c>/blank the model receives a fixed, host-neutral
+    /// refusal. A callback that throws (or that returns <c>null</c>) fails <b>closed</b>: the tool
+    /// does not run and the model receives a fixed refusal that never contains the exception's type,
+    /// message, or stack trace — on both the manual streaming tool loop and the
+    /// <c>FunctionInvokingChatClient</c> path (which is configured with
+    /// <c>IncludeDetailedErrors = true</c>). An <see cref="OperationCanceledException"/> is
+    /// cancellation, not a fault, and propagates as cancellation. The caller's
+    /// <see cref="System.Threading.CancellationToken"/> is passed to the callback and, on allow, to
+    /// the tool unchanged.
+    /// </para>
+    /// <para>
+    /// <b>Scope of the guarantee.</b> Only the tools SharpCoder itself registers in the model's
+    /// <c>ChatOptions</c> pass through this boundary. These are <b>trusted host entry points</b>
+    /// that this callback never sees, and that a host must authorize itself if it exposes them:
+    /// <c>FileTools</c>/<c>BashTools</c>/<c>SkillTools</c> instances used directly, the original
+    /// unwrapped custom tool instances a host keeps its own reference to, and the public
+    /// <see cref="SubAgents.SubAgentManager.StartAsync(SubAgents.SubAgentRequest, System.Threading.CancellationToken)"/>.
+    /// </para>
+    /// <para>
+    /// <b>Handlers must be thread-safe.</b> This callback can be invoked concurrently: a parent
+    /// agent's tools and the tools of background sub-agents it started can call it at the same
+    /// moment, from different threads. It is invoked outside any internal lock.
+    /// </para>
+    /// <para>
+    /// When this property is <c>null</c> (the default) every tool is registered exactly as before —
+    /// same names, schemas, descriptions and behavior, with no wrapper in the chain. When it is set,
+    /// every custom tool in <see cref="CustomTools"/> must be an <see cref="AIFunction"/>: a
+    /// non-invokable custom tool (for example an <see cref="AIFunctionDeclaration"/>, or a
+    /// provider-executed tool) cannot be guarded locally, so building the model request fails closed
+    /// by throwing <see cref="InvalidOperationException"/>.
+    /// </para>
+    /// </summary>
+    public Func<ToolAuthorizationContext, CancellationToken, Task<ToolAuthorizationDecision>>? AuthorizeTool { get; set; }
+
+    /// <summary>
+    /// Optional immutable host correlation — typically a user, tenant, or conversation id — passed to
+    /// <see cref="AuthorizeTool"/> on every guarded tool call through
+    /// <see cref="ToolAuthorizationContext.CorrelationId"/>, so a host can authorize per user or per
+    /// context rather than per tool name alone.
+    /// <para>
+    /// The value is captured when each <see cref="CodingAgent"/> is constructed (a
+    /// <see cref="string"/> is immutable, so the captured reference cannot change afterwards), and it
+    /// stays fixed for that agent's lifetime and all of its executions. Because
+    /// <see cref="string"/> cannot be mutated in place, replacing this property after construction
+    /// affects only agents constructed afterwards — an existing agent keeps the value it captured.
+    /// </para>
+    /// <para>
+    /// The correlation is host metadata only: SharpCoder stores it but never interprets, parses, or
+    /// logs it beyond a diagnostic message written when a call is refused.
+    /// </para>
+    /// </summary>
+    public string? ToolAuthorizationCorrelationId { get; set; }
 
     /// <summary>
     /// Optional reasoning effort level for models that support extended thinking.

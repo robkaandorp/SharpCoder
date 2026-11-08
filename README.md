@@ -52,6 +52,37 @@ Console.WriteLine($"Tokens used: input={result.TokenUsage.Total.InputTokens}, ou
 Console.WriteLine(result.Message);
 ```
 
+## Host tool authorization
+
+Use `AgentOptions.AuthorizeTool` to approve each locally invokable tool call before it runs. The callback receives the tool name, captured correlation ID and read-only argument snapshot, and returns `Allow` or a host-authored `Deny` decision:
+
+```csharp
+using System.Threading;
+using System.Threading.Tasks;
+using SharpCoder;
+
+var options = new AgentOptions
+{
+    WorkDirectory = "/path/to/project",
+    ToolAuthorizationCorrelationId = "user-123",
+    AuthorizeTool = (context, cancellationToken) =>
+    {
+        if (context.ToolName == "write_file" || context.ToolName == "edit_file")
+            return Task.FromResult(ToolAuthorizationDecision.Deny("File writes are not allowed for this user."));
+
+        return Task.FromResult(ToolAuthorizationDecision.Allow);
+    }
+};
+
+var agent = new CodingAgent(chatClient, options);
+```
+
+The callback and correlation ID are captured together when the `CodingAgent` is constructed and stay fixed for its lifetime. Accepted sub-agent children inherit that captured pair; later `AgentOptions` mutations affect only agents constructed afterwards. A denial, callback fault or null decision fails closed before tool side effects. Callback-fault details are sanitized and never shown to the model on both the manual-streaming and `FunctionInvokingChatClient` paths; the host-approved reason supplied to `Deny` is model-visible. Caller cancellation propagates.
+
+All locally invokable tools are guarded: built-in bash, file-operation and skills tools, custom `AIFunction` tools, and the four sub-agent tools. When authorization is enabled, non-`AIFunction` custom tools fail closed while `BuildChatOptions` builds the model request. With no callback configured, tool behavior is unchanged from previous versions.
+
+This callback boundary covers only tools SharpCoder registers for the model. Trusted host entry points are outside it and must be authorized by the host when needed: direct use of raw `FileTools`, host-retained unwrapped custom functions, and public `SubAgentManager.StartAsync`.
+
 ## Sessions
 
 Sessions provide persistent, multi-turn conversations. The agent remembers prior turns and builds on them:

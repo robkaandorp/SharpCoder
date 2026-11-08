@@ -33,6 +33,25 @@ public sealed class CodingAgent : IAsyncDisposable
     private readonly AgentOptions _options;
     private readonly ILogger _logger;
     private readonly ContextCompactor _compactor;
+
+    /// <summary>
+    /// The host tool-authorization pair captured ONCE at construction, or <c>null</c> when the agent
+    /// was constructed without an <see cref="AgentOptions.AuthorizeTool"/> callback. Never re-read
+    /// from <see cref="_options"/>: a later enable/disable/replace of
+    /// <see cref="AgentOptions.AuthorizeTool"/>, or a later change of
+    /// <see cref="AgentOptions.ToolAuthorizationCorrelationId"/>, affects only agents constructed
+    /// afterwards, never this one.
+    /// </summary>
+    private readonly ToolAuthorizationCapture? _toolAuthorization;
+
+    /// <summary>
+    /// The authorization pair this agent captured at construction, exposed so the sub-agent runtime
+    /// can receive exactly this pair (rather than re-reading the live options) when it is created
+    /// lazily during an execution. A read-only accessor over <see cref="_toolAuthorization"/>: it
+    /// adds no state and changes no behavior. <c>null</c> when authorization is off for this agent.
+    /// </summary>
+    internal ToolAuthorizationCapture? CapturedToolAuthorization => _toolAuthorization;
+
     private SubAgentManager? _subAgentManager;
     private SubAgentOptions? _subAgentSnapshot;
     private readonly object _subAgentLock = new();
@@ -96,7 +115,12 @@ public sealed class CodingAgent : IAsyncDisposable
                 snapshot.AvailableModels.Add(model);
 
             _subAgentSnapshot = snapshot;
-            _subAgentManager = new SubAgentManager(snapshot, _client, _options, _logger);
+            // Hand over the pair captured at THIS agent's construction, not the live options: the
+            // manager is created lazily during an execution, so reading _options here would let a
+            // host change made after construction (but before the first execution) reach every
+            // sub-agent this agent starts. Passing null here means "authorization off for this
+            // agent", so a later enable on the live options cannot retro-guard its children either.
+            _subAgentManager = new SubAgentManager(snapshot, _client, _options, _logger, CapturedToolAuthorization);
             _subAgentManager.SubAgentChanged += OnSubAgentChanged;
             Interlocked.Increment(ref _subAgentManagerCreateCount);
             return _subAgentManager;
@@ -155,8 +179,37 @@ public sealed class CodingAgent : IAsyncDisposable
         _logger = options.Logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         _compactor = new ContextCompactor(options.CompactionClient ?? client, _logger);
 
+        // Capture the authorization pair ONCE. Both members are read here (in
+        // ToolAuthorizationCapture.Capture) and never again, so enabling, disabling, replacing or
+        // re-correlating the options afterwards can only affect agents constructed later.
+        _toolAuthorization = ToolAuthorizationCapture.Capture(options);
+
         if (SubAgentsEffectivelyEnabled)
             ThrowOnReservedToolNames(options.CustomTools);
+    }
+
+    /// <summary>
+    /// Returns <paramref name="tool"/> wrapped in the single authorization boundary when this agent
+    /// captured an authorization callback, or exactly <paramref name="tool"/> unchanged when it did
+    /// not — so the no-callback tool surface (instances, names, schemas, usage bindings) is
+    /// byte-identical to what SharpCoder registered before authorization existed.
+    /// </summary>
+    private AITool Guard(AITool tool)
+    {
+        var capture = _toolAuthorization;
+        if (capture is null) return tool;
+
+        if (tool is not AIFunction function)
+        {
+            // Fail closed: a custom tool that is not locally invokable (for example an
+            // AIFunctionDeclaration, or a provider-executed tool) cannot pass the authorization
+            // boundary, so an agent that promises a check for every tool must not offer it at all.
+            throw new InvalidOperationException(
+                $"CustomTools contains the tool '{tool?.Name}', which is a {tool?.GetType().Name} and not an invokable AIFunction. " +
+                $"When {nameof(AgentOptions.AuthorizeTool)} is set, every custom tool must be an invokable AIFunction so it can be authorized before it runs.");
+        }
+
+        return ToolAuthorizationGuard.Wrap(function, capture.AuthorizeTool, capture.CorrelationId, _logger);
     }
 
     private void OnSubAgentChanged(SubAgentInfo info)
@@ -776,15 +829,26 @@ public sealed class CodingAgent : IAsyncDisposable
     /// <param name="ct">The execution's cancellation token, passed to the sub-agent tools.</param>
     private ChatOptions BuildChatOptions(UsageRecorder recorder, CancellationToken ct)
     {
+        var customTools = new List<AITool>(_options.CustomTools);
+
+        // Catches post-construction mutation of CustomTools too. It runs on the RAW custom tools,
+        // before they are wrapped, so the reserved-name diagnostic keeps exactly the precedence and
+        // wording it had before the authorization boundary existed.
+        if (SubAgentsEffectivelyEnabled)
+            ThrowOnReservedToolNames(customTools);
+
+        // Every tool SharpCoder registers for the model then goes through Guard(): it is either the
+        // exact instance that was always registered (no authorization callback captured) or the same
+        // function behind the single authorization boundary.
         var chatOptions = new ChatOptions
         {
-            Tools = new List<AITool>(_options.CustomTools),
             ToolMode = ChatToolMode.Auto
         };
+        var tools = new List<AITool>(customTools.Count + 12);
+        foreach (var customTool in customTools)
+            tools.Add(Guard(customTool));
 
-        // Catches post-construction mutation of CustomTools too.
-        if (SubAgentsEffectivelyEnabled)
-            ThrowOnReservedToolNames(chatOptions.Tools);
+        chatOptions.Tools = tools;
 
         if (_options.ReasoningEffort.HasValue)
         {
@@ -802,28 +866,28 @@ public sealed class CodingAgent : IAsyncDisposable
             // Register the timeout-aware overload explicitly: the LLM-facing schema exposes the
             // optional timeout_ms parameter (the CancellationToken is injected, not part of the schema).
             Func<string, CancellationToken, int?, Task<string>> bashInvoke = bashTools.execute_bash_command;
-            chatOptions.Tools.Add(AIFunctionFactory.Create(bashInvoke));
+            tools.Add(Guard(AIFunctionFactory.Create(bashInvoke)));
         }
 
         if (_options.EnableFileOps)
         {
             var fileTools = new FileTools(_options.WorkDirectory, _logger);
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.read_file));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.glob));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.grep));
+            tools.Add(Guard(AIFunctionFactory.Create(fileTools.read_file)));
+            tools.Add(Guard(AIFunctionFactory.Create(fileTools.glob)));
+            tools.Add(Guard(AIFunctionFactory.Create(fileTools.grep)));
 
             if (_options.EnableFileWrites)
             {
-                chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.write_file));
-                chatOptions.Tools.Add(AIFunctionFactory.Create(fileTools.edit_file));
+                tools.Add(Guard(AIFunctionFactory.Create(fileTools.write_file)));
+                tools.Add(Guard(AIFunctionFactory.Create(fileTools.edit_file)));
             }
         }
 
         if (_options.EnableSkills)
         {
             var skillTools = new SkillTools(_options.WorkDirectory);
-            chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.load_skill));
-            chatOptions.Tools.Add(AIFunctionFactory.Create(skillTools.list_skills));
+            tools.Add(Guard(AIFunctionFactory.Create(skillTools.load_skill)));
+            tools.Add(Guard(AIFunctionFactory.Create(skillTools.list_skills)));
         }
 
         if (SubAgentsEffectivelyEnabled)
@@ -834,7 +898,7 @@ public sealed class CodingAgent : IAsyncDisposable
             if (manager != null && _subAgentSnapshot != null)
             {
                 foreach (var tool in SubAgentTools.BuildTools(manager, _subAgentSnapshot, ct, recorder))
-                    chatOptions.Tools.Add(tool);
+                    tools.Add(Guard(tool));
             }
         }
 

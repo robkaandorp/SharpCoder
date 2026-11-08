@@ -75,6 +75,16 @@ public sealed class SubAgentManager : IAsyncDisposable
         public int? CompactionMaxTokens;
         public ReasoningEffort? ReasoningEffort;
         public IReadOnlyList<ImageAttachment>? Images;
+
+        /// <summary>
+        /// The tool-authorization pair this sub-agent was accepted with, copied from the manager's
+        /// own fixed snapshot while the start request was being accepted — before the concurrency
+        /// slot is awaited. The child <see cref="CodingAgent"/> is built from THIS value and never
+        /// from the live options, so a policy change made after acceptance (enabling, disabling,
+        /// replacing the callback, or re-correlating) can never reach an already-accepted run in
+        /// either direction. <c>null</c> means the child registers its tools unguarded.
+        /// </summary>
+        public ToolAuthorizationCapture? ToolAuthorization;
     }
 
     private sealed class Entry
@@ -177,6 +187,16 @@ public sealed class SubAgentManager : IAsyncDisposable
     private readonly UsageRecorder _fallbackUsageSink;
 
     /// <summary>
+    /// The tool-authorization pair this manager was created with, fixed for its whole lifetime —
+    /// the same "snapshot at creation" discipline as the capability ceiling and
+    /// <see cref="_fallbackUsageSink"/>. Every <see cref="RunSpec"/> copies THIS value at acceptance
+    /// time, so neither later <see cref="AgentOptions"/> mutation nor a later change of the pair can
+    /// reach an accepted child. <c>null</c> means this manager was created without authorization, so
+    /// its children register their tools unguarded.
+    /// </summary>
+    private readonly ToolAuthorizationCapture? _toolAuthorizationSnapshot;
+
+    /// <summary>
     /// Test seam: whether this manager has been disposed.
     /// Tests use this to verify that CodingAgent.DisposeAsync disposed the manager.
     /// </summary>
@@ -209,6 +229,22 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// tracked and the runner scheduled. Used to exercise post-slot startup rollback.
     /// </summary>
     internal Action? OnSlotAcquiredBeforeStart { get; set; }
+
+    private AgentOptions? _lastChildOptions;
+
+    /// <summary>
+    /// Test seam: the most recently built child <see cref="AgentOptions"/> — captured at the moment
+    /// the child <see cref="CodingAgent"/> is constructed, so a test can read the exact options the
+    /// child ran under (including its tool-authorization pair) without installing a hook before the
+    /// run. <c>null</c> until the first child is constructed.
+    /// </summary>
+    internal AgentOptions? LastChildOptions => Volatile.Read(ref _lastChildOptions);
+
+    /// <summary>
+    /// Test seam: the tool-authorization pair this manager fixed at creation, which every child is
+    /// built from. <c>null</c> when this manager's children register their tools unguarded.
+    /// </summary>
+    internal ToolAuthorizationCapture? ToolAuthorizationSnapshot => _toolAuthorizationSnapshot;
 
     /// <summary>The logger resolved by the constructor (explicit logger, else parent options logger).</summary>
     internal ILogger ResolvedLogger => _logger;
@@ -244,10 +280,57 @@ public sealed class SubAgentManager : IAsyncDisposable
     /// <param name="defaultClient">Fallback client used when no model-specific client is selected.</param>
     /// <param name="parentOptions">Parent agent configuration; its capabilities bound those available to sub-agents.</param>
     /// <param name="logger">Optional logger; null uses the parent logger, then a no-op logger.</param>
+    /// <remarks>
+    /// This overload is a <b>trusted host entry point</b>: the manager captures the
+    /// <see cref="AgentOptions.AuthorizeTool"/> pair from <paramref name="parentOptions"/> ONCE, here,
+    /// exactly like its capability ceiling. Every sub-agent this manager starts then inherits that
+    /// fixed pair — including children started through the public
+    /// <see cref="StartAsync(SubAgentRequest, CancellationToken)"/>, whose own guarantee boundary is
+    /// documented rather than guarded. Later mutation of <paramref name="parentOptions"/> does not
+    /// change the pair this manager already fixed.
+    /// <para>
+    /// A manager created by a <see cref="CodingAgent"/> does NOT use this overload: it is given the
+    /// pair that agent captured at its own construction, so mutating the parent options after the
+    /// agent was constructed — including before the first execution, when this manager is created
+    /// lazily — cannot change the policy the agent's sub-agents run under.
+    /// </para>
+    /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
     /// <exception cref="ArgumentException">Thrown when the model catalog is invalid.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when limits or timeouts are invalid.</exception>
     public SubAgentManager(SubAgentOptions options, IChatClient defaultClient, AgentOptions parentOptions, ILogger? logger = null)
+        : this(options, defaultClient, parentOptions, logger, ToolAuthorizationCapture.Capture(parentOptions))
+    {
+    }
+
+    /// <summary>
+    /// Creates a new sub-agent manager with the tool-authorization pair fixed explicitly by the
+    /// caller, instead of capturing it from <paramref name="parentOptions"/>.
+    /// <para>
+    /// <see cref="CodingAgent"/> uses this overload to hand over the pair it captured at ITS
+    /// construction, so the lazy creation of the manager cannot pick up a callback the host added to
+    /// the live options afterwards. <paramref name="captureToolAuthorization"/> is used verbatim:
+    /// <c>null</c> means "authorization disabled for this manager", and is never replaced by a
+    /// capture from <paramref name="parentOptions"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="options">Configuration for available models, limits, defaults, and optional image root.</param>
+    /// <param name="defaultClient">Fallback client used when no model-specific client is selected.</param>
+    /// <param name="parentOptions">Parent agent configuration; its capabilities bound those available to sub-agents.</param>
+    /// <param name="logger">Optional logger; null uses the parent logger, then a no-op logger.</param>
+    /// <param name="captureToolAuthorization">
+    /// The already-fixed authorization pair, or <c>null</c> for a manager whose children register
+    /// their tools unguarded.
+    /// </param>
+    /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
+    /// <exception cref="ArgumentException">Thrown when the model catalog is invalid.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when limits or timeouts are invalid.</exception>
+    internal SubAgentManager(
+        SubAgentOptions options,
+        IChatClient defaultClient,
+        AgentOptions parentOptions,
+        ILogger? logger,
+        ToolAuthorizationCapture? captureToolAuthorization)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _defaultClient = defaultClient ?? throw new ArgumentNullException(nameof(defaultClient));
@@ -260,6 +343,11 @@ public sealed class SubAgentManager : IAsyncDisposable
         _parentEnableSkillsSnapshot = parentOptions.EnableSkills;
         _workDirectorySnapshot = parentOptions.WorkDirectory;
         _additionalImagesRootSnapshot = CanonicalizeAdditionalImagesRoot(options.AdditionalImagesRoot);
+
+        // Fixed ONCE, at creation, exactly like the capability ceiling above. Every RunSpec copies
+        // this value at acceptance time, so neither later AgentOptions mutation nor a later change of
+        // the pair can reach an already-accepted child in either direction.
+        _toolAuthorizationSnapshot = captureToolAuthorization;
 
         if (options.MaxConcurrentSubAgents < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxConcurrentSubAgents must be at least 1.");
@@ -464,7 +552,12 @@ public sealed class SubAgentManager : IAsyncDisposable
                 CompactionClient = _parentOptions.CompactionClient,
                 CompactionMaxTokens = _parentOptions.CompactionMaxTokens,
                 ReasoningEffort = _parentOptions.ReasoningEffort,
-                Images = SnapshotImages(request.Images)
+                Images = SnapshotImages(request.Images),
+
+                // Copied from the manager's fixed creation-time pair while the request is being
+                // accepted — BEFORE the concurrency slot is awaited — so this child runs under the
+                // policy that was in force at acceptance no matter what the host does afterwards.
+                ToolAuthorization = _toolAuthorizationSnapshot
             };
 
             Interlocked.Increment(ref _pendingStarts);
@@ -643,7 +736,21 @@ public sealed class SubAgentManager : IAsyncDisposable
             // and records into the bound sink.
             subOptions.OnUsage = usageEvent => ForwardUsage(entry, spec, usageEvent);
 
+            // The child's tool authorization comes from the pair captured with THIS run's spec at
+            // acceptance — never from the live parent options. That value is the manager's own
+            // creation-time snapshot (the field is readonly and written once), so a host that
+            // enables, disables, replaces or re-correlates authorization afterwards can neither
+            // grant nor revoke it for an already-accepted child. When the accepted pair is null the
+            // child captures no callback, so it registers its tools unguarded and its own
+            // FileTools/BashTools/SkillTools keep the pre-authorization shape byte for byte.
+            subOptions.AuthorizeTool = spec.ToolAuthorization?.AuthorizeTool;
+            subOptions.ToolAuthorizationCorrelationId = spec.ToolAuthorization?.CorrelationId;
+
             OnSubAgentOptionsCreated?.Invoke(subOptions);
+
+            // Publish the exact options the child is about to be constructed from (test seam; a
+            // plain reference write, so it cannot change what the child sees).
+            Volatile.Write(ref _lastChildOptions, subOptions);
 
             var agent = new CodingAgent(spec.Client, subOptions);
             var result = await agent.ExecuteAsync(spec.Task, spec.Images, linked.Token).ConfigureAwait(false);
