@@ -1089,8 +1089,42 @@ public static class ChatClientFactory
     /// The OpenAI SDK only reads choices[0], losing the tool_calls. This handler
     /// merges all choices into a single choice so the SDK sees both text and tool_calls.
     /// </summary>
+    /// <remarks>
+    /// This handler also owns one deliberate non-passthrough case: a <b>syntactically valid
+    /// successful</b> chat-completions response in which a choice explicitly carries
+    /// <c>finish_reason</c> <c>"error"</c> is an explicit provider failure, not a completion, so it
+    /// is converted into a controlled transient transport failure
+    /// (<see cref="ProviderErrorFinishReasonMessage"/>) instead of being handed to the OpenAI SDK —
+    /// whose <c>ChatFinishReason</c> parser throws an unhelpful
+    /// <c>ArgumentOutOfRangeException</c> for that value. See
+    /// <see cref="HasProviderErrorFinishReason"/>.
+    /// <para>
+    /// <b>Body reads.</b> A non-success response is buffered and re-wrapped as before. A
+    /// <i>successful</i> response whose declared media type is <c>text/event-stream</c>
+    /// (case-insensitive) is returned FIRST, decided from the headers alone: the handler performs
+    /// no read, no log, no rewrite and no error-finish-reason scan, and hands back the original
+    /// content instance with its original media type, so a streaming caller (for example one using
+    /// <see cref="HttpCompletionOption.ResponseHeadersRead"/>) is never blocked behind a buffered
+    /// body. Every other successful response is read once; the error check is then a
+    /// forward-only <see cref="Utf8JsonReader"/> token scan of that body
+    /// (<see cref="HasProviderErrorFinishReason"/>), which runs BEFORE the merge block's
+    /// <see cref="JsonNode"/> parse and outside that block's catch-all. A body that is not a
+    /// well-formed JSON document is never interpreted as an error signal and keeps its unchanged
+    /// passthrough.
+    /// </para>
+    /// </remarks>
     internal sealed class CopilotChoiceMergingHandler : DelegatingHandler
     {
+        /// <summary>
+        /// The fixed, safe message used when the provider reports an explicit error finish reason.
+        /// </summary>
+        /// <remarks>
+        /// It names the signal (<c>finish_reason="error"</c>) and nothing else: no response body,
+        /// no echo of any provider-supplied text and no credential material ever reaches it.
+        /// </remarks>
+        internal const string ProviderErrorFinishReasonMessage =
+            "GitHub Copilot returned an explicit provider error finish reason (finish_reason=\"error\").";
+
         private int _requestCount;
 
         public CopilotChoiceMergingHandler() { }
@@ -1122,11 +1156,48 @@ public static class ChatClientFactory
                 return response;
             }
 
+            // A declared SSE response is a stream the SDK's streaming parser must consume itself.
+            // Decided from the headers ALONE, before any body read or log: buffering here would
+            // block until the stream ends (defeating ResponseHeadersRead streaming) and would
+            // rewrite or reject a body this handler never agreed to interpret. The original content
+            // instance and media type are handed back untouched. HTTP media types are
+            // case-insensitive, hence the ignore-case comparison.
+            if (string.Equals(
+                    response.Content.Headers.ContentType?.MediaType,
+                    "text/event-stream",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return response;
+            }
+
             var body = await response.Content.ReadAsStringAsync();
             LogCompletionsExchange(seq, "response", body);
 
+            // EXPLICIT PROVIDER FAILURE — checked BEFORE any rewriting, and deliberately OUTSIDE
+            // the merge try/catch below (which absorbs every exception into "return the original
+            // body"), so an error finish reason can never be laundered into a fabricated
+            // completion. The OpenAI SDK maps finish_reason onto its ChatFinishReason enum and
+            // throws ArgumentOutOfRangeException("Unknown ChatFinishReason value ... error") for
+            // this value, which surfaces as an opaque bug in the agent loop instead of a retryable
+            // transport failure. Raising here instead lets the ResilienceHandler above apply its
+            // standard retry policy, and leaves the caller with the fixed safe message after
+            // exhaustion. The scan is a TOLERANT forward-only token walk (see
+            // HasProviderErrorFinishReason) — never a JsonNode indexer walk, whose lazy parse
+            // throws on duplicate properties (and on undecodable strings) and would break a
+            // completion that merely has such content in a field the scan does not need.
+            if (HasProviderErrorFinishReason(body))
+            {
+                // The caller never sees this response; the response we are rejecting is ours to
+                // release.
+                response.Dispose();
+                throw new HttpRequestException(ProviderErrorFinishReasonMessage);
+            }
+
             try
             {
+                // Parse INSIDE the passthrough try: JsonNode is lazy, so both the parse and every
+                // later indexer access may throw (malformed JSON, duplicate properties), and all of
+                // that must keep meaning "return the original response unchanged".
                 var json = JsonNode.Parse(body);
                 var choices = json?["choices"]?.AsArray();
 
@@ -1182,6 +1253,146 @@ public static class ChatClientFactory
         {
             response.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
             return response;
+        }
+
+        /// <summary>
+        /// The <c>finish_reason</c> value the Copilot API uses to report an explicit provider-side
+        /// error inside an otherwise syntactically valid, successful chat-completions response.
+        /// </summary>
+        /// <remarks>
+        /// The OpenAI SDK has no member for it, so handing such a response to the SDK fails with
+        /// <c>ArgumentOutOfRangeException("Unknown ChatFinishReason value …")</c> — an opaque
+        /// contract violation rather than the provider failure it actually is.
+        /// </remarks>
+        internal const string ProviderErrorFinishReason = "error";
+
+        /// <summary>
+        /// Reports whether <paramref name="body"/> is a syntactically valid chat-completions
+        /// response in which at least one element of the root <c>choices</c> array explicitly
+        /// carries the string <c>finish_reason</c> <see cref="ProviderErrorFinishReason"/>, compared
+        /// case-insensitively so a differently cased provider spelling is caught too.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>Why a token walk and not <see cref="JsonNode"/>.</b> A parsed <see cref="JsonNode"/>
+        /// is lazy: indexing an object throws <see cref="ArgumentException"/> on a duplicate
+        /// property, and reading a string throws on an unpaired Unicode escape. A scan built on
+        /// that indexer would therefore turn a completion that has a duplicate property in an
+        /// unused field into an uncontrolled failure — and could abort before reaching a genuine
+        /// error choice. (The OpenAI SDK's own tolerance is partial: it can skip an undecodable
+        /// value in a field it does not use, but reading a known field such as
+        /// <c>message.content</c> can still throw on one, which this handler does not change.) The
+        /// walk below uses <see cref="Utf8JsonReader"/>, which neither de-duplicates nor decodes
+        /// anything it does not inspect, and decodes only the property names it compares and the
+        /// one <c>finish_reason</c> string it needs, each in isolation.
+        /// </para>
+        /// <para>
+        /// <b>Semantics.</b> Only <c>root.choices[i].finish_reason</c> counts. A missing or
+        /// non-array <c>choices</c>, a non-object element, a missing finish_reason, JSON
+        /// <c>null</c> and every non-string value (number, boolean, object, array) report no
+        /// signal; so does an empty array (the empty-choice stop synthesis stays in charge) and a
+        /// non-object root. A string that cannot be decoded (unpaired surrogate escape) can never
+        /// equal <c>"error"</c>, so it is a non-match for THAT value only and the walk goes on to
+        /// later choices. Duplicate properties are all visited, so an <c>"error"</c> on ANY
+        /// occurrence is a failure — failing closed on an ambiguous document rather than guessing
+        /// which duplicate a consumer would honour.
+        /// </para>
+        /// <para>
+        /// <b>Only a syntactically valid document can be an error response.</b> The result is
+        /// reported only after the whole body, including the absence of trailing content, has been
+        /// read without a syntax error (same default reader options and depth limit as
+        /// <see cref="JsonNode.Parse(string, JsonNodeOptions?, JsonDocumentOptions)"/>). A truncated
+        /// or otherwise malformed body keeps its unchanged passthrough even when an
+        /// <c>"error"</c> was seen before the syntax error.
+        /// </para>
+        /// <para>Never throws.</para>
+        /// </remarks>
+        internal static bool HasProviderErrorFinishReason(string? body)
+        {
+            if (string.IsNullOrEmpty(body)) return false;
+
+            try
+            {
+                var reader = new Utf8JsonReader(Encoding.UTF8.GetBytes(body));
+
+                // A non-object root is not a chat-completions response: no signal.
+                if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return false;
+
+                var found = false;
+
+                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    var isChoices = StringEquals(ref reader, "choices", StringComparison.Ordinal);
+                    reader.Read(); // advance to the property's value
+
+                    if (isChoices && reader.TokenType == JsonTokenType.StartArray)
+                        found |= ScanChoices(ref reader);
+                    else
+                        reader.Skip();
+                }
+
+                // The loop ends on the root EndObject. Anything after it must be the end of the
+                // input: Read() throws on trailing content and returns false at the end.
+                if (reader.TokenType != JsonTokenType.EndObject || reader.Read()) return false;
+
+                return found;
+            }
+            catch (Exception)
+            {
+                // Syntax error, depth limit or any other failure to walk the document: it is not a
+                // well-formed error response, so the unchanged passthrough keeps handling it.
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Walks a <c>choices</c> array whose <c>StartArray</c> the reader is positioned on, leaving
+        /// the reader on its <c>EndArray</c>. Returns whether any element is an object with an error
+        /// <c>finish_reason</c>. Always walks the WHOLE array, so the caller can still verify the
+        /// document's syntax to the end.
+        /// </summary>
+        private static bool ScanChoices(ref Utf8JsonReader reader)
+        {
+            var found = false;
+
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            {
+                if (reader.TokenType != JsonTokenType.StartObject)
+                {
+                    reader.Skip(); // scalar (no-op) or a nested container
+                    continue;
+                }
+
+                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    var isFinishReason = StringEquals(ref reader, "finish_reason", StringComparison.Ordinal);
+                    reader.Read(); // advance to the property's value
+
+                    if (isFinishReason && reader.TokenType == JsonTokenType.String)
+                        found |= StringEquals(ref reader, ProviderErrorFinishReason, StringComparison.OrdinalIgnoreCase);
+                    else
+                        reader.Skip();
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// Whether the current string or property-name token equals <paramref name="expected"/>
+        /// under <paramref name="comparison"/>, escapes resolved. A token that cannot be decoded
+        /// (unpaired surrogate escape) matches nothing — isolated to this one token.
+        /// </summary>
+        private static bool StringEquals(ref Utf8JsonReader reader, string expected, StringComparison comparison)
+        {
+            try
+            {
+                return string.Equals(reader.GetString(), expected, comparison);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
         }
 
         /// <summary>
