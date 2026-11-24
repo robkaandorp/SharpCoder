@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.23.1] — 2026-11-24
+
+### Fixed
+
+- **Copilot explicit provider error finish reason** — For a successful, non-SSE Copilot chat-completions response containing valid JSON, if any choice explicitly reports `finish_reason: "error"`, SharpCoder raises a safe, retryable provider failure beneath the existing HTTP resilience handler, before the OpenAI SDK can raise “Unknown ChatFinishReason.” The error is not rewritten as `stop` or treated as a successful completion. Ordinary `stop` and `tool_calls` responses and choice merging are unchanged. Successful responses declared as `text/event-stream` pass through without body inspection or buffering. Regression tests cover transient recovery and persistent failure.
+
 ## [0.23.0] — 2026-11-07
 
 ### Added
