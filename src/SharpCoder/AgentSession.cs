@@ -81,31 +81,10 @@ public sealed class AgentSession
 
     /// <summary>
     /// Estimated token count of the current message history.
-    /// Uses a rough heuristic (~4 chars per token).
+    /// Uses a rough heuristic (~4 chars per token, plus a flat allowance per image/PDF
+    /// attachment); includes reasoning content.
     /// </summary>
-    public long EstimatedContextTokens
-    {
-        get
-        {
-            long chars = 0;
-            long imageCount = 0;
-            foreach (var msg in MessageHistory)
-            {
-                foreach (var content in msg.Contents)
-                {
-                    if (content is TextContent tc)
-                        chars += tc.Text?.Length ?? 0;
-                    else if (content is FunctionCallContent fc)
-                        chars += UsageEstimator.EstimateCallLength(fc);
-                    else if (content is FunctionResultContent fr)
-                        chars += UsageEstimator.EstimateResultLength(fr);
-                    else if (content is DataContent dc && UsageEstimator.IsImageOrPdf(dc))
-                        imageCount++;
-                }
-            }
-            return chars / 4 + imageCount * ImageTokenEstimate; // ~4 chars per token heuristic
-        }
-    }
+    public long EstimatedContextTokens => UsageEstimator.EstimateMessagesTokens(MessageHistory); // ~4 chars per token heuristic
 
     /// <summary>Save session state to a JSON file.</summary>
     /// <param name="filePath">Destination JSON file path; missing parent directories are created.</param>
@@ -114,7 +93,8 @@ public sealed class AgentSession
     public async Task SaveAsync(string filePath, CancellationToken ct = default)
     {
         var dir = Path.GetDirectoryName(filePath);
-        if (dir != null && !Directory.Exists(dir))
+        // A bare filename (no directory component) yields "" — creating that throws.
+        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
         var data = new SessionData

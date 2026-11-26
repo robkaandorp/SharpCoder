@@ -47,6 +47,10 @@ public sealed class AgentFactory : IAsyncDisposable
             OnCompacting = _ui.Compacting,
             OnCompacted = _ui.Compacted,
         };
+        // The CLI defaults to a 1M-token window (the library keeps a conservative 100k default).
+        agentOptions.MaxContextTokens = _options.ContextTokens ?? CliOptions.DefaultContextTokens;
+        if (_options.RetainTokens is { } retainTokens)
+            agentOptions.CompactionRetainTokens = retainTokens;
 
         _agent = new CodingAgent(_client, agentOptions);
 
@@ -64,6 +68,7 @@ public sealed class AgentFactory : IAsyncDisposable
             maxSteps: _options.MaxSteps,
             enableBash: _options.EnableBash,
             reasoning: _options.ReasoningEffort,
+            contextTokens: _options.ContextTokens,
             savePath: _options.SavePath);
 
     public async ValueTask DisposeAsync()

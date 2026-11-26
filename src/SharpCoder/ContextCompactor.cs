@@ -114,8 +114,8 @@ public sealed class ContextCompactor
         if (estimated < threshold) return false;
 
         var startIndex = FindStartIndex(session.MessageHistory);
-        if (session.MessageHistory.Count - startIndex <= options.CompactionRetainRecent + 1)
-            return false; // Not enough messages to compact
+        if (session.MessageHistory.Count - startIndex <= options.CompactionRetainRecent)
+            return false; // Not enough messages to compact beyond the retained floor
 
         var tokensBefore = estimated;
         var messagesBefore = session.MessageHistory.Count - startIndex;
@@ -126,8 +126,8 @@ public sealed class ContextCompactor
 
         try
         {
-            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-                session.MessageHistory, startIndex, options.CompactionRetainRecent, options,
+            var (compacted, compactedMessages, oldCount, tokensElided) = await CompactMessageSliceAsync(
+                session.MessageHistory, startIndex, null, options,
                 substituteNullSummary: true, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
@@ -141,7 +141,8 @@ public sealed class ContextCompactor
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session.EstimatedContextTokens,
-                messagesBefore, session.MessageHistory.Count - startIndex));
+                messagesBefore, session.MessageHistory.Count - startIndex)
+                { TokensElided = tokensElided });
 
             session.LastKnownContextTokens = 0;
             return true;
@@ -252,8 +253,8 @@ public sealed class ContextCompactor
         var messages = session.MessageHistory;
         var startIndex = FindStartIndex(messages);
 
-        if (messages.Count - startIndex <= options.CompactionRetainRecent + 1)
-            return false; // Not enough messages to compact
+        if (messages.Count - startIndex <= options.CompactionRetainRecent)
+            return false; // Not enough messages to compact beyond the retained floor
 
         var tokensBefore = session.EstimatedContextTokens;
         var messagesBefore = messages.Count - startIndex;
@@ -295,7 +296,7 @@ public sealed class ContextCompactor
 
         try
         {
-            var (compacted, compactedMessages, summaryOldCount) = await CompactMessageSliceAsync(
+            var (compacted, compactedMessages, summaryOldCount, tokensElided) = await CompactMessageSliceAsync(
                 messages, startIndex, messages.Count - splitPoint, options,
                 substituteNullSummary: false, ResolveRecorder(recorder, session, options), ct);
 
@@ -310,7 +311,8 @@ public sealed class ContextCompactor
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session.EstimatedContextTokens,
-                messagesBefore, session.MessageHistory.Count - startIndex));
+                messagesBefore, session.MessageHistory.Count - startIndex)
+                { TokensElided = tokensElided });
 
             session.LastKnownContextTokens = 0;
             return true;
@@ -330,19 +332,7 @@ public sealed class ContextCompactor
     }
 
     private static long EstimateMessageTokens(ChatMessage message)
-    {
-        long chars = 0;
-        foreach (var content in message.Contents)
-        {
-            if (content is TextContent tc)
-                chars += tc.Text?.Length ?? 0;
-            else if (content is FunctionCallContent fc)
-                chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
-            else if (content is FunctionResultContent fr)
-                chars += EstimateResultLength(fr);
-        }
-        return chars / 4;
-    }
+        => UsageEstimator.EstimateMessagesTokens(new[] { message });
 
     /// <summary>
     /// Compacts the session unconditionally, regardless of whether the token threshold
@@ -391,8 +381,8 @@ public sealed class ContextCompactor
         var messages = session.MessageHistory;
 
         var startIndex = FindStartIndex(messages);
-        if (messages.Count - startIndex <= options.CompactionRetainRecent + 1)
-            return false; // Not enough messages to compact
+        if (messages.Count - startIndex <= options.CompactionRetainRecent)
+            return false; // Not enough messages to compact beyond the retained floor
 
         var tokensBefore = session.EstimatedContextTokens;
         var messagesBefore = messages.Count - startIndex;
@@ -407,8 +397,8 @@ public sealed class ContextCompactor
             // propagating to the caller. A failed chunk returns false without logging;
             // an OperationCanceledException while ct is cancelled is rethrown by the
             // filtered catch below.
-            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-                messages, startIndex, options.CompactionRetainRecent, options,
+            var (compacted, compactedMessages, oldCount, tokensElided) = await CompactMessageSliceAsync(
+                messages, startIndex, null, options,
                 substituteNullSummary: false, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
@@ -421,7 +411,8 @@ public sealed class ContextCompactor
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session.EstimatedContextTokens,
-                messagesBefore, session.MessageHistory.Count - startIndex));
+                messagesBefore, session.MessageHistory.Count - startIndex)
+                { TokensElided = tokensElided });
 
             session.LastKnownContextTokens = 0;
             return true;
@@ -504,21 +495,8 @@ public sealed class ContextCompactor
         long estimated;
         int startIndex = messages.Count > 0 && messages[0].Role == ChatRole.System ? 1 : 0;
 
-        // Compute heuristic estimate from current message content
-        long chars = 0;
-        for (int i = startIndex; i < messages.Count; i++)
-        {
-            foreach (var content in messages[i].Contents)
-            {
-                if (content is TextContent tc)
-                    chars += tc.Text?.Length ?? 0;
-                else if (content is FunctionCallContent fc)
-                    chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
-                else if (content is FunctionResultContent fr)
-                    chars += EstimateResultLength(fr);
-            }
-        }
-        var heuristicEstimate = chars / 4;
+        // Compute heuristic estimate from current message content (skipping any system prefix)
+        var heuristicEstimate = UsageEstimator.EstimateMessagesTokens(messages.Skip(startIndex));
 
         if (session != null && session.LastKnownContextTokens > 0)
         {
@@ -536,7 +514,7 @@ public sealed class ContextCompactor
 
         // Count non-system messages
         int nonSystemCount = messages.Count - startIndex;
-        if (nonSystemCount <= options.CompactionRetainRecent + 1)
+        if (nonSystemCount <= options.CompactionRetainRecent)
             return false;
 
         var tokensBefore = estimated;
@@ -548,8 +526,8 @@ public sealed class ContextCompactor
 
         try
         {
-            var (compacted, compactedMessages, oldCount) = await CompactMessageSliceAsync(
-                messages, startIndex, options.CompactionRetainRecent, options,
+            var (compacted, compactedMessages, oldCount, tokensElided) = await CompactMessageSliceAsync(
+                messages, startIndex, null, options,
                 substituteNullSummary: true, ResolveRecorder(recorder, session, options), ct);
 
             if (!compacted) return false;
@@ -576,7 +554,8 @@ public sealed class ContextCompactor
 
             options.OnCompacted?.Invoke(new CompactionResult(
                 tokensBefore, session?.EstimatedContextTokens ?? 0,
-                messagesBefore, messagesAfter));
+                messagesBefore, messagesAfter)
+                { TokensElided = tokensElided });
 
             if (session != null)
                 session.LastKnownContextTokens = 0;
@@ -605,7 +584,11 @@ public sealed class ContextCompactor
     /// Number of leading messages to skip (0 for session-based methods,
     /// 1 when a system prompt is present at index 0 in the mid-loop overload).
     /// </param>
-    /// <param name="retainCount">Number of recent messages to preserve verbatim.</param>
+    /// <param name="retainCountOverride">
+    /// Exact number of recent messages to keep verbatim (used by percentage-based compaction);
+    /// when <c>null</c>, the tail is sized by the token budget (<see cref="AgentOptions.CompactionRetainTokens"/>),
+    /// never smaller than <see cref="AgentOptions.CompactionRetainRecent"/> messages.
+    /// </param>
     /// <param name="options">Agent options (used for <see cref="AgentOptions.OnCompacting"/>).</param>
     /// <param name="substituteNullSummary">
     /// When <c>true</c>, a null/whitespace LLM response is replaced with <c>"No summary available."</c>.
@@ -618,31 +601,68 @@ public sealed class ContextCompactor
     /// </param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
-    /// A tuple of <c>(compacted, compactedMessages, oldCount)</c>. When <c>compacted</c> is
-    /// <c>true</c>, <c>compactedMessages</c> contains a single summary message followed by the
-    /// retained recent messages, and <c>oldCount</c> is the number of messages that were summarized.
+    /// A tuple of <c>(compacted, compactedMessages, oldCount, tokensElided)</c>. When <c>compacted</c> is
+    /// <c>true</c>, <c>compactedMessages</c> contains the compacted history followed by the
+    /// retained recent messages, <c>oldCount</c> is the number of messages compacted away, and
+    /// <c>tokensElided</c> is how many tokens were reclaimed by tool-result elision (0 when elision
+    /// is disabled, found nothing, or was not reached because summarization produced the history).
+    /// When elision alone brings the context under the threshold, no summary message is produced.
     /// </returns>
-    private async Task<(bool compacted, IList<ChatMessage> compactedMessages, int oldCount)>
+    private async Task<(bool compacted, IList<ChatMessage> compactedMessages, int oldCount, long tokensElided)>
         CompactMessageSliceAsync(
             IList<ChatMessage> messages,
             int startIndex,
-            int retainCount,
+            int? retainCountOverride,
             AgentOptions options,
             bool substituteNullSummary,
             UsageRecorder recorder,
             CancellationToken ct)
     {
-        int nonSkippedCount = messages.Count - startIndex;
-        if (nonSkippedCount <= retainCount + 1)
-            return (false, Array.Empty<ChatMessage>(), 0);
-
         var slice = messages.Skip(startIndex).ToList();
-        var splitPoint = AdjustSplitPoint(slice, slice.Count - retainCount);
+        if (slice.Count <= options.CompactionRetainRecent)
+            return (false, Array.Empty<ChatMessage>(), 0, 0);
+
+        int splitPoint;
+        if (retainCountOverride is int retainCount)
+        {
+            splitPoint = AdjustSplitPoint(slice, Math.Max(0, slice.Count - retainCount));
+        }
+        else
+        {
+            splitPoint = AdjustSplitPoint(slice, TokenBudgetSplitIndex(
+                slice, RetainBudget(options), options.CompactionRetainRecent));
+        }
         if (splitPoint <= 0)
-            return (false, Array.Empty<ChatMessage>(), 0);
+            return (false, Array.Empty<ChatMessage>(), 0, 0);
 
         var oldMessages = slice.Take(splitPoint).ToList();
         var recentMessages = slice.Skip(splitPoint).ToList();
+
+        // Stage 1 (optional): elide large tool-result bodies and attachments from the old slice.
+        // When elision alone brings the context back under the threshold, no summary call is
+        // needed at all: the history is rewritten with stubs in place of the bulky results.
+        // Otherwise the slice is summarized exactly as before — the summarizer's prompt drops
+        // result bodies anyway, so pre-eliding it would not help.
+        var threshold = (long)(options.MaxContextTokens * options.CompactionThreshold);
+        long tokensElided = 0;
+        if (options.EnableToolResultElision)
+        {
+            var (elidedMessages, reclaimed, elidedItems) = ElideBulkyContents(oldMessages);
+            if (reclaimed > 0
+                && EstimateTokens(elidedMessages) + EstimateTokens(recentMessages) <= threshold)
+            {
+                var elidedOnly = new List<ChatMessage>(elidedMessages.Count + recentMessages.Count);
+                elidedOnly.AddRange(elidedMessages);
+                elidedOnly.AddRange(recentMessages);
+                _logger.LogInformation(
+                    "Elided {Items} bulky items from the compacted range (~{Tokens:n0} tokens reclaimed); no summary call needed",
+                    elidedItems, reclaimed);
+                options.OnCompacting?.Invoke();
+                return (true, elidedOnly, oldMessages.Count, reclaimed);
+            }
+        }
+
+        options.OnCompacting?.Invoke();
 
         // Budget is 75% of the compaction model's context window. When no dedicated
         // compaction limit is configured, fall back to the main model's limit.
@@ -658,7 +678,7 @@ public sealed class ContextCompactor
                 oldMessages, (int)budget, options, substituteNullSummary, recorder, ct);
 
             if (!success)
-                return (false, Array.Empty<ChatMessage>(), 0);
+                return (false, Array.Empty<ChatMessage>(), 0, 0);
 
             summary = chunkedSummary;
             chunkCount = chunksUsed;
@@ -673,8 +693,6 @@ public sealed class ContextCompactor
                 new ChatMessage(ChatRole.User, summaryPromptText)
             };
 
-            options.OnCompacting?.Invoke();
-
             // The summary call goes through the shared recording wrapper (Source = Compaction), so
             // it is recorded exactly once when it ends — completion or failure alike.
             var summaryResponse = await CreateRecordingClient(recorder)
@@ -684,7 +702,7 @@ public sealed class ContextCompactor
             if (string.IsNullOrWhiteSpace(rawSummary))
             {
                 if (!substituteNullSummary)
-                    return (false, Array.Empty<ChatMessage>(), 0);
+                    return (false, Array.Empty<ChatMessage>(), 0, 0);
                 summary = "No summary available.";
             }
             else
@@ -705,26 +723,127 @@ public sealed class ContextCompactor
         foreach (var msg in recentMessages)
             compactedMessages.Add(msg);
 
-        return (true, compactedMessages, oldMessages.Count);
+        return (true, compactedMessages, oldMessages.Count, tokensElided);
+    }
+
+    /// <summary>
+    /// Token budget for the verbatim tail retained by compaction: the smaller of
+    /// <see cref="AgentOptions.CompactionRetainTokens"/> and half the compaction threshold
+    /// (which guarantees a full half-threshold of headroom after compacting). At least 1.
+    /// </summary>
+    private static long RetainBudget(AgentOptions options)
+    {
+        long threshold = (long)(options.MaxContextTokens * options.CompactionThreshold);
+        long cap = Math.Max(1, threshold / 2);
+        return Math.Max(1, Math.Min(options.CompactionRetainTokens, cap));
+    }
+
+    /// <summary>
+    /// Computes the split index for a token-budgeted retained tail: walks from the newest
+    /// message backwards until adding one more would exceed <paramref name="budgetTokens"/>,
+    /// but never keeps fewer than <paramref name="minKeep"/> messages. Returns 0 when the whole
+    /// slice fits the budget (nothing worth compacting).
+    /// </summary>
+    private static int TokenBudgetSplitIndex(IList<ChatMessage> slice, long budgetTokens, int minKeep)
+    {
+        long tokens = 0;
+        int kept = 0;
+        for (int i = slice.Count - 1; i >= 0; i--)
+        {
+            long t = UsageEstimator.EstimateMessagesTokens(new[] { slice[i] });
+            if (kept >= minKeep && tokens + t > budgetTokens) break;
+            tokens += t;
+            kept++;
+        }
+        return slice.Count - kept;
+    }
+
+    /// <summary>Smallest tool-result body (in characters) considered worthwhile to elide.</summary>
+    private const int MinElideChars = 256;
+
+    /// <summary>
+    /// Replaces bulky, re-fetchable content in <paramref name="slice"/> with one-line stubs:
+    /// tool-result bodies of at least <see cref="MinElideChars"/> characters become a stub naming
+    /// the tool (and a truncated argument hint taken from the matching call) and the original size;
+    /// image/PDF attachments become a one-line stub. Call ids are preserved, so tool-call pairing
+    /// stays valid and the model can re-run a tool to recover the content. User text, assistant
+    /// text and reasoning content are never touched. The input list is not mutated.
+    /// Returns the rewritten list, the estimated tokens reclaimed, and the number of items elided.
+    /// </summary>
+    private static (List<ChatMessage> Messages, long TokensReclaimed, int ItemsElided) ElideBulkyContents(
+        IReadOnlyList<ChatMessage> slice)
+    {
+        // Map call id -> (tool name, argument hint) so stubs can say what was omitted and how to get it back.
+        var callInfo = new Dictionary<string, (string Name, string? Hint)>(StringComparer.Ordinal);
+        foreach (var msg in slice)
+        foreach (var fc in msg.Contents.OfType<FunctionCallContent>())
+            if (fc.CallId is { } id && !callInfo.ContainsKey(id))
+                callInfo[id] = (fc.Name ?? "tool", FormatArgumentsHint(fc.Arguments));
+
+        var result = new List<ChatMessage>(slice.Count);
+        long reclaimed = 0;
+        int elided = 0;
+        foreach (var msg in slice)
+        {
+            List<AIContent>? rebuilt = null;
+            for (int i = 0; i < msg.Contents.Count; i++)
+            {
+                var content = msg.Contents[i];
+                switch (content)
+                {
+                    case FunctionResultContent fr when UsageEstimator.EstimateResultLength(fr) >= MinElideChars:
+                        var (name, hint) = callInfo.TryGetValue(fr.CallId ?? string.Empty, out var info)
+                            ? info
+                            : ("tool", (string?)null);
+                        long original = UsageEstimator.EstimateResultLength(fr);
+                        string stub = $"[tool result elided: {name}{(hint is null ? string.Empty : "(" + hint + ")")} - {original} chars - re-run the tool to see the contents]";
+                        reclaimed += Math.Max(0, original - stub.Length) / 4;
+                        elided++;
+                        (rebuilt ??= new List<AIContent>(msg.Contents))[i] = new FunctionResultContent(fr.CallId ?? string.Empty, stub);
+                        break;
+                    case DataContent dc when UsageEstimator.IsImageOrPdf(dc):
+                        reclaimed += AgentSession.ImageTokenEstimate;
+                        elided++;
+                        (rebuilt ??= new List<AIContent>(msg.Contents))[i] =
+                            new TextContent($"[{dc.MediaType} attachment elided - re-attach if needed]");
+                        break;
+                }
+            }
+
+            if (rebuilt is null)
+            {
+                result.Add(msg);
+            }
+            else
+            {
+                result.Add(new ChatMessage(msg.Role, rebuilt)
+                {
+                    AuthorName = msg.AuthorName,
+                    CreatedAt = msg.CreatedAt,
+                });
+            }
+        }
+
+        return (result, reclaimed, elided);
+    }
+
+    /// <summary>Renders a short, single-line argument hint (truncated at 80 characters) for elision stubs.</summary>
+    private static string? FormatArgumentsHint(IDictionary<string, object?>? arguments)
+    {
+        if (arguments is null || arguments.Count == 0) return null;
+        var sb = new StringBuilder();
+        foreach (var (key, value) in arguments)
+        {
+            if (sb.Length > 0) sb.Append(", ");
+            sb.Append(key).Append('=').Append(value);
+            if (sb.Length >= 80) break;
+        }
+        var text = sb.ToString();
+        return text.Length <= 80 ? text : text[..80] + "...";
     }
 
     private static long EstimateTokens(IList<ChatMessage> messages)
-    {
-        long chars = 0;
-        foreach (var msg in messages)
-        {
-            foreach (var content in msg.Contents)
-            {
-                if (content is TextContent tc)
-                    chars += tc.Text?.Length ?? 0;
-                else if (content is FunctionCallContent fc)
-                    chars += (fc.Name?.Length ?? 0) + EstimateArgumentsLength(fc);
-                else if (content is FunctionResultContent fr)
-                    chars += EstimateResultLength(fr);
-            }
-        }
-        return chars / 4;
-    }
+        => UsageEstimator.EstimateMessagesTokens(messages);
 
     private async Task<(bool success, string summary, int chunkCount)> SummarizeInChunksAsync(
         IList<ChatMessage> oldMessages,
@@ -771,8 +890,6 @@ public sealed class ContextCompactor
         {
             chunks.Add(currentChunk);
         }
-
-        options.OnCompacting?.Invoke();
 
         // One recording wrapper for the whole chunked operation: every chunk's call is recorded
         // exactly once (a throwing chunk call records a zero-token call) under
@@ -823,24 +940,6 @@ public sealed class ContextCompactor
 
         var combinedSummary = string.Join("\n\n", summaries);
         return (true, combinedSummary, chunks.Count);
-    }
-
-    private static long EstimateArgumentsLength(FunctionCallContent fc)
-    {
-        if (fc.Arguments == null) return 0;
-        long len = 0;
-        foreach (var kvp in fc.Arguments)
-        {
-            len += kvp.Key?.Length ?? 0;
-            len += kvp.Value?.ToString()?.Length ?? 0;
-        }
-        return len;
-    }
-
-    private static long EstimateResultLength(FunctionResultContent fr)
-    {
-        if (fr.Result == null) return 0;
-        return fr.Result.ToString()?.Length ?? 0;
     }
 
     private static string BuildSummaryPrompt(IList<ChatMessage> messages)

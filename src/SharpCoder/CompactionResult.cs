@@ -18,6 +18,12 @@ public sealed class CompactionResult
     /// <summary>Number of messages after compaction.</summary>
     public int MessagesAfter { get; }
 
+    /// <summary>
+    /// Tokens reclaimed by eliding old tool-result bodies and attachments before any summarization.
+    /// Zero when elision was disabled, found nothing to elide, or was skipped because a summary was produced.
+    /// </summary>
+    public long TokensElided { get; internal set; }
+
     /// <summary>Percentage of tokens reduced (0–100). Zero if <see cref="TokensBefore"/> is zero.</summary>
     public int ReductionPercent => TokensBefore > 0
         ? (int)Math.Round((1.0 - (double)TokensAfter / TokensBefore) * 100)

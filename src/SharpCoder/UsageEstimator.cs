@@ -56,6 +56,44 @@ internal static class UsageEstimator
     internal const long ImageCharacterWeight = AgentSession.ImageTokenEstimate * 4;
 
     /// <summary>
+    /// Estimates the token count of a sequence of messages with the shared heuristic:
+    /// total character weight divided by 4, plus a flat <see cref="AgentSession.ImageTokenEstimate"/>
+    /// per image/PDF attachment. Counts text, reasoning text, tool calls (name + arguments) and
+    /// tool results. Used for context-window estimates before any exact API usage is available.
+    /// </summary>
+    internal static long EstimateMessagesTokens(IEnumerable<ChatMessage> messages)
+    {
+        long chars = 0;
+        long imageCount = 0;
+        foreach (var msg in messages)
+        {
+            if (msg is null) continue;
+            foreach (var content in msg.Contents)
+            {
+                switch (content)
+                {
+                    case TextContent tc:
+                        chars += tc.Text?.Length ?? 0;
+                        break;
+                    case TextReasoningContent rc:
+                        chars += rc.Text?.Length ?? 0;
+                        break;
+                    case FunctionCallContent fc:
+                        chars += EstimateCallLength(fc);
+                        break;
+                    case FunctionResultContent fr:
+                        chars += EstimateResultLength(fr);
+                        break;
+                    case DataContent dc when IsImageOrPdf(dc):
+                        imageCount++;
+                        break;
+                }
+            }
+        }
+        return chars / 4 + imageCount * AgentSession.ImageTokenEstimate;
+    }
+
+    /// <summary>
     /// Character length of a function call's arguments: the sum of each argument's key length and
     /// its value's <c>ToString()</c> length.
     /// </summary>

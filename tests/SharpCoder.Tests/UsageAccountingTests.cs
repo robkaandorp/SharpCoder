@@ -645,9 +645,43 @@ public class UsageAccountingTests
         Assert.Equal(1, session.Usage.Total.Calls);
         Assert.Equal(300, session.Usage.Total.InputTokens);
 
-        // The input count of that call was reported, so it is the session's known context size —
-        // a last-item-only reader would treat the final (output/cached) update as "no input" here.
-        Assert.Equal(300, session.LastKnownContextTokens);
+        // TokenUsage accounting sums the parts (300), but the context-size signal takes the
+        // largest single report (200): providers either report usage once or re-report cumulative
+        // snapshots, so the max is the true prompt size in both real cases. A pure last-item
+        // reader would still have to find an update that carries input — here one always exists.
+        Assert.Equal(200, session.LastKnownContextTokens);
+    }
+
+    [Theory]
+    [InlineData(UsageExecutionPath.StreamingDefault)]
+    [InlineData(UsageExecutionPath.StreamingManualToolLoop)]
+    public async Task StreamingCall_CumulativeUsageSnapshots_DoNotInflateContextSize(UsageExecutionPath path)
+    {
+        // Providers that re-report cumulative usage in every update must not inflate the
+        // context-size signal: 100 then 250 cumulative means the real prompt is 250 tokens,
+        // not 350. TokenUsage accounting keeps the summed semantics.
+        static async IAsyncEnumerable<ChatResponseUpdate> Cumulative()
+        {
+            await Task.Yield();
+            yield return new ChatResponseUpdate { Contents = [new UsageContent(new UsageDetails { InputTokenCount = 100, OutputTokenCount = 2 })] };
+            yield return new ChatResponseUpdate { Contents = [new UsageContent(new UsageDetails { InputTokenCount = 150, OutputTokenCount = 3 })] };
+            yield return new ChatResponseUpdate { Contents = [new UsageContent(new UsageDetails { InputTokenCount = 250, OutputTokenCount = 7 })] };
+            yield return AssistantText("done");
+            yield return Finished(ChatFinishReason.Stop);
+        }
+
+        var client = new ScriptedChatClient(
+            onGetStreaming: _ => Cumulative(),
+            metadataModelId: "metadata-model");
+        var options = path == UsageExecutionPath.StreamingManualToolLoop ? ToolLoopOptions(path) : MinimalOptions();
+        await using var agent = new CodingAgent(client, options);
+        var session = AgentSession.Create("cumulative-usage-" + path);
+
+        var result = await RunAsync(path, agent, session, TestContext.Current.CancellationToken);
+
+        Assert.Equal(250, session.LastKnownContextTokens);
+        // Accounting still sums the reported values; context sizing uses the max single report.
+        Assert.Equal(500, result.TokenUsage.Total.InputTokens);
     }
 
     [Fact]
@@ -1040,6 +1074,37 @@ public class UsageAccountingTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_ContextOverflow_CompactsAndRetriesOnce()
+    {
+        // The non-streaming path mirrors the streaming path: an overflow rejection compacts
+        // the session and retries the request once instead of failing the execution.
+        var client = new ScriptedChatClient(
+            onGetResponse: index => index switch
+            {
+                0 => throw new InvalidOperationException("model_max_prompt_tokens_exceeded"),
+                1 => Task.FromResult(TextResponse("Compact summary text", 77, 7, modelId: "compaction-model")),
+                _ => Task.FromResult(TextResponse("done", 5_000, 8, modelId: "metadata-model")),
+            },
+            metadataModelId: "metadata-model");
+        var options = MinimalOptions();
+        options.MaxContextTokens = 1_000;
+        options.CompactionRetainRecent = 1;
+        options.CompactionRetainTokens = 1; // tiny tail budget so the overflow path can compact
+        await using var agent = new CodingAgent(client, options);
+        var session = AgentSession.Create("overflow-retry-nonstreaming");
+        for (var i = 0; i < 6; i++)
+            session.MessageHistory.Add(new ChatMessage(ChatRole.User, $"history {i}"));
+
+        var result = await agent.ExecuteAsync(session, "go", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Success", result.Status);
+        Assert.Contains(session.MessageHistory, m => m.Text?.Contains("CONTEXT SUMMARY", StringComparison.Ordinal) == true);
+        Assert.Equal(3, client.ResponseCallCount); // overflowed call + summary call + retry
+        Assert.Equal(2, CallsForSource(session.Usage, UsageSource.Agent));
+        Assert.Equal(1, CallsForSource(session.Usage, UsageSource.Compaction));
+    }
+
+    [Fact]
     public async Task StreamingDefault_CallYieldsUsageThenThrows_KeepsTheReceivedUsage()
     {
         var client = new ScriptedChatClient(
@@ -1148,6 +1213,7 @@ public class UsageAccountingTests
         options.CompactionThreshold = 0.8;
         options.MaxContextTokens = 100_000;
         options.CompactionRetainRecent = 2;
+        options.CompactionRetainTokens = 1; // tiny tail budget so the overflow path can compact
 
         await using var agent = new CodingAgent(client, options);
         var session = AgentSession.Create("overflow-retry");

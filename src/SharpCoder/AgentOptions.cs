@@ -96,8 +96,32 @@ public sealed class AgentOptions
     /// <summary>Fraction of MaxContextTokens at which automatic compaction triggers (0.0–1.0).</summary>
     public double CompactionThreshold { get; set; } = 0.8;
 
-    /// <summary>Number of recent messages to keep verbatim during compaction.</summary>
-    public int CompactionRetainRecent { get; set; } = 10;
+    /// <summary>
+    /// Minimum number of recent messages to keep verbatim during compaction — a floor, not a target.
+    /// The token budget <see cref="CompactionRetainTokens"/> usually keeps more (or fewer large)
+    /// messages; this value is only the lower bound. Defaults to 2.
+    /// </summary>
+    public int CompactionRetainRecent { get; set; } = 2;
+
+    /// <summary>
+    /// Token budget for the verbatim tail retained during compaction. The newest messages are kept
+    /// until adding one more would exceed this budget (never fewer than <see cref="CompactionRetainRecent"/>
+    /// messages are kept). The effective budget is further capped at half the compaction threshold
+    /// (<see cref="MaxContextTokens"/> × <see cref="CompactionThreshold"/>), which guarantees a full
+    /// context-half of headroom after compaction and prevents retain-and-recompact thrashing when
+    /// recent messages are huge (e.g. large tool results). Defaults to 16,000 tokens.
+    /// </summary>
+    public int CompactionRetainTokens { get; set; } = 16_000;
+
+    /// <summary>
+    /// When enabled (the default), compaction first elides the most expensive content of messages
+    /// older than the retained tail — tool-result bodies (replaced by a one-line stub naming the tool
+    /// and the number of characters, so the model can re-run the tool to recover the data) and
+    /// image/PDF attachments — before falling back to LLM summarization. If the elided history fits
+    /// within the compaction threshold, no summarization call is made at all. Elision never touches
+    /// the retained tail, user or assistant text.
+    /// </summary>
+    public bool EnableToolResultElision { get; set; } = true;
 
     /// <summary>Enable automatic context compaction when approaching token limits.</summary>
     public bool EnableAutoCompaction { get; set; } = true;

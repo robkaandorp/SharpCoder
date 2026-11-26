@@ -25,11 +25,21 @@ public enum Command
 /// </summary>
 public sealed class CliOptions
 {
+    /// <summary>
+    /// Context window the CLI assumes when <c>--context-tokens</c> is not passed. The library
+    /// default is intentionally conservative (100k); the CLI is tuned for current frontier models,
+    /// so it defaults to 1,000,000 instead. Set <c>--context-tokens</c> for smaller-window models.
+    /// </summary>
+    public const int DefaultContextTokens = 1_000_000;
+
     /// <summary>The command to run. Defaults to <see cref="Command.Chat"/>.</summary>
     public Command Command { get; init; } = Command.Chat;
 
     /// <summary>The task text for <c>run</c> and for seeding <c>chat</c>; <c>null</c> for a bare interactive session.</summary>
     public string? Task { get; init; }
+
+    /// <summary>How the CLI renders assistant markdown. Defaults to <see cref="MarkdownMode.Auto"/>.</summary>
+    public MarkdownMode Markdown { get; init; } = MarkdownMode.Auto;
 
     /// <summary>Provider-prefixed model string (e.g. <c>ollama-local/llama3</c>), or a bare model id.</summary>
     public string? Model { get; init; }
@@ -45,6 +55,18 @@ public sealed class CliOptions
 
     /// <summary>Reasoning effort for models with extended thinking; <c>null</c> leaves the provider default.</summary>
     public ReasoningEffort? ReasoningEffort { get; init; }
+
+    /// <summary>
+    /// Context window size in tokens for the model, from <c>--context-tokens</c>; <c>null</c> keeps the library default.
+    /// Used for compaction decisions (automatic compaction triggers at 80% of this value).
+    /// </summary>
+    public int? ContextTokens { get; init; }
+
+    /// <summary>
+    /// Token budget for the verbatim tail kept during compaction, from <c>--retain-tokens</c>;
+    /// <c>null</c> keeps the library default (16,000). Older messages beyond this budget are compacted.
+    /// </summary>
+    public int? RetainTokens { get; init; }
 
     /// <summary>Path of a session JSON file to resume.</summary>
     public string? SessionPath { get; init; }
@@ -74,7 +96,14 @@ public sealed class CliOptions
                                       Defaults to $LLM_PROVIDER (provider default 'copilot').
             -w, --workdir <dir>       Working directory for the agent (default: current directory).
             -n, --max-steps <n>       Max tool-call iterations per execution (default: 25).
+                --context-tokens <n>  Context window of the model, in tokens. Accepts a plain
+                                      number or a k/m suffix (e.g. 200000, 200k, 1m).
+                                      Default: 1000000. Compaction triggers at 80% of this.
+                --retain-tokens <n>   Tokens of recent context kept verbatim when compacting.
+                                      Plain number or k/m suffix. Default: 16000.
                 --reasoning <level>   none | low | medium | high | extra-high (aliases: off, xhigh).
+                --markdown <mode>     auto | live | full | raw. Render assistant output as
+                                      markdown (default: auto — live on a terminal, raw when piped).
                 --bash                Enable the bash tool (off by default; see README security notes).
                 --session <file>      Resume a saved session (JSON).
                 --save <file>         Save the session to a file after every turn and on exit.
@@ -108,8 +137,11 @@ public sealed class CliOptions
         var maxSteps = 25;
         var enableBash = false;
         ReasoningEffortLevel? reasoning = null;
+        int? contextTokens = null;
+        int? retainTokens = null;
         string? sessionPath = null;
         string? savePath = null;
+        var markdown = MarkdownMode.Auto;
         var showVersion = false;
         var positionals = new List<string>();
 
@@ -143,8 +175,17 @@ public sealed class CliOptions
                         throw new ArgumentException($"--max-steps expects a positive integer, got '{args[i]}'.");
                     maxSteps = steps;
                     break;
+                case "--context-tokens":
+                    contextTokens = ParseContextTokens(RequireValue(args, ref i, arg), "--context-tokens");
+                    break;
+                case "--retain-tokens":
+                    retainTokens = ParseContextTokens(RequireValue(args, ref i, arg), "--retain-tokens");
+                    break;
                 case "--reasoning":
                     reasoning = ParseReasoning(RequireValue(args, ref i, arg));
+                    break;
+                case "--markdown":
+                    markdown = ParseMarkdownMode(RequireValue(args, ref i, arg));
                     break;
                 case "--bash":
                     enableBash = true;
@@ -190,8 +231,39 @@ public sealed class CliOptions
             MaxSteps = maxSteps,
             EnableBash = enableBash,
             ReasoningEffort = reasoning,
+            Markdown = markdown,
+            ContextTokens = contextTokens,
+            RetainTokens = retainTokens,
             SessionPath = sessionPath,
             SavePath = savePath,
+        };
+    }
+
+    private static int ParseContextTokens(string value, string flagName)
+    {
+        var text = value.Trim();
+        long multiplier = 1;
+        if (text.Length > 1)
+        {
+            var suffix = char.ToLowerInvariant(text[^1]);
+            if (suffix == 'k') { multiplier = 1_000L; text = text[..^1]; }
+            else if (suffix == 'm') { multiplier = 1_000_000L; text = text[..^1]; }
+        }
+
+        if (!long.TryParse(text, out var parsed) || parsed <= 0 || parsed > int.MaxValue / multiplier)
+            throw new ArgumentException($"{flagName} expects a positive token count (e.g. 200000, 200k, or 1m), got '{value}'.");
+        return (int)(parsed * multiplier);
+    }
+
+    private static MarkdownMode ParseMarkdownMode(string value)
+    {
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "auto" => MarkdownMode.Auto,
+            "live" => MarkdownMode.Live,
+            "full" => MarkdownMode.Full,
+            "raw" or "none" or "off" => MarkdownMode.Raw,
+            _ => throw new ArgumentException($"Unknown --markdown mode '{value}'. Use auto, live, full or raw."),
         };
     }
 

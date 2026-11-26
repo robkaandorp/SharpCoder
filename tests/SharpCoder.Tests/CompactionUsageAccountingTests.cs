@@ -160,6 +160,9 @@ public class CompactionUsageAccountingTests
         MaxContextTokens = 100_000,
         CompactionThreshold = 0.8,
         CompactionRetainRecent = 2,
+        // Tiny tail budget: the test sessions use tiny messages, and the token-budgeted
+        // retention would otherwise swallow them whole (nothing left to compact).
+        CompactionRetainTokens = 20,
         Logger = NullLogger.Instance
     };
 
@@ -455,6 +458,7 @@ public class CompactionUsageAccountingTests
             WorkDirectory = Path.GetTempPath(),
             CompactionMaxTokens = 200,
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 100,
             Logger = NullLogger.Instance
         };
 
@@ -626,6 +630,7 @@ public class CompactionUsageAccountingTests
             MaxContextTokens = 200_000,
             CompactionThreshold = 0.5,
             CompactionRetainRecent = 1,
+            CompactionRetainTokens = 1,
             Logger = NullLogger.Instance
         };
         return options;
@@ -766,6 +771,7 @@ public class CompactionUsageAccountingTests
             MaxContextTokens = 4_000,
             CompactionThreshold = 0.5,
             CompactionRetainRecent = 1,
+            CompactionRetainTokens = 1,
             Logger = NullLogger.Instance,
             CompactionClient = compactionClient
         };
@@ -907,6 +913,7 @@ public class CompactionUsageAccountingTests
             MaxContextTokens = 1_000,
             CompactionThreshold = 0.5,
             CompactionRetainRecent = 1,
+            CompactionRetainTokens = 1,
             Logger = NullLogger.Instance,
             CompactionClient = compactionClient,
             OnUsage = events.Add

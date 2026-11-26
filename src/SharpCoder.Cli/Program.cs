@@ -47,7 +47,7 @@ internal static class Program
             return 0;
         }
 
-        var ui = new ConsoleUi();
+        var ui = new ConsoleUi { MarkdownMode = options.Markdown };
         ui.ShowBanner(Version);
 
         await using var factory = new AgentFactory(options, ui);
@@ -206,8 +206,11 @@ internal static class Program
                 return false;
 
             case "/session":
-                ui.ShowSessionStats(session);
+                ui.ShowSessionStats(session, options.ContextTokens);
                 return false;
+
+            case "/markdown":
+                return HandleMarkdownCommand(arg, ui);
 
             case "/save":
                 var target = arg ?? options.SavePath;
@@ -223,6 +226,32 @@ internal static class Program
                 ui.Error($"unknown command '{cmd}' — /help lists available commands");
                 return false;
         }
+    }
+
+    /// <summary>Handles /markdown [auto|live|full|raw].</summary>
+    private static bool HandleMarkdownCommand(string? arg, ConsoleUi ui)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            ui.Info($"markdown mode: {ui.MarkdownMode.ToString().ToLowerInvariant()} (auto|live|full|raw)");
+            return false;
+        }
+
+        switch (arg.Trim().ToLowerInvariant())
+        {
+            case "auto": ui.MarkdownMode = MarkdownMode.Auto; break;
+            case "live": ui.MarkdownMode = MarkdownMode.Live; break;
+            case "full": ui.MarkdownMode = MarkdownMode.Full; break;
+            case "raw":
+            case "off":
+            case "none": ui.MarkdownMode = MarkdownMode.Raw; break;
+            default:
+                ui.Error($"unknown markdown mode '{arg}' — use auto, live, full or raw");
+                return false;
+        }
+
+        ui.Info($"markdown mode: {ui.MarkdownMode.ToString().ToLowerInvariant()}");
+        return false;
     }
 
     private static async Task SaveSessionAsync(ConsoleUi ui, AgentSession session, string? path)

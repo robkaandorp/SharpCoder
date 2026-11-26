@@ -328,7 +328,9 @@ var options = new AgentOptions
     // Context management
     MaxContextTokens = 100_000,   // model's context window
     CompactionThreshold = 0.8,    // compact at 80% usage
-    CompactionRetainRecent = 10,  // keep last 10 messages verbatim
+    CompactionRetainRecent = 2,     // floor: always keep at least this many recent messages
+    CompactionRetainTokens = 16_000, // keep as many recent messages as fit in 16k tokens
+    EnableToolResultElision = true,  // stub out bulky old tool results instead of summarizing them
     EnableAutoCompaction = true,  // enabled by default
 
     // Optional: separate (cheaper) model for context compaction summaries
@@ -413,8 +415,8 @@ Long-running sessions can exceed model context limits. SharpCoder automatically 
 
 - Triggered when tokens exceed `CompactionThreshold × MaxContextTokens`
 - Uses exact token counts from the most recent API round-trip (`LastKnownContextTokens`) when available; falls back to heuristic estimate (`~4 chars per token`) before the first API call. When tools are invoked, the token count reflects the final round's context size — not the sum across all internal tool-call round-trips.
-- Older messages are summarized into a single `[CONTEXT SUMMARY]` message
-- Recent messages (count controlled by `CompactionRetainRecent`) are kept verbatim
+- Two-stage: old **tool-result bodies and attachments are first elided** (replaced by a one-line stub naming the tool, its arguments and the payload size — re-run the tool to recover the content). If elision alone brings the history back under the threshold, no summarization call is made at all; otherwise the remaining old messages are summarized into a single `[CONTEXT SUMMARY]` message
+- Recent messages are kept verbatim within a token budget: as many newest messages as fit in `CompactionRetainTokens` (default 16,000, capped at half the compaction threshold), but always at least `CompactionRetainRecent` (default 2) messages, and never split mid tool-call/tool-result group
 - **Leading system messages are preserved** — all consecutive `ChatRole.System` messages at the start of the history are kept intact and are never included in the summary. Callers do not need to re-add the system prompt after compaction.
 - Key decisions, findings, and file paths are preserved in the summary
 - **Automatic recovery** — If an API call fails due to context overflow (`model_max_prompt_tokens_exceeded`), the agent force-compacts the session and retries once
@@ -456,7 +458,24 @@ dotnet run --project src/SharpCoder.Cli -- \
 dotnet run --project src/SharpCoder.Cli
 ```
 
-In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`). Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+
+### Markdown rendering
+
+Assistant output is rendered as markdown in the terminal. The CLI renders complete blocks as they finish arriving, so output still streams live; tool-call notes are shown as dim one-liners. It understands headings, paragraphs, bold/italic/strikethrough, inline code, fenced code blocks (with language label), ordered/unordered/task lists, blockquotes, tables, links, and horizontal rules.
+
+`--markdown` selects how much processing happens. It defaults to `auto`, which uses `live` on an interactive terminal and `raw` when output is redirected or piped (so `SharpCoder.Cli … > out.txt` stays plain text):
+
+| Mode | Behavior |
+| --- | --- |
+| `live` | Render each block as soon as it is complete (default on a TTY) |
+| `full` | Buffer the whole turn and render once at the end |
+| `raw` | No processing; the model's bytes are written verbatim |
+| `auto` | `live` on a TTY, `raw` otherwise (default) |
+
+`/markdown` in the interactive REPL shows or changes the mode for the rest of the session.
+
+The CLI sets the context window used for compaction decisions to **1,000,000 tokens by default** (the library default is 100,000), and keeps up to **16,000 tokens** of recent conversation verbatim when compacting (`--retain-tokens`); older tool results are first replaced with one-line elision stubs, and only if that is not enough is the remainder summarized. Override it with `--context-tokens` — accepts a raw number or a `k`/`m` suffix (e.g. `--context-tokens 200000`, `--context-tokens 200k`, `--context-tokens 1m`). Compaction triggers at 80% of the configured window. Set this to your model's real window: set it too low and the agent compacts long before it needs to; set it too high and a smaller model fails with context-overflow errors (the agent then force-compacts and retries once, at the cost of the failed request and a more aggressive compaction than pre-emptive one).
 
 The produced binary is `SharpCoder.Cli`. The CLI targets `net11.0` and is deliberately **not** in `SharpCoder.slnx` (CI builds the solution with the .NET 10 SDK); build it directly with `dotnet build src/SharpCoder.Cli` until CI moves to .NET 11.
 

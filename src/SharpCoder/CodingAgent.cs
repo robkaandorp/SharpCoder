@@ -289,6 +289,10 @@ public sealed class CodingAgent : IAsyncDisposable
     /// <exception cref="ObjectDisposedException">Thrown on call when the agent is already disposed; if disposal occurs after the wrapper guard, raised through the returned task by the async overload's disposal checks.</exception>
     /// <exception cref="OperationCanceledException">Propagated through the returned task when execution is cancelled.</exception>
     /// <exception cref="HttpRequestException">Propagated through the returned task when a model request fails with an HTTP error.</exception>
+    /// <remarks>
+    /// If the provider rejects the request with a context-overflow error, the session is force-compacted
+    /// and the request retried once before any error is reported, mirroring the streaming path.
+    /// </remarks>
     public Task<AgentResult> ExecuteAsync(AgentSession? session, string userMessage, CancellationToken ct = default)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -338,7 +342,31 @@ public sealed class CodingAgent : IAsyncDisposable
 
         try
         {
-            var response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
+            // One overflow retry: when the provider rejects the prompt as too large, compact the
+            // session and retry the request once with the reduced history — mirroring the
+            // streaming path. If compaction is impossible (too few messages) or the retry also
+            // fails, the exception flows to the handlers below unchanged.
+            var overflowRetried = false;
+            ChatResponse response;
+            while (true)
+            {
+                try
+                {
+                    response = await wrappedClient.GetResponseAsync(messages, chatOptions, ct);
+                    break;
+                }
+                catch (Exception overflow) when (!overflowRetried
+                    && session != null
+                    && ContextCompactor.IsContextOverflowError(overflow))
+                {
+                    overflowRetried = true;
+                    _logger.LogWarning(overflow, "Context overflow — compacting and retrying");
+                    if (!await _compactor.ForceCompactAsync(session, _options, recorder, ct))
+                        throw;
+                    messages = BuildMessages(session, userMessage, images);
+                    diagnostics = BuildDiagnostics(messages, chatOptions, userMessage, session);
+                }
+            }
             var toolCalls = AgentResult.CountToolCalls(response.Messages);
             var finalText = response.Text ?? "No text response.";
 

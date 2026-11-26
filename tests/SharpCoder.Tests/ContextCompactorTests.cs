@@ -329,6 +329,7 @@ public class ContextCompactorTests
             MaxContextTokens = 10_000_000,
             CompactionThreshold = 0.99,
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 10,
         };
 
         var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
@@ -352,6 +353,7 @@ public class ContextCompactorTests
         var options = new AgentOptions
         {
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 10,
             OnCompacted = r => callbackResult = r,
         };
 
@@ -379,6 +381,7 @@ public class ContextCompactorTests
         var options = new AgentOptions
         {
             CompactionRetainRecent = 4,  // Keep last 4 messages verbatim
+            CompactionRetainTokens = 10, // tiny tail budget so retention follows the floor
         };
 
         var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
@@ -607,7 +610,8 @@ public class ContextCompactorTests
 
         var options = new AgentOptions
         {
-            CompactionRetainRecent = 3
+            CompactionRetainRecent = 3,
+            CompactionRetainTokens = 10
         };
 
         var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
@@ -643,7 +647,8 @@ public class ContextCompactorTests
 
         var options = new AgentOptions
         {
-            CompactionRetainRecent = 3
+            CompactionRetainRecent = 3,
+            CompactionRetainTokens = 10
         };
 
         var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
@@ -924,6 +929,7 @@ public class ContextCompactorTests
             MaxContextTokens = 50000,
             CompactionThreshold = 0.5, // threshold = 25000
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 1,
             EnableAutoCompaction = true
         };
 
@@ -986,6 +992,7 @@ public class ContextCompactorTests
             MaxContextTokens = 100_000,
             CompactionThreshold = 0.9, // threshold = 90000 — below LastKnownContextTokens
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 1,
             EnableAutoCompaction = true
         };
 
@@ -1012,7 +1019,7 @@ public class ContextCompactorTests
 
         session.LastKnownContextTokens = 55_000;
 
-        var options = new AgentOptions { CompactionRetainRecent = 5 };
+        var options = new AgentOptions { CompactionRetainRecent = 5, CompactionRetainTokens = 10 };
 
         // Act
         var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
@@ -1094,6 +1101,7 @@ public class ContextCompactorTests
             MaxContextTokens = 10_000,
             CompactionThreshold = 0.5, // threshold = 5000
             CompactionRetainRecent = 5,
+            CompactionRetainTokens = 1,
             EnableAutoCompaction = true
         };
 
@@ -1184,6 +1192,7 @@ public class ContextCompactorTests
             MaxContextTokens = 100_000,
             CompactionThreshold = 0.5, // threshold = 50000
             CompactionRetainRecent = 3,
+            CompactionRetainTokens = 1,
             EnableAutoCompaction = true
         };
 
@@ -1958,5 +1967,294 @@ public class ContextCompactorTests
 
         Assert.True(perChunkMessageCounts.Any(c => c >= 2),
             $"Expected at least one chunk with multiple messages, but per-chunk counts were: [{string.Join(", ", perChunkMessageCounts)}]");
+    }
+
+    // ======================================================================
+    // Token-budgeted tail retention and tool-result elision
+    // ======================================================================
+
+    private sealed class CapturingSummaryClient : IChatClient
+    {
+        public List<IList<ChatMessage>> Calls { get; } = new();
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            Calls.Add(messages.ToList());
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Summary of prior conversation.")));
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
+    private static ChatMessage AssistantWithCall(string callId, string tool, string argValue)
+        => new(ChatRole.Assistant,
+            [new FunctionCallContent(callId, tool, new Dictionary<string, object?> { ["path"] = argValue })]);
+
+    private static ChatMessage ToolResult(string callId, string content)
+        => new(ChatRole.Tool, [new FunctionResultContent(callId, content)]);
+
+    [Fact]
+    public async Task RetainTokens_SmallBudget_KeepsOnlyFloorMessages()
+    {
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 15; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Message-" + i + ": " + new string('x', 200))); // ~52 tokens each
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 3,
+            CompactionRetainTokens = 1, // token budget cannot fit even one message -> floor (3) wins
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(4, session.MessageHistory.Count); // 1 summary + 3 retained
+        Assert.Equal("Message-12", session.MessageHistory[1].Text![..10]);
+        Assert.Equal("Message-14", session.MessageHistory[3].Text![..10]);
+    }
+
+    [Fact]
+    public async Task RetainTokens_BudgetLimitsTail_WhenLargerThanFloor()
+    {
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 12; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Message-" + i + ": " + new string('x', 200))); // ~52 tokens each
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 2,
+            CompactionRetainTokens = 150, // ~2 messages fit
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(3, session.MessageHistory.Count); // 1 summary + 2 retained
+        Assert.Equal("Message-10", session.MessageHistory[1].Text![..10]);
+        Assert.Equal("Message-11", session.MessageHistory[2].Text![..10]);
+    }
+
+    [Fact]
+    public async Task RetainTokens_EverythingFits_CompactionIsANoOp()
+    {
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 6; i++)
+            session.MessageHistory.Add(new ChatMessage(ChatRole.User, $"tiny {i}"));
+
+        var options = new AgentOptions { CompactionRetainTokens = 100_000 };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        Assert.Equal(0, mockClient.CallCount);
+        Assert.Equal(6, session.MessageHistory.Count);
+    }
+
+    [Fact]
+    public async Task RetainSplit_NeverBeginsTailWithOrphanedToolResult()
+    {
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        for (int i = 0; i < 8; i++)
+            session.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                "Filler " + i + ": " + new string('x', 200)));
+        session.MessageHistory.Add(AssistantWithCall("call-1", "read_file", "f1.txt"));
+        session.MessageHistory.Add(ToolResult("call-1", new string('a', 200)));
+        session.MessageHistory.Add(ToolResult("call-1", new string('b', 200)));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "final question"));
+
+        var options = new AgentOptions
+        {
+            CompactionRetainRecent = 2,
+            CompactionRetainTokens = 110, // fits the two tool results but not the call message
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        for (int i = 1; i < session.MessageHistory.Count; i++)
+        {
+            var results = session.MessageHistory[i].Contents.OfType<FunctionResultContent>().ToList();
+            foreach (var fr in results)
+            {
+                Assert.Contains(session.MessageHistory.Take(i).SelectMany(m => m.Contents).OfType<FunctionCallContent>(),
+                    fc => fc.CallId == fr.CallId);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Elision_BigToolResults_SkipsSummaryCallAndStubsResults()
+    {
+        var client = new ThrowingClient(); // fails the test if the LLM is called
+        var compactor = new ContextCompactor(client);
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "Please read the specs"));
+        session.MessageHistory.Add(AssistantWithCall("call-1", "read_file", "spec_01.txt"));
+        session.MessageHistory.Add(ToolResult("call-1", new string('a', 4000)));
+        session.MessageHistory.Add(AssistantWithCall("call-2", "read_file", "spec_02.txt"));
+        session.MessageHistory.Add(ToolResult("call-2", new string('b', 4000)));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, "Reading the two specs now."));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "and the third one?"));
+
+        CompactionResult? fired = null;
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1_000, // threshold = 800; elision alone must get us under it
+            CompactionRetainTokens = 40,
+            CompactionRetainRecent = 2,
+            OnCompacted = r => fired = r,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.NotNull(fired);
+        Assert.True(fired!.TokensElided > 0);
+        Assert.DoesNotContain(session.MessageHistory, m => m.Text?.Contains("CONTEXT SUMMARY", StringComparison.Ordinal) == true);
+        var results = session.MessageHistory.SelectMany(m => m.Contents).OfType<FunctionResultContent>().ToList();
+        Assert.Equal(2, results.Count);
+        Assert.All(results, fr =>
+        {
+            var text = Assert.IsType<string>(fr.Result);
+            Assert.Contains("tool result elided", text, StringComparison.Ordinal);
+            Assert.Contains("read_file", text, StringComparison.Ordinal);
+        });
+        Assert.Contains(session.MessageHistory, m => m.Text == "Reading the two specs now.");
+        var callIds = session.MessageHistory.SelectMany(m => m.Contents).OfType<FunctionCallContent>().Select(c => c.CallId).ToList();
+        foreach (var fr in results)
+            Assert.Contains(fr.CallId, callIds);
+    }
+
+    [Fact]
+    public async Task Elision_NotEnoughAfterElision_FallsBackToSummaryOnElidedInput()
+    {
+        var capturing = new CapturingSummaryClient();
+        var compactor = new ContextCompactor(capturing);
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "Please read the specs"));
+        session.MessageHistory.Add(AssistantWithCall("call-1", "read_file", "spec_01.txt"));
+        session.MessageHistory.Add(ToolResult("call-1", new string('a', 4000)));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, "Reading it now."));
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "and then?"));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 40, // threshold = 32 tokens — elision alone cannot reach it
+            CompactionMaxTokens = 100_000, // keep the summarizer on the single-call path
+            CompactionRetainTokens = 10,
+            CompactionRetainRecent = 1,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Single(capturing.Calls); // exactly one summary call
+        var prompt = string.Concat(capturing.Calls[0].SelectMany(m => m.Contents).OfType<TextContent>().Select(t => t.Text));
+        Assert.DoesNotContain(new string('a', 4000), prompt); // bulk never reaches the LLM
+        Assert.Contains(session.MessageHistory, m => m.Text?.Contains("CONTEXT SUMMARY", StringComparison.Ordinal) == true);
+        Assert.DoesNotContain(session.MessageHistory.SelectMany(m => m.Contents).OfType<FunctionResultContent>(),
+            fr => fr.Result as string == new string('a', 4000));
+    }
+
+    [Fact]
+    public async Task Elision_NothingBulky_FallsBackToSummaryWithZeroElided()
+    {
+        var capturing = new CapturingSummaryClient();
+        var compactor = new ContextCompactor(capturing);
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "read it"));
+        session.MessageHistory.Add(AssistantWithCall("call-1", "read_file", "tiny.txt"));
+        session.MessageHistory.Add(ToolResult("call-1", "small result")); // < 256 chars -> not elided
+        for (int i = 0; i < 10; i++)
+            session.MessageHistory.Add(new ChatMessage(ChatRole.User, "padding " + new string('x', 200)));
+
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1_000,
+            CompactionRetainTokens = 20,
+            CompactionRetainRecent = 2,
+        };
+
+        CompactionResult? fired = null;
+        options.OnCompacted = r => fired = r;
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Single(capturing.Calls); // nothing worth eliding -> the history is summarized
+        Assert.NotNull(fired);
+        Assert.Equal(0, fired!.TokensElided);
+        var prompt = string.Concat(capturing.Calls[0].SelectMany(m => m.Contents).OfType<TextContent>().Select(t => t.Text));
+        Assert.DoesNotContain("tool result elided", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Elision_Disabled_SummarizesWithoutElision()
+    {
+        var mockClient = new MockSummarizingClient("Summary.");
+        var compactor = new ContextCompactor(mockClient);
+        var session = AgentSession.Create();
+
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, "read it"));
+        session.MessageHistory.Add(AssistantWithCall("call-1", "read_file", "big.txt"));
+        session.MessageHistory.Add(ToolResult("call-1", new string('a', 4000)));
+        for (int i = 0; i < 4; i++)
+            session.MessageHistory.Add(new ChatMessage(ChatRole.User, "padding " + new string('x', 200)));
+
+        CompactionResult? fired = null;
+        var options = new AgentOptions
+        {
+            MaxContextTokens = 1_000,
+            CompactionMaxTokens = 100_000, // keep the summarizer on the single-call path
+            CompactionRetainTokens = 20,
+            CompactionRetainRecent = 2,
+            EnableToolResultElision = false,
+            OnCompacted = r => fired = r,
+        };
+
+        var result = await compactor.ForceCompactAsync(session, options, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Equal(1, mockClient.CallCount);
+        Assert.NotNull(fired);
+        Assert.Equal(0, fired!.TokensElided);
+    }
+
+    [Fact]
+    public void CompactionDefaults_AreSensible()
+    {
+        var options = new AgentOptions();
+        Assert.Equal(2, options.CompactionRetainRecent);
+        Assert.Equal(16_000, options.CompactionRetainTokens);
+        Assert.True(options.EnableToolResultElision);
     }
 }

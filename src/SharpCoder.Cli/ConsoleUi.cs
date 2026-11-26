@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
@@ -24,6 +26,9 @@ public sealed class ConsoleUi
     private static readonly string[] SpinnerFrames =
         { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
+    /// <summary>How assistant markdown is rendered. Set by the caller from <c>--markdown</c>.</summary>
+    public MarkdownMode MarkdownMode { get; set; } = MarkdownMode.Auto;
+
     /// <summary>Prints the application banner.</summary>
     public void ShowBanner(string version)
     {
@@ -47,12 +52,19 @@ public sealed class ConsoleUi
         int maxSteps,
         bool enableBash,
         ReasoningEffort? reasoning,
+        int? contextTokens,
         string? savePath)
     {
+        var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
+        var contextValue = contextTokens is null
+            ? $"{effectiveContext:n0} [dim](default)[/]"
+            : $"{effectiveContext:n0}";
+        var compactAt = (long)(effectiveContext * 0.8);
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey).AddColumn("[dim]Setting[/]").AddColumn("[dim]Value[/]");
         table.AddRow("Model", Markup.Escape(model ?? $"default ($LLM_PROVIDER → {Environment.GetEnvironmentVariable("LLM_PROVIDER") ?? "copilot"})"));
         table.AddRow("Working directory", Markup.Escape(workDirectory));
         table.AddRow("Max steps", maxSteps.ToString());
+        table.AddRow("Context window", $"{contextValue} [dim](compacts at ~{compactAt:n0})[/]");
         table.AddRow("Bash tool", enableBash
             ? $"[{Warn}]enabled[/] [dim](the agent can run arbitrary shell commands)[/]"
             : "[dim]disabled[/]");
@@ -89,6 +101,7 @@ public sealed class ConsoleUi
         var spinner = Task.Run(() => Spin(spinnerCts.Token), CancellationToken.None);
 
         var receivedText = false;
+        var writer = new StreamingMarkdownWriter(AnsiConsole.Console, MarkdownMode);
         AgentResult? result = null;
         try
         {
@@ -99,7 +112,7 @@ public sealed class ConsoleUi
                     case StreamingUpdateKind.TextDelta when update.Text is { Length: > 0 } text:
                         StopSpinner(spinnerCts, spinner);
                         receivedText = true;
-                        Console.Write(text);
+                        writer.Append(text);
                         break;
                     case StreamingUpdateKind.Completed:
                         result = update.Result;
@@ -110,9 +123,10 @@ public sealed class ConsoleUi
         finally
         {
             StopSpinner(spinnerCts, spinner);
-            if (receivedText)
+            writer.Flush();
+            if (receivedText && writer.EffectiveMode == MarkdownMode.Raw)
                 Console.WriteLine();
-            else
+            else if (!receivedText)
                 ClearSpinnerLine();
         }
 
@@ -164,19 +178,22 @@ public sealed class ConsoleUi
         table.AddRow("/help", "Show this help");
         table.AddRow("/save [[path]]", "Save the session (defaults to --save path)");
         table.AddRow("/session", "Show session statistics");
+        table.AddRow("/markdown [[mode]]", "Show or set markdown rendering (auto, live, full, raw)");
         table.AddRow("/clear", "Clear the screen");
         table.AddRow("/exit, /quit", "Save (if --save) and exit");
         AnsiConsole.Write(table);
     }
 
     /// <summary>Prints session statistics.</summary>
-    public void ShowSessionStats(AgentSession session)
+    public void ShowSessionStats(AgentSession session, int? contextTokens = null)
     {
+        var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
         var table = new Table().Border(TableBorder.Rounded).AddColumn("[dim]Field[/]").AddColumn("[dim]Value[/]");
         table.AddRow("Session id", Markup.Escape(session.SessionId));
         table.AddRow("Messages", session.MessageHistory.Count.ToString());
         table.AddRow("Tool calls", session.TotalToolCalls.ToString());
         table.AddRow("Tokens in / out", $"{session.InputTokensUsed:n0} / {session.OutputTokensUsed:n0}");
+        table.AddRow("Context window", $"{effectiveContext:n0} tokens (compacts at ~{(long)(effectiveContext * 0.8):n0})");
         table.AddRow("Last known context", session.LastKnownContextTokens > 0 ? $"{session.LastKnownContextTokens:n0} tokens" : "unknown");
         table.AddRow("Created", session.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
         table.AddRow("Last activity", session.LastActivityAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));

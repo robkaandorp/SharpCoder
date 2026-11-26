@@ -623,7 +623,11 @@ internal sealed class UsageRecorder
 /// One instance is created per execution (or per call site that needs its own classification), so
 /// overlapping executions never mix their usage. The wrapper also captures
 /// <see cref="LastRoundInputTokens"/>, the input token count of the most recent call, which feeds
-/// <see cref="AgentSession.LastKnownContextTokens"/> (the latest round's context size — never a sum).
+/// <see cref="AgentSession.LastKnownContextTokens"/> (the latest round's context size — never the
+/// cross-call sum). Within one call it is the largest single input count reported by any update,
+/// not the sum: providers either report usage once, or re-report cumulative snapshots, and summing
+/// snapshots would inflate the window estimate. The summed value still feeds
+/// <see cref="TokenUsage.InputTokens"/> accounting.
 /// </para>
 /// <para>
 /// A sub-agent's client is wrapped the same way — by the child execution itself, with
@@ -677,6 +681,10 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
 
     /// <summary>
     /// Input token count of the most recent call, or <c>null</c> while no call has reported one.
+    /// This is the largest single input token count reported by any update of that call: providers
+    /// either report usage once (that value) or re-report cumulative snapshots (the last snapshot is
+    /// the largest), so the maximum is the true prompt size in both cases. The sum feeds
+    /// <see cref="TokenUsage.InputTokens"/> accounting instead.
     /// </summary>
     internal long? LastRoundInputTokens { get; private set; }
 
@@ -700,8 +708,8 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
         finally
         {
             var usage = response?.Usage;
-            if (usage?.InputTokenCount is long inputTokens)
-                LastRoundInputTokens = inputTokens;
+            if (usage?.InputTokenCount is long directInputTokens)
+                LastRoundInputTokens = directInputTokens;
 
             var tokenUsage = TokenUsage.FromSingleCall(usage);
             tokenUsage.Estimated = BuildEstimate(
@@ -747,7 +755,7 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
             // early: either way the call is recorded exactly once, with whatever usage arrived —
             // and the estimate describes exactly the updates that arrived.
             if (usage.InputReported)
-                LastRoundInputTokens = usage.InputTokens;
+                LastRoundInputTokens = usage.MaxInputTokens;
 
             var tokenUsage = usage.ToTokenUsage();
             tokenUsage.Estimated = BuildStreamingEstimate(inputWeights, estimationFailure, usage);
@@ -862,6 +870,7 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
     private sealed class CallUsageAccumulator
     {
         private long _inputTokens;
+        private long _maxInputTokens;
         private long _outputTokens;
         private long _cachedInputTokens;
         private long _reasoningTokens;
@@ -877,6 +886,13 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
 
         /// <summary>The summed input token count of this call so far.</summary>
         internal long InputTokens => _inputTokens;
+
+        /// <summary>
+        /// The largest single input token count reported by any update of this call so far.
+        /// Providers that re-report cumulative snapshots make this the call's true prompt size;
+        /// it is what feeds <see cref="LastRoundInputTokens"/>.
+        /// </summary>
+        internal long MaxInputTokens => _maxInputTokens;
 
         /// <summary>True when at least one update reported an output token count.</summary>
         internal bool OutputReported => _outputReported;
@@ -925,6 +941,7 @@ internal sealed class UsageRecordingChatClient : DelegatingChatClient
                 if (details.InputTokenCount is long inputTokens)
                 {
                     _inputTokens += inputTokens;
+                    if (inputTokens > _maxInputTokens) _maxInputTokens = inputTokens;
                     _inputReported = true;
                 }
 

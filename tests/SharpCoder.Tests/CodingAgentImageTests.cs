@@ -270,14 +270,15 @@ public class CodingAgentImageTests
         var opts = ToolCallOptions();
         // Low retain so ForceCompactAsync has enough to compact with a small history.
         opts.CompactionRetainRecent = 1;
+        opts.CompactionRetainTokens = 1; // tiny tail budget so compaction actually happens
         opts.EnableAutoCompaction = false; // avoid premature compaction; test the force path
 
         await using var agent = new CodingAgent(client, opts);
         var session = AgentSession.Create("img-overflow");
         var ct = TestContext.Current.CancellationToken;
 
-        // Seed enough history so ForceCompactAsync can compact (needs > retainRecent+1
-        // non-system messages, i.e. > 2).
+        // Seed enough history so ForceCompactAsync can compact (needs more messages than
+        // the retained floor of 1).
         session.MessageHistory.Add(new ChatMessage(ChatRole.User, "previous question"));
         session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, "previous answer"));
         session.MessageHistory.Add(new ChatMessage(ChatRole.User, "another question"));

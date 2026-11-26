@@ -546,6 +546,7 @@ public class UsageBreakdownEstimateTests
         var compactor = new ContextCompactor(client);
         var options = Options();
         options.CompactionRetainRecent = 2;
+        options.CompactionRetainTokens = 10; // tiny tail so the compaction actually fires
         var events = new List<UsageEvent>();
         options.OnUsage = events.Add;
         var session = AgentSession.Create("estimate-compaction");
