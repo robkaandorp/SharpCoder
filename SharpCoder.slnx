@@ -2,6 +2,9 @@
   <Folder Name="/src/">
     <Project Path="src/SharpCoder/SharpCoder.csproj" />
     <Project Path="src/SharpCoder.Providers/SharpCoder.Providers.csproj" />
+    <!-- SharpCoder.Cli targets net11.0 and CI uses the .NET 10 SDK, so the CLI
+         stays out of the solution (and CI) until CI moves to .NET 11.
+         Build it directly: dotnet build src/SharpCoder.Cli -->
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SharpCoder.Tests/SharpCoder.Tests.csproj" />

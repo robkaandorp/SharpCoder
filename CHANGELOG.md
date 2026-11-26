@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **CLI (`src/SharpCoder.Cli`, net11.0, not shipped to NuGet, not in `SharpCoder.slnx`/CI)** — a `SharpCoder.Cli` console app built on Spectre.Console: streaming responses with a spinner, inline tool-call rendering, per-turn and cumulative token/tool-call usage, an interactive REPL (slash commands `/help`, `/save`, `/session`, `/clear`, `/exit`) alongside a one-shot `run` mode, and `--session`/`--save` session persistence. Supports every provider from `SharpCoder.Providers` via provider-prefixed model ids.
+
 ## [0.23.1] — 2026-11-24
 
 ### Fixed

@@ -444,6 +444,22 @@ Run `dotnet build` to compile the solution.
 
 The agent calls `list_skills` to discover what's available and `load_skill` to read the full instructions.
 
+## Command-line interface
+
+The repository includes a small terminal front-end over the library, in `src/SharpCoder.Cli` (not shipped to NuGet). It streams responses live, renders tool calls inline, shows per-turn and cumulative token/tool usage, and supports saved sessions and the same providers as `SharpCoder.Providers`.
+
+```bash
+dotnet run --project src/SharpCoder.Cli -- \
+    --model ollama-local/llama3 "Summarize this repository"
+
+# interactive session (default)
+dotnet run --project src/SharpCoder.Cli
+```
+
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`). Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+
+The produced binary is `SharpCoder.Cli`. The CLI targets `net11.0` and is deliberately **not** in `SharpCoder.slnx` (CI builds the solution with the .NET 10 SDK); build it directly with `dotnet build src/SharpCoder.Cli` until CI moves to .NET 11.
+
 ## Security
 
 - **Path traversal protection** — all file operations are confined to `WorkDirectory`

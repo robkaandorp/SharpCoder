@@ -12,6 +12,10 @@ NuGet package.
   `LangVersion 12.0`, nullable enabled, **`TreatWarningsAsErrors=true`**.
 - `src/SharpCoder.Providers/` — model-provider library (packable NuGet package).
   Target: `net10.0`.
+- `src/SharpCoder.Cli/` — console app (not packable). Target: `net11.0`.
+  Spectre.Console UI over `SharpCoder` + `SharpCoder.Providers`;
+  build directly with `dotnet build src/SharpCoder.Cli`. Deliberately NOT in
+  `SharpCoder.slnx` so CI (.NET 10 SDK) does not build it until CI moves to .NET 11.
 - `tests/SharpCoder.Tests/` — xUnit v3 tests. Target: `net10.0`.
   `InternalsVisibleTo` is granted so tests can touch internals.
 - `tests/SharpCoder.Providers.Tests/` — xUnit v3 tests for the provider library.
