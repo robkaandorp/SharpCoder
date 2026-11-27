@@ -65,6 +65,13 @@ public sealed class CodingAgent : IAsyncDisposable
 
     /// <summary>Human-readable description of the resolved bash shell, or null when bash is disabled.</summary>
     private readonly string? _resolvedBashShell;
+
+    /// <summary>
+    /// Human-readable description of the shell <c>execute_bash_command</c> will actually launch
+    /// (e.g. <c>pwsh (auto: C:\path\to\pwsh.exe)</c>, <c>cmd.exe</c> or <c>/bin/bash</c>).
+    /// Resolved once at construction. <c>null</c> when bash is disabled.
+    /// </summary>
+    public string? ResolvedBashShell => _resolvedBashShell;
     private int _subAgentManagerCreateCount;
 
     /// <summary>Test seam: how many times a sub-agent manager was created for this instance.</summary>

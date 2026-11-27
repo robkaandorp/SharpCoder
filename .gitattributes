@@ -1,0 +1,24 @@
+# Normalize line endings. The repository stores LF in the index; this file
+# makes that explicit so checkouts are predictable on every platform,
+# independent of each contributor's core.autocrlf setting.
+
+* text=auto eol=lf
+
+# Line endings that must survive verbatim
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Never touch binary files
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.nupkg binary
+*.dll  binary
+*.exe  binary
+*.snk  binary
+*.zip  binary
+*.gz   binary
+*.7z   binary

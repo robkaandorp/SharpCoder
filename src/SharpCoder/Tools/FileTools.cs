@@ -37,7 +37,7 @@ public sealed class FileTools
     /// <param name="limit">Maximum lines to return; values below 1 are treated as 1. Defaults to 2000.</param>
     /// <param name="ct">Token used to cancel the file read.</param>
     /// <returns>Numbered file lines, an end-of-file continuation hint, or an error message.</returns>
-    [Description("Read a file from the local filesystem. Returns contents with each line prefixed by its line number. Use offset to read specific sections.")]
+    [Description("Read a file from the local filesystem. Returns contents with each line prefixed by its line number. Use offset to read specific sections. The header line reports the file's line-ending style (LF or CRLF) and whether it contains a UTF-8 BOM.")]
     public async Task<string> read_file(
         [Description("The relative or absolute path to the file")] string filePath,
         [Description("The line number to start reading from (1-indexed)")] int offset = 1,
@@ -52,7 +52,9 @@ public sealed class FileTools
                 return $"Error: File '{filePath}' does not exist.";
             }
 
-            var lines = await File.ReadAllLinesAsync(fullPath, ct);
+            var (raw, hadBom) = ReadRaw(fullPath);
+            var lineEnding = DetectLineEnding(raw);
+            var lines = SplitLines(raw);
             if (lines.Length > 5000)
                 _logger.LogDebug("Reading large file {Path} ({Lines} lines)", filePath, lines.Length);
             if (offset < 1) offset = 1;
@@ -66,7 +68,8 @@ public sealed class FileTools
 
             var count = Math.Max(0, Math.Min(limit, lines.Length - startIndex));
             var result = new StringBuilder();
-            
+            result.AppendLine($"[file: {lineEnding} line endings, UTF-8{(hadBom ? " with BOM" : string.Empty)}, {lines.Length} line(s)]");
+
             for (var i = 0; i < count && startIndex + i < lines.Length; i++)
             {
                 var lineIndex = startIndex + i;
@@ -89,10 +92,10 @@ public sealed class FileTools
 
     /// <summary>Creates or completely overwrites a file under the working directory, creating parent directories as needed.</summary>
     /// <param name="filePath">Relative or absolute file path, resolved within the working directory.</param>
-    /// <param name="content">Complete replacement content to write.</param>
+    /// <param name="content">Complete replacement content. Line endings are normalised to the file's existing style when overwriting, or to LF for new files; a UTF-8 BOM is preserved when overwriting a file that had one.</param>
     /// <param name="ct">Token used to cancel the write.</param>
     /// <returns>A success message or an error message.</returns>
-    [Description("Writes new content to a file, completely overwriting it. Do not use this to modify existing files - use edit_file instead.")]
+    [Description("Writes new content to a file, completely overwriting it. Do not use this to modify existing files - use edit_file instead. When overwriting an existing file, LF/CRLF line endings and a UTF-8 BOM are preserved from the existing file; new files are written with LF and no BOM.")]
     public async Task<string> write_file(
         [Description("The relative or absolute path to the file")] string filePath,
         [Description("The content to write")] string content,
@@ -107,8 +110,13 @@ public sealed class FileTools
                 Directory.CreateDirectory(dir);
             }
 
-            await File.WriteAllTextAsync(fullPath, content, ct);
-            _logger.LogDebug("Wrote {Chars} chars to {Path}", content.Length, filePath);            return $"Successfully wrote {content.Length} characters to '{filePath}'.";
+            var (existingText, hadBom) = File.Exists(fullPath) ? ReadRaw(fullPath) : (null, false);
+            var lineEnding = existingText is not null ? DetectLineEnding(existingText) : "LF";
+            var preservedBom = existingText is not null && hadBom;
+            var payload = NormalizeLineEndings(content, lineEnding);
+            await WriteRawAsync(fullPath, payload, preservedBom, ct);
+            _logger.LogDebug("Wrote {Chars} chars to {Path}", payload.Length, filePath);
+            return $"Successfully wrote {payload.Length} characters to '{filePath}' ({lineEnding} line endings{(preservedBom ? ", UTF-8 BOM preserved" : string.Empty)}).";
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -119,11 +127,11 @@ public sealed class FileTools
 
     /// <summary>Replaces one exact, unique text occurrence in a file under the working directory.</summary>
     /// <param name="filePath">Relative or absolute file path, resolved within the working directory.</param>
-    /// <param name="oldString">Non-empty text that must occur exactly once in the file.</param>
-    /// <param name="newString">Text inserted in place of the matched content.</param>
+    /// <param name="oldString">Non-empty text that must occur exactly once in the file. Line endings are matched leniently: an LF oldString matches a CRLF file (and vice versa).</param>
+    /// <param name="newString">Text inserted in place of the matched content. Line endings are normalised to the file's own line-ending style; a UTF-8 BOM, if any, is preserved.</param>
     /// <param name="ct">Token used to cancel file reads and writes.</param>
     /// <returns>A success message or an error message describing why the replacement was not made.</returns>
-    [Description("Performs exact string replacements in files. The oldString must exactly match the file content, including whitespace and indentation. Only one occurrence is replaced per call.")]
+    [Description("Performs exact string replacements in files. The oldString must match the file content exactly, including whitespace and indentation, except that line endings (LF vs CRLF) are matched leniently and the file's original line-ending style and BOM are preserved. Only one occurrence is replaced per call.")]
     public async Task<string> edit_file(
         [Description("The relative or absolute path to the file")] string filePath,
         [Description("The exact text to replace. Must match the existing file exactly.")] string oldString,
@@ -143,33 +151,37 @@ public sealed class FileTools
                 return $"Error: File '{filePath}' does not exist.";
             }
 
-            var content = await File.ReadAllTextAsync(fullPath, ct);
+            var (content, hadBom) = ReadRaw(fullPath);
+            var lineEnding = DetectLineEnding(content);
 
-            var firstIndex = content.IndexOf(oldString, StringComparison.Ordinal);
+            // Match in LF-normalized space so LF needles work against CRLF files (and vice
+            // versa) and against files with mixed endings. The result is re-emitted using
+            // the file's dominant line ending, preserving BOM if present.
+            var normalizedContent = NormalizeLineEndings(content, "LF");
+            var needle = NormalizeLineEndings(oldString, "LF");
+            var replacement = NormalizeLineEndings(newString, "LF");
+
+            var firstIndex = normalizedContent.IndexOf(needle, StringComparison.Ordinal);
             if (firstIndex == -1)
             {
-                return "Error: oldString not found in file. Ensure exact whitespace/indentation matching.";
+                return $"Error: oldString not found in file (file uses {lineEnding} line endings). Check whitespace/indentation and line-ending style.";
             }
 
-            var endIndex = firstIndex + oldString.Length;
-            if (endIndex > content.Length)
-            {
-                return "Error: Internal inconsistency — matched text extends beyond file content.";
-            }
-
-            var secondIndex = content.IndexOf(oldString, endIndex, StringComparison.Ordinal);
+            var endIndex = firstIndex + needle.Length;
+            var secondIndex = normalizedContent.IndexOf(needle, endIndex, StringComparison.Ordinal);
             if (secondIndex != -1)
             {
                 return "Error: Found multiple matches for oldString. Provide more surrounding lines to make it unique.";
             }
 
-            var updatedContent = content.Substring(0, firstIndex)
-                + newString
-                + content.Substring(endIndex);
-            await File.WriteAllTextAsync(fullPath, updatedContent, ct);
+            var updatedNormalized = normalizedContent.Substring(0, firstIndex)
+                + replacement
+                + normalizedContent.Substring(endIndex);
+            var output = NormalizeLineEndings(updatedNormalized, lineEnding);
+            await WriteRawAsync(fullPath, output, hadBom, ct);
             _logger.LogDebug("Edited {Path}: replaced {OldLen} chars with {NewLen} chars at position {Pos}",
-                filePath, oldString.Length, newString.Length, firstIndex);
-            return $"Successfully replaced 1 occurrence of oldString in '{filePath}'.";
+                filePath, needle.Length, replacement.Length, firstIndex);
+            return $"Successfully replaced 1 occurrence of oldString in '{filePath}' ({lineEnding} line endings{(hadBom ? ", UTF-8 BOM preserved" : string.Empty)}).";
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -351,5 +363,66 @@ public sealed class FileTools
         {
             return $"Error performing grep: {ex.Message}";
         }
+    }
+
+    // ---------- Line-ending / encoding helpers ----------
+
+    private static readonly System.Text.UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+    private static readonly System.Text.UTF8Encoding Utf8WithBom = new(encoderShouldEmitUTF8Identifier: true);
+
+    /// <summary>Reads a file as UTF-8 text, reporting whether it had a UTF-8 BOM.</summary>
+    private static (string Content, bool HadBom) ReadRaw(string fullPath)
+    {
+        var bytes = File.ReadAllBytes(fullPath);
+        var hadBom = bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
+        var offset = hadBom ? 3 : 0;
+        var content = System.Text.Encoding.UTF8.GetString(bytes, offset, bytes.Length - offset);
+        return (content, hadBom);
+    }
+
+    private static Task WriteRawAsync(string fullPath, string content, bool withBom, CancellationToken ct)
+        => File.WriteAllTextAsync(fullPath, content, withBom ? Utf8WithBom : Utf8NoBom, ct);
+
+    /// <summary>Returns "CRLF" when the text contains at least one CRLF and at least as many CRLFs as lone LFs; otherwise "LF".</summary>
+    private static string DetectLineEnding(string text)
+    {
+        var crlf = 0;
+        var lf = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] != '\n') continue;
+            if (i > 0 && text[i - 1] == '\r') crlf++; else lf++;
+        }
+
+        return crlf > 0 && crlf >= lf ? "CRLF" : "LF";
+    }
+
+    /// <summary>Splits on LF, stripping a trailing CR from each line. A trailing newline does not produce a phantom final empty line.</summary>
+    private static string[] SplitLines(string text)
+    {
+        if (text.Length == 0) return Array.Empty<string>();
+        var lines = text.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].EndsWith("\r", StringComparison.Ordinal))
+            {
+                lines[i] = lines[i].Substring(0, lines[i].Length - 1);
+            }
+        }
+
+        if (lines.Length > 0 && lines[lines.Length - 1].Length == 0 && text.EndsWith("\n", StringComparison.Ordinal))
+        {
+            Array.Resize(ref lines, lines.Length - 1);
+        }
+
+        return lines;
+    }
+
+    /// <summary>Normalizes all line breaks in <paramref name="text"/> to <paramref name="lineEnding"/> ("LF" or "CRLF").</summary>
+    private static string NormalizeLineEndings(string text, string lineEnding)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        var lf = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        return lineEnding == "CRLF" ? lf.Replace("\n", "\r\n") : lf;
     }
 }

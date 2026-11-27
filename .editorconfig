@@ -1,0 +1,18 @@
+# Editor defaults so contributors and tooling stop drifting between CRLF and LF.
+# Line endings are enforced repository-wide by .gitattributes; this file makes
+# editors and the CLI agents they host agree with it.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json,md}]
+indent_size = 2
+
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

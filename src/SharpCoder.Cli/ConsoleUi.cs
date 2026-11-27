@@ -66,7 +66,8 @@ public sealed class ConsoleUi
         ReasoningEffort? reasoning,
         int? contextTokens,
         SharpCoder.ShellPreference shell,
-        string? savePath)
+        string? savePath,
+        string? resolvedShell = null)
     {
         var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
         var contextValue = contextTokens is null
@@ -81,7 +82,9 @@ public sealed class ConsoleUi
         table.AddRow("Bash tool", enableBash
             ? $"[{Warn}]enabled[/] [dim](the agent can run arbitrary shell commands)[/]"
             : "[dim]disabled[/]");
-        table.AddRow("Shell", $"[dim]{Markup.Escape(ShellDescription(shell))}[/]");
+        table.AddRow("Shell", resolvedShell is not null
+            ? $"[dim]{Markup.Escape(resolvedShell)}[/]"
+            : $"[dim]{Markup.Escape(ShellDescription(shell))}[/]");
         table.AddRow("Reasoning", reasoning?.ToString() ?? "[dim]provider default[/]");
         if (savePath is not null)
             table.AddRow("Session file", Markup.Escape(savePath));

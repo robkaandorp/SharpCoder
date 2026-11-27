@@ -162,4 +162,117 @@ public class FileToolsTests : IDisposable
         Assert.Contains("Error", result);
         Assert.Contains("does not exist", result);
     }
+    [Fact]
+    public async Task ReadFile_ReportsCrlfLineEndings()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "crlf.txt");
+        await File.WriteAllTextAsync(full, "a\r\nb\r\nc\r\n", ct);
+
+        var result = await _tools.read_file("crlf.txt", ct: ct);
+        Assert.Contains("CRLF line endings", result);
+        Assert.Contains("1: a", result);
+        Assert.Contains("3: c", result);
+    }
+
+    [Fact]
+    public async Task ReadFile_ReportsBom()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "bom.txt");
+        await File.WriteAllBytesAsync(full, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(System.Text.Encoding.UTF8.GetBytes("x\ny\n")).ToArray(), ct);
+
+        var result = await _tools.read_file("bom.txt", ct: ct);
+        Assert.Contains("BOM", result);
+        Assert.Contains("1: x", result);
+    }
+
+    [Fact]
+    public async Task EditFile_LfNeedleMatchesCrlfFile_AndPreservesCrlf()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "crlf_edit.txt");
+        await File.WriteAllTextAsync(full, "one\r\ntwo\r\nthree\r\n", ct);
+
+        // Caller passes LF-only oldString/newString against a CRLF file.
+        var result = await _tools.edit_file("crlf_edit.txt", "one\ntwo", "ONE\nTWO", ct);
+        Assert.Contains("Successfully replaced", result);
+
+        var bytes = await File.ReadAllBytesAsync(full, ct);
+        var text = System.Text.Encoding.UTF8.GetString(bytes);
+        Assert.Equal("ONE\r\nTWO\r\nthree\r\n", text);
+        Assert.DoesNotContain("\n\n", text);
+    }
+
+    [Fact]
+    public async Task EditFile_PreservesUtf8Bom()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "bom_edit.txt");
+        await File.WriteAllBytesAsync(full,
+            new byte[] { 0xEF, 0xBB, 0xBF }.Concat(System.Text.Encoding.UTF8.GetBytes("keep\r\nbody\r\n")).ToArray(), ct);
+
+        var result = await _tools.edit_file("bom_edit.txt", "keep", "kept", ct);
+        Assert.Contains("Successfully replaced", result);
+
+        var bytes = await File.ReadAllBytesAsync(full, ct);
+        Assert.Equal(0xEF, bytes[0]);
+        Assert.Equal(0xBB, bytes[1]);
+        Assert.Equal(0xBF, bytes[2]);
+        Assert.Contains("kept\r\nbody\r\n", System.Text.Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3));
+    }
+
+    [Fact]
+    public async Task EditFile_MixedLineEndings_MatchesViaCrlfPath()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "mixed.txt");
+        // Dominant CRLF with a lone LF line inside.
+        await File.WriteAllTextAsync(full, "a\r\nb\nc\r\n", ct);
+
+        var result = await _tools.edit_file("mixed.txt", "a\nb\nc", "A\nB\nC", ct);
+        Assert.Contains("Successfully replaced", result);
+    }
+
+    [Fact]
+    public async Task WriteFile_PreservesCrlfStyleOfExistingFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "write_preserve.txt");
+        await File.WriteAllTextAsync(full, "old\r\ncontent\r\n", ct);
+
+        var result = await _tools.write_file("write_preserve.txt", "new\ncontent\n", ct);
+        Assert.Contains("Successfully wrote", result);
+
+        var bytes = await File.ReadAllTextAsync(full, ct);
+        Assert.Equal("new\r\ncontent\r\n", bytes);
+    }
+
+    [Fact]
+    public async Task WriteFile_NewFileDefaultsToLf()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "write_new.txt");
+
+        var result = await _tools.write_file("write_new.txt", "a\r\nb\n", ct);
+        Assert.Contains("Successfully wrote", result);
+
+        var text = await File.ReadAllTextAsync(full, ct);
+        Assert.Equal("a\nb\n", text);
+    }
+
+    [Fact]
+    public async Task WriteFile_PreservesBomOfExistingFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var full = Path.Combine(_testDir, "write_bom.txt");
+        await File.WriteAllBytesAsync(full,
+            new byte[] { 0xEF, 0xBB, 0xBF }.Concat(System.Text.Encoding.UTF8.GetBytes("old\r\n")).ToArray(), ct);
+
+        await _tools.write_file("write_bom.txt", "new\n", ct);
+
+        var bytes = await File.ReadAllBytesAsync(full, ct);
+        Assert.Equal(new byte[] { 0xEF, 0xBB, 0xBF }, bytes.Take(3).ToArray());
+        Assert.Equal("new\r\n", System.Text.Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3));
+    }
 }

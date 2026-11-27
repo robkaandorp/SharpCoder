@@ -71,7 +71,8 @@ public sealed class AgentFactory : IAsyncDisposable
             shell: _options.Shell,
             reasoning: _options.ReasoningEffort,
             contextTokens: _options.ContextTokens,
-            savePath: _options.SavePath);
+            savePath: _options.SavePath,
+            resolvedShell: _agent?.ResolvedBashShell);
 
     public async ValueTask DisposeAsync()
     {
