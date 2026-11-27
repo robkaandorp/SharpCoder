@@ -47,7 +47,11 @@ internal static class Program
             return 0;
         }
 
-        var ui = new ConsoleUi { MarkdownMode = options.Markdown };
+        var ui = new ConsoleUi
+        {
+            MarkdownMode = options.Markdown,
+            VerboseToolResults = options.VerboseToolResults,
+        };
         ui.ShowBanner(Version);
 
         await using var factory = new AgentFactory(options, ui);
@@ -213,6 +217,9 @@ internal static class Program
             case "/markdown":
                 return HandleMarkdownCommand(arg, ui);
 
+            case "/verbose":
+                return HandleVerboseCommand(arg, ui);
+
             case "/save":
                 var target = arg ?? options.SavePath;
                 if (target is null)
@@ -252,6 +259,32 @@ internal static class Program
         }
 
         ui.Info($"markdown mode: {ui.MarkdownMode.ToString().ToLowerInvariant()}");
+        return false;
+    }
+
+    /// <summary>Handles /verbose [on|off].</summary>
+    private static bool HandleVerboseCommand(string? arg, ConsoleUi ui)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            ui.Info($"verbose tool results: {(ui.VerboseToolResults ? "on" : "off")} (on|off)");
+            return false;
+        }
+
+        switch (arg.Trim().ToLowerInvariant())
+        {
+            case "on" or "true" or "yes":
+                ui.VerboseToolResults = true;
+                break;
+            case "off" or "false" or "no":
+                ui.VerboseToolResults = false;
+                break;
+            default:
+                ui.Error($"unknown verbose setting '{arg}' — use on or off");
+                return false;
+        }
+
+        ui.Info($"verbose tool results: {(ui.VerboseToolResults ? "on" : "off")}");
         return false;
     }
 

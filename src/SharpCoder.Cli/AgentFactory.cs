@@ -14,14 +14,32 @@ public sealed class AgentFactory : IAsyncDisposable
 {
     private readonly CliOptions _options;
     private readonly ConsoleUi _ui;
+    private readonly EnvironmentDigest _environmentDigest;
+    private readonly Func<string?, IChatClient> _clientFactory;
+    private readonly IToolConfirmationPrompter _confirmationPrompter;
 
     private IChatClient? _client;
     private CodingAgent? _agent;
 
     public AgentFactory(CliOptions options, ConsoleUi ui)
+        : this(options, ui, EnvironmentDigest.CreateDefault(), ChatClientFactory.Create)
+    {
+    }
+
+    /// <summary>Test seam: allows injecting a deterministic digest builder and chat client factory.</summary>
+    internal AgentFactory(
+        CliOptions options,
+        ConsoleUi ui,
+        EnvironmentDigest environmentDigest,
+        Func<string?, IChatClient>? clientFactory = null,
+        IToolConfirmationPrompter? confirmationPrompter = null)
     {
         _options = options;
         _ui = ui;
+        _environmentDigest = environmentDigest;
+        _clientFactory = clientFactory ?? ChatClientFactory.Create;
+        _confirmationPrompter = confirmationPrompter
+            ?? new SpectreToolConfirmationPrompter(Spectre.Console.AnsiConsole.Console);
     }
 
     /// <summary>
@@ -35,7 +53,23 @@ public sealed class AgentFactory : IAsyncDisposable
             ? await AgentSession.LoadAsync(path).ConfigureAwait(false)
             : AgentSession.Create();
 
-        _client = ChatClientFactory.Create(_options.Model);
+        _client = _clientFactory(_options.Model);
+
+        // The digest is appended under CodingAgent's "Custom Instructions" heading. It is built
+        // before construction, with a placeholder token for the shell; the token is substituted
+        // from CodingAgent.ResolvedBashShell afterwards. BuildSystemPrompt reads these options live
+        // on every turn, so the enriched value is what the model sees.
+        var customInstructions = _options.NoEnvContext
+            ? null
+            : _environmentDigest.Build(_options, EnvironmentDigest.ShellPlaceholder);
+
+        // In Auto mode a redirected stdin/stdout means no human can answer, so prompting would
+        // hang a scripted run. --confirm-tools always overrides this by choosing Always directly.
+        var effectiveMode = _options.ConfirmTools == ToolConfirmationMode.Auto
+                            && (Console.IsInputRedirected || Console.IsOutputRedirected)
+            ? ToolConfirmationMode.Never
+            : _options.ConfirmTools;
+        var authorization = new ToolAuthorizationPolicy(_confirmationPrompter, effectiveMode);
 
         var agentOptions = new AgentOptions
         {
@@ -45,7 +79,11 @@ public sealed class AgentFactory : IAsyncDisposable
             EnableFileWrites = !_options.ReadOnly,
             BashShell = _options.Shell,
             ShowToolCallsInStream = true,
+            EmitStructuredToolUpdates = true,
             ReasoningEffort = _options.ReasoningEffort,
+            CustomInstructions = customInstructions,
+            AuthorizeTool = authorization.AuthorizeAsync,
+            ToolAuthorizationCorrelationId = "SharpCoder.Cli",
             OnCompacting = _ui.Compacting,
             OnCompacted = _ui.Compacted,
         };
@@ -55,6 +93,15 @@ public sealed class AgentFactory : IAsyncDisposable
             agentOptions.CompactionRetainTokens = retainTokens;
 
         _agent = new CodingAgent(_client, agentOptions);
+
+        if (customInstructions is not null)
+        {
+            // Substitute the shell the agent actually resolved, so the model knows which command
+            // syntax to emit for execute_bash_command. Falls back to the preference if bash is off.
+            var resolved = _agent.ResolvedBashShell ?? _options.Shell.ToString();
+            agentOptions.CustomInstructions = customInstructions.Replace(
+                EnvironmentDigest.ShellPlaceholder, resolved, StringComparison.Ordinal);
+        }
 
         if (_options.SessionPath is not null)
             _ui.SessionRestored(session);
@@ -70,6 +117,8 @@ public sealed class AgentFactory : IAsyncDisposable
             maxSteps: _options.MaxSteps,
             enableBash: _options.EnableBash,
             readOnly: _options.ReadOnly,
+            noEnvContext: _options.NoEnvContext,
+            confirmTools: _options.ConfirmTools,
             shell: _options.Shell,
             reasoning: _options.ReasoningEffort,
             contextTokens: _options.ContextTokens,

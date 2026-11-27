@@ -290,6 +290,22 @@ public sealed class AgentOptions
     public bool ShowToolCallsInStream { get; set; }
 
     /// <summary>
+    /// When <c>true</c>, the manual streaming tool loop (<see cref="ShowToolCallsInStream"/>)
+    /// additionally emits structured <see cref="StreamingUpdateKind.ToolCallStarted"/>,
+    /// <see cref="StreamingUpdateKind.ToolCallCompleted"/> and
+    /// <see cref="StreamingUpdateKind.RoundProgress"/> updates carrying full tool arguments,
+    /// untruncated results, error state and elapsed time. The markdown-formatted text narration
+    /// from <see cref="ShowToolCallsInStream"/> is still emitted unchanged, so existing hosts that
+    /// only consume <see cref="StreamingUpdateKind.TextDelta"/> see exactly the same bytes.
+    /// <para>
+    /// Has no effect when <see cref="ShowToolCallsInStream"/> is <c>false</c>: on that path
+    /// <c>FunctionInvokingChatClient</c> owns the tool loop and SharpCoder cannot observe individual
+    /// invocations. Defaults to <c>false</c>.
+    /// </para>
+    /// </summary>
+    public bool EmitStructuredToolUpdates { get; set; }
+
+    /// <summary>
     /// Optional <see cref="IChatClient"/> to use for context compaction summaries.
     /// When <c>null</c>, the main agent client is used (default behavior).
     /// Set this to a cheaper/faster model to avoid consuming the main model's

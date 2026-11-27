@@ -652,8 +652,10 @@ public sealed class CodingAgent : IAsyncDisposable
         var allResponseMessages = new List<ChatMessage>();
         int totalToolCalls = 0;
         int steps = 0;
+        int round = 0;
         string? lastModelId = null;
         UsageDetails? lastUsage = null;
+        var structured = _options.EmitStructuredToolUpdates;
 
         while (steps <= _options.MaxSteps)
         {
@@ -750,13 +752,30 @@ public sealed class CodingAgent : IAsyncDisposable
                 steps++;
                 totalToolCalls++;
 
-                // Yield formatted tool call as markdown
+                var arguments = fc.Arguments ?? new Dictionary<string, object?>();
+                // A defensive snapshot keeps the structured payload stable even if a tool mutates
+                // the argument dictionary while running.
+                var argumentSnapshot = new Dictionary<string, object?>(arguments, StringComparer.Ordinal);
+
+                if (structured)
+                {
+                    yield return StreamingUpdate.ToolStarted(new ToolCallUpdate
+                    {
+                        Name = fc.Name,
+                        CallId = fc.CallId,
+                        Arguments = argumentSnapshot,
+                    });
+                }
+
+                // Yield formatted tool call as markdown (unchanged for existing hosts).
                 var argsStr = FormatToolCallArgs(fc.Arguments);
                 yield return StreamingUpdate.TextDelta($"\n\n`🔧 {fc.Name}({argsStr})`\n");
 
                 // Find and invoke the matching tool
                 var tool = chatOptions.Tools?.OfType<AIFunction>().FirstOrDefault(f => f.Name == fc.Name);
                 object? result;
+                var isError = false;
+                var startedAt = structured ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 if (tool != null)
                 {
                     try
@@ -772,11 +791,13 @@ public sealed class CodingAgent : IAsyncDisposable
                     {
                         _logger.LogWarning(ex, "Tool {ToolName} failed", fc.Name);
                         result = $"Error: {ex.Message}";
+                        isError = true;
                     }
                 }
                 else
                 {
                     result = $"Unknown tool: {fc.Name}";
+                    isError = true;
                 }
 
                 // Yield formatted result (first line, truncated)
@@ -784,12 +805,39 @@ public sealed class CodingAgent : IAsyncDisposable
                 var firstLine = TruncateFirstLine(resultStr, 120);
                 yield return StreamingUpdate.TextDelta($"> {firstLine}\n");
 
+                if (structured)
+                {
+                    var elapsedTicks = System.Diagnostics.Stopwatch.GetTimestamp() - startedAt;
+                    var elapsed = TimeSpan.FromTicks(
+                        elapsedTicks * TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency);
+                    yield return StreamingUpdate.ToolFinished(new ToolCallUpdate
+                    {
+                        Name = fc.Name,
+                        CallId = fc.CallId,
+                        Arguments = argumentSnapshot,
+                        Result = resultStr,
+                        IsError = isError,
+                        Elapsed = elapsed,
+                    });
+                }
+
                 // Add tool result to conversation for the next round
                 var resultMessage = new ChatMessage(ChatRole.Tool,
                     new AIContent[] { new FunctionResultContent(fc.CallId, result) });
                 messages.Add(resultMessage);
                 allResponseMessages.Add(resultMessage);
             }
+
+            if (structured)
+            {
+                yield return StreamingUpdate.RoundProgress(new RoundProgressUpdate
+                {
+                    Round = round,
+                    ToolCallsSoFar = totalToolCalls,
+                    MaxSteps = _options.MaxSteps,
+                });
+            }
+            round++;
 
             // Mid-loop compaction: check before next API call. Its summary calls are recorded
             // into this execution's summary (UsageSource.Compaction); with a null session the

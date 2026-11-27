@@ -29,6 +29,9 @@ public sealed class ConsoleUi
     /// <summary>How assistant markdown is rendered. Set by the caller from <c>--markdown</c>.</summary>
     public MarkdownMode MarkdownMode { get; set; } = MarkdownMode.Auto;
 
+    /// <summary>When true, structured tool results are printed in full rather than one truncated line.</summary>
+    public bool VerboseToolResults { get; set; }
+
     /// <summary>
     /// Console used for rendered widgets such as the startup configuration table. Defaults to
     /// <see cref="AnsiConsole.Console"/>; test hosts can inject a recording console.
@@ -70,6 +73,8 @@ public sealed class ConsoleUi
         int maxSteps,
         bool enableBash,
         bool readOnly,
+        bool noEnvContext,
+        ToolConfirmationMode confirmTools,
         ReasoningEffort? reasoning,
         int? contextTokens,
         SharpCoder.ShellPreference shell,
@@ -96,6 +101,15 @@ public sealed class ConsoleUi
             ? $"[dim]{Markup.Escape(resolvedShell)}[/]"
             : $"[dim]{Markup.Escape(ShellDescription(shell))}[/]");
         table.AddRow("Reasoning", reasoning?.ToString() ?? "[dim]provider default[/]");
+        table.AddRow("Env context", noEnvContext
+            ? "[dim]off (--no-env-context)[/]"
+            : "[dim]on (OS, SDK, git, workspace, tools in system prompt)[/]");
+        table.AddRow("Tool confirmation", confirmTools switch
+        {
+            ToolConfirmationMode.Never => "[dim]off (all guarded calls allowed)[/]",
+            ToolConfirmationMode.Always => $"[{Warn}]always[/] [dim](every write/bash call)[/]",
+            _ => $"[{Warn}]auto[/] [dim](interactive: prompt; piped: allow)[/]",
+        });
         if (savePath is not null)
             table.AddRow("Session file", Markup.Escape(savePath));
         RenderConsole.Write(table);
@@ -127,7 +141,11 @@ public sealed class ConsoleUi
         var spinner = Task.Run(() => Spin(spinnerCts.Token), CancellationToken.None);
 
         var receivedText = false;
-        var writer = new StreamingMarkdownWriter(AnsiConsole.Console, MarkdownMode);
+        var writer = new StreamingMarkdownWriter(RenderConsole, MarkdownMode);
+        var toolRenderer = new StructuredToolCallRenderer(
+            RenderConsole, VerboseToolResults, writer.EffectiveMode == MarkdownMode.Raw);
+        var structuredSeen = false;
+        var expectingLegacyResultLine = false;
         AgentResult? result = null;
         try
         {
@@ -136,9 +154,36 @@ public sealed class ConsoleUi
                 switch (update.Kind)
                 {
                     case StreamingUpdateKind.TextDelta when update.Text is { Length: > 0 } text:
+                        // Once structured tool updates are in play, drop the legacy markdown
+                        // narration for those calls so they are not rendered twice. Other hosts
+                        // still receive the original text deltas unchanged.
+                        if (structuredSeen && IsLegacyToolCallLine(text))
+                        {
+                            expectingLegacyResultLine = true;
+                            break;
+                        }
+                        if (structuredSeen && expectingLegacyResultLine && IsLegacyToolResultLine(text))
+                        {
+                            expectingLegacyResultLine = false;
+                            break;
+                        }
+                        expectingLegacyResultLine = false;
                         StopSpinner(spinnerCts, spinner);
                         receivedText = true;
                         writer.Append(text);
+                        break;
+                    case StreamingUpdateKind.ToolCallStarted when update.ToolCall is { } started:
+                        structuredSeen = true;
+                        StopSpinner(spinnerCts, spinner);
+                        toolRenderer.Started(started);
+                        break;
+                    case StreamingUpdateKind.ToolCallCompleted when update.ToolCall is { } finished:
+                        structuredSeen = true;
+                        toolRenderer.Finished(finished);
+                        break;
+                    case StreamingUpdateKind.RoundProgress when update.Progress is { } progress:
+                        structuredSeen = true;
+                        toolRenderer.Progress(progress);
                         break;
                     case StreamingUpdateKind.Completed:
                         result = update.Result;
@@ -158,6 +203,16 @@ public sealed class ConsoleUi
 
         return result;
     }
+
+    /// <summary>
+    /// Recognizes the two whole-delta markdown narration lines <c>CodingAgent</c> emits for a tool
+    /// call. Only used to suppress them when their structured equivalents have been rendered.
+    /// </summary>
+    private static bool IsLegacyToolCallLine(string text) =>
+        text.StartsWith("\n\n`🔧 ", StringComparison.Ordinal) && text.EndsWith("`\n", StringComparison.Ordinal);
+
+    private static bool IsLegacyToolResultLine(string text) =>
+        text.StartsWith("> ", StringComparison.Ordinal) && text.EndsWith('\n');
 
     /// <summary>Renders the per-turn outcome: status, model, usage and cumulative session totals.</summary>
     public void ShowResult(AgentResult result, AgentSession session)
@@ -205,6 +260,7 @@ public sealed class ConsoleUi
         table.AddRow("/save [[path]]", "Save the session (defaults to --save path)");
         table.AddRow("/session", "Show session statistics");
         table.AddRow("/markdown [[mode]]", "Show or set markdown rendering (auto, live, full, raw)");
+        table.AddRow("/verbose [[on|off]]", "Show or set full tool-result rendering");
         table.AddRow("/clear", "Clear the screen");
         table.AddRow("/exit, /quit", "Save (if --save) and exit");
         AnsiConsole.Write(table);

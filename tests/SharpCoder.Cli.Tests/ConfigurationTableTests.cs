@@ -15,6 +15,8 @@ public class ConfigurationTableTests
             maxSteps: 25,
             enableBash: false,
             readOnly: readOnly,
+            noEnvContext: false,
+            confirmTools: ToolConfirmationMode.Auto,
             reasoning: null,
             contextTokens: 200_000,
             shell: SharpCoder.ShellPreference.Auto,
@@ -41,5 +43,31 @@ public class ConfigurationTableTests
         Assert.Contains("File writes", output);
         Assert.Contains("disabled", output);
         Assert.Contains("--read-only", output);
+    }
+
+    [Theory]
+    [InlineData(ToolConfirmationMode.Auto, "auto")]
+    [InlineData(ToolConfirmationMode.Always, "always")]
+    [InlineData(ToolConfirmationMode.Never, "off")]
+    public void Configuration_ReportsToolConfirmationMode(ToolConfirmationMode mode, string expected)
+    {
+        var console = TestConsoleFactory.Create(width: 120);
+        var ui = new ConsoleUi { RenderConsole = console };
+
+        ui.Configuration(
+            model: "copilot/test-model",
+            workDirectory: "/repo",
+            maxSteps: 25,
+            enableBash: false,
+            readOnly: false,
+            noEnvContext: false,
+            confirmTools: mode,
+            reasoning: null,
+            contextTokens: 200_000,
+            shell: SharpCoder.ShellPreference.Auto,
+            savePath: null);
+
+        Assert.Contains("Tool confirmation", console.Output);
+        Assert.Contains(expected, console.Output);
     }
 }

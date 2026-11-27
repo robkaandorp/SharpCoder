@@ -478,7 +478,47 @@ dotnet run --project src/SharpCoder.Cli -- \
 dotnet run --project src/SharpCoder.Cli
 ```
 
-In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--confirm-tools auto|always|never` (or `-y`/`--yes`) to control consent prompts for write and bash tools, `--verbose` (or `/verbose`) for full tool results, `--no-env-context` to skip the startup environment snapshot, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+
+### Structured tool updates
+
+The CLI renders tool calls as distinct terminal lines: a cyan call line with arguments, a result line (red when the tool failed), elapsed time, and a round/step progress line. By default only the first line of a tool result is shown; `--verbose` (or `/verbose on` in the REPL) prints the full, untruncated result, which is useful for build/test logs. When output is redirected (`--markdown raw`), tool annotations are kept off stdout, so `SharpCoder.Cli run "..." > out.txt` contains only the model's text.
+
+These come from the library's additive `AgentOptions.EmitStructuredToolUpdates` flag. When enabled on the manual streaming tool loop, `CodingAgent` emits `StreamingUpdateKind.ToolCallStarted`, `ToolCallCompleted` and `RoundProgress` updates carrying `ToolCallUpdate` (full arguments, untruncated result, error flag, elapsed time) and `RoundProgressUpdate`. The flag defaults to `false`; the pre-existing markdown text narration is still emitted unchanged, so existing hosts that only read `TextDelta` see exactly the same output:
+
+```csharp
+var options = new AgentOptions
+{
+    ShowToolCallsInStream = true,
+    EmitStructuredToolUpdates = true,
+};
+
+await foreach (var update in agent.ExecuteStreamingAsync(session, task))
+{
+    if (update.Kind == StreamingUpdateKind.ToolCallCompleted && update.ToolCall is { } t)
+        Console.WriteLine($"{t.Name}: {t.Result} ({t.Elapsed.TotalMilliseconds:n0} ms, error={t.IsError})");
+}
+```
+
+The flag has no effect on the default streaming path, where `FunctionInvokingChatClient` owns the tool loop and individual invocations are not observable.
+
+### Tool confirmation
+
+By default the CLI asks for consent before `write_file`, `edit_file` and `execute_bash_command` run. The prompt shows the tool name and its arguments; answer `y` to allow once, `n` to deny once (the default), `a` to allow all remaining calls in the session, or `s` to deny all remaining calls. Read/search tools and skills are never prompted. A denial is returned to the agent as a refusal — the tool does not run and no file or command is affected.
+
+`--confirm-tools` selects the mode:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Prompt on an interactive terminal; auto-allow when input or output is redirected, so `SharpCoder.Cli run … > out.txt` never hangs |
+| `always` | Prompt even when redirected; EOF / no answer denies (fail closed) |
+| `never` | Allow all guarded calls without asking — for CI and trusted batches |
+
+`-y` / `--yes` is an alias for `never`. The startup configuration table shows the effective mode. Note that `--read-only` and `--no-writes` remove the write tools entirely, which is a stronger guarantee than prompting.
+
+### Startup environment context
+
+By default the CLI adds a compact **environment context** block to the agent's system prompt so the model knows its surroundings without probing: OS/architecture, .NET runtime and SDK version, work directory, git branch / status / last commit, a bounded top-level workspace listing, and the enabled tool set (including the resolved shell and read-only state). It is a startup snapshot — the agent should re-check with a tool if state may have changed. Everything is best-effort with short timeouts (a missing toolchain or a non-git directory reports `unavailable`) and the output is capped (20 git-status lines, 40 workspace entries, 4,000 characters per command), so it cannot consume a meaningful share of the context window. Use `--no-env-context` to disable it; the startup configuration table shows the effective setting.
 
 ### Markdown rendering
 
@@ -503,7 +543,7 @@ The produced binary is `SharpCoder.Cli`. The CLI targets `net11.0` and is delibe
 
 - **Path traversal protection** — all file operations are confined to `WorkDirectory`
 - **Bash disabled by default** — opt in explicitly with `EnableBash = true` (CLI: `--bash`)
-- **File writes are enabled by default** — the CLI registers `write_file`/`edit_file` without a confirmation prompt. Use `--read-only`/`--no-writes` (or `AgentOptions.EnableFileWrites = false` in the library) when you only want the agent to inspect code. The CLI's startup configuration table shows the effective setting. Only enable writes in trusted or sandboxed environments.
+- **File writes are enabled by default, but confirmed interactively** — the CLI registers `write_file`/`edit_file` and asks for consent via `AuthorizeTool` on an interactive terminal (see [Tool confirmation](#tool-confirmation)). In redirected/scripted runs `auto` mode allows them without prompting, so use `--confirm-tools always`, `-y`/`--yes` deliberately, or `--read-only`/`--no-writes` (which removes the write tools entirely). The library itself has no confirmation prompt: hosts must set `AgentOptions.AuthorizeTool` or `EnableFileWrites = false` themselves. The CLI's startup configuration table shows the effective settings. Only enable writes in trusted or sandboxed environments.
 - **No sandboxing for bash** — when enabled, the agent has full shell access with the process's privileges. Only enable in trusted environments (containers, CI runners)
 
 ## License

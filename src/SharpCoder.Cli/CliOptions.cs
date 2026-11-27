@@ -88,6 +88,27 @@ public sealed class CliOptions
     /// <summary>Path to save the session JSON to (written after every turn and on exit).</summary>
     public string? SavePath { get; init; }
 
+    /// <summary>
+    /// When <see langword="true"/>, skip the auto-generated environment context block that the CLI
+    /// appends to the agent's system prompt. Set by <c>--no-env-context</c>. Defaults to
+    /// <see langword="false"/> (the digest is enabled).
+    /// </summary>
+    public bool NoEnvContext { get; init; }
+
+    /// <summary>
+    /// When true, structured tool results are printed in full instead of one truncated line.
+    /// Set by <c>--verbose</c> / <c>/verbose</c>.
+    /// </summary>
+    public bool VerboseToolResults { get; init; }
+
+    /// <summary>
+    /// How the CLI asks for consent before a side-effecting tool call (<c>write_file</c>,
+    /// <c>edit_file</c>, <c>execute_bash_command</c>). Defaults to
+    /// <see cref="ToolConfirmationMode.Auto"/>: prompt on an interactive terminal, auto-allow when
+    /// input or output is redirected so scripted runs never hang.
+    /// </summary>
+    public ToolConfirmationMode ConfirmTools { get; init; } = ToolConfirmationMode.Auto;
+
     /// <summary>True when <c>-v</c>/<c>--version</c> was passed; the caller should print the version and exit.</summary>
     public bool ShowVersion { get; init; }
 
@@ -118,6 +139,7 @@ public sealed class CliOptions
                 --reasoning <level>   none | low | medium | high | extra-high (aliases: off, xhigh).
                 --markdown <mode>     auto | live | full | raw. Render assistant output as
                                       markdown (default: auto — live on a terminal, raw when piped).
+                --verbose             Print full tool results instead of a one-line summary.
                 --bash                Enable the bash tool (off by default; see README security notes).
                 --read-only, --no-writes
                                       Disable write_file/edit_file; the agent can only read and
@@ -126,6 +148,13 @@ public sealed class CliOptions
                 --shell <shell>       auto | pwsh | powershell | cmd | bash. Which shell the
                                       bash tool launches. Default: auto (pwsh → powershell.exe →
                                       cmd.exe on Windows; bash on PATH, else /bin/sh elsewhere).
+                --no-env-context      Do not add the startup environment snapshot (OS, SDK, git
+                                      state, workspace layout, enabled tools) to the system prompt.
+                --confirm-tools <mode>
+                                      Consent for write_file, edit_file and execute_bash_command:
+                                      auto (default — prompt on a terminal, auto-allow when piped),
+                                      always (prompt even when piped; EOF denies), never (allow all).
+                -y, --yes             Alias for --confirm-tools never (CI / trusted batches).
                 --session <file>      Resume a saved session (JSON).
                 --save <file>         Save the session to a file after every turn and on exit.
             -v, --version             Print the version and exit.
@@ -165,6 +194,9 @@ public sealed class CliOptions
         string? sessionPath = null;
         string? savePath = null;
         var markdown = MarkdownMode.Auto;
+        var verboseToolResults = false;
+        var noEnvContext = false;
+        var confirmTools = ToolConfirmationMode.Auto;
         var showVersion = false;
         var positionals = new List<string>();
 
@@ -210,6 +242,9 @@ public sealed class CliOptions
                 case "--markdown":
                     markdown = ParseMarkdownMode(RequireValue(args, ref i, arg));
                     break;
+                case "--verbose":
+                    verboseToolResults = true;
+                    break;
                 case "--bash":
                     enableBash = true;
                     break;
@@ -219,6 +254,16 @@ public sealed class CliOptions
                     break;
                 case "--shell":
                     shell = ParseShell(RequireValue(args, ref i, arg));
+                    break;
+                case "--no-env-context":
+                    noEnvContext = true;
+                    break;
+                case "--confirm-tools":
+                    confirmTools = ParseConfirmTools(RequireValue(args, ref i, arg));
+                    break;
+                case "-y":
+                case "--yes":
+                    confirmTools = ToolConfirmationMode.Never;
                     break;
                 case "--session":
                     sessionPath = RequireValue(args, ref i, arg);
@@ -264,6 +309,9 @@ public sealed class CliOptions
             Shell = shell,
             ReasoningEffort = reasoning,
             Markdown = markdown,
+            VerboseToolResults = verboseToolResults,
+            NoEnvContext = noEnvContext,
+            ConfirmTools = confirmTools,
             ContextTokens = contextTokens,
             RetainTokens = retainTokens,
             SessionPath = sessionPath,
@@ -299,6 +347,15 @@ public sealed class CliOptions
             _ => throw new ArgumentException($"Unknown --shell '{value}'. Use auto, pwsh, powershell, cmd or bash."),
         };
     }
+
+    private static ToolConfirmationMode ParseConfirmTools(string value) =>
+        value.Trim().ToLowerInvariant() switch
+        {
+            "auto" => ToolConfirmationMode.Auto,
+            "always" or "ask" => ToolConfirmationMode.Always,
+            "never" or "off" or "none" => ToolConfirmationMode.Never,
+            _ => throw new ArgumentException($"Unknown --confirm-tools mode '{value}'. Use auto, always or never."),
+        };
 
     private static MarkdownMode ParseMarkdownMode(string value)
     {
