@@ -478,7 +478,7 @@ dotnet run --project src/SharpCoder.Cli -- \
 dotnet run --project src/SharpCoder.Cli
 ```
 
-In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
 
 ### Markdown rendering
 
@@ -502,7 +502,8 @@ The produced binary is `SharpCoder.Cli`. The CLI targets `net11.0` and is delibe
 ## Security
 
 - **Path traversal protection** — all file operations are confined to `WorkDirectory`
-- **Bash disabled by default** — opt in explicitly with `EnableBash = true`
+- **Bash disabled by default** — opt in explicitly with `EnableBash = true` (CLI: `--bash`)
+- **File writes are enabled by default** — the CLI registers `write_file`/`edit_file` without a confirmation prompt. Use `--read-only`/`--no-writes` (or `AgentOptions.EnableFileWrites = false` in the library) when you only want the agent to inspect code. The CLI's startup configuration table shows the effective setting. Only enable writes in trusted or sandboxed environments.
 - **No sandboxing for bash** — when enabled, the agent has full shell access with the process's privileges. Only enable in trusted environments (containers, CI runners)
 
 ## License

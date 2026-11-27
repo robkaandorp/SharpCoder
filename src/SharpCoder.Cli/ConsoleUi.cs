@@ -29,6 +29,12 @@ public sealed class ConsoleUi
     /// <summary>How assistant markdown is rendered. Set by the caller from <c>--markdown</c>.</summary>
     public MarkdownMode MarkdownMode { get; set; } = MarkdownMode.Auto;
 
+    /// <summary>
+    /// Console used for rendered widgets such as the startup configuration table. Defaults to
+    /// <see cref="AnsiConsole.Console"/>; test hosts can inject a recording console.
+    /// </summary>
+    public IAnsiConsole RenderConsole { get; init; } = AnsiConsole.Console;
+
     /// <summary>Prints the application banner.</summary>
     public void ShowBanner(string version)
     {
@@ -63,6 +69,7 @@ public sealed class ConsoleUi
         string workDirectory,
         int maxSteps,
         bool enableBash,
+        bool readOnly,
         ReasoningEffort? reasoning,
         int? contextTokens,
         SharpCoder.ShellPreference shell,
@@ -82,14 +89,16 @@ public sealed class ConsoleUi
         table.AddRow("Bash tool", enableBash
             ? $"[{Warn}]enabled[/] [dim](the agent can run arbitrary shell commands)[/]"
             : "[dim]disabled[/]");
+        table.AddRow("File writes", readOnly
+            ? "[dim]disabled (--read-only)[/]"
+            : $"[{Warn}]enabled[/] [dim](write_file/edit_file run without confirmation)[/]");
         table.AddRow("Shell", resolvedShell is not null
             ? $"[dim]{Markup.Escape(resolvedShell)}[/]"
             : $"[dim]{Markup.Escape(ShellDescription(shell))}[/]");
         table.AddRow("Reasoning", reasoning?.ToString() ?? "[dim]provider default[/]");
         if (savePath is not null)
             table.AddRow("Session file", Markup.Escape(savePath));
-        AnsiConsole.Write(table);
-        AnsiConsole.WriteLine();
+        RenderConsole.Write(table);
     }
 
     /// <summary>Notes that a session was restored from disk.</summary>

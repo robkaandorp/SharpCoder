@@ -65,6 +65,7 @@ internal static class Program
         }
 
         factory.ShowConfiguration();
+        AnsiConsole.WriteLine();
 
         // Ctrl+C cancels the in-flight turn; at an idle prompt it saves (if --save) and exits.
         Console.CancelKeyPress += (_, e) =>

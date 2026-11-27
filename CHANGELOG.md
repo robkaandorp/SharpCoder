@@ -2,12 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](ht Sub-agents started through the sub-agent tools inherit the parent's BashShell, BashShellPath and BashShellArgsFormat alongside their other inherited options.tps://keepachangelog.com/en/1.0.0/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
 ### Added
 
+- **CLI `--read-only` / `--no-writes`** — disables the `write_file` and `edit_file` tools (maps to `AgentOptions.EnableFileWrites = false`), leaving read/search tools available. The startup configuration table now has a **File writes** row that states when writes are enabled *without confirmation*, or disabled via `--read-only`. File writes remain enabled by default for backward compatibility.
 - **Line-ending-aware file tools** — `read_file`/`write_file`/`edit_file` now round-trip line endings and BOMs instead of silently corrupting them. `read_file` prefixes output with a header reporting the file's line-ending style (LF/CRLF), whether a UTF-8 BOM is present and the line count. `edit_file` matches `oldString` in LF-normalized space, so an LF needle edits a CRLF (or mixed-ending) file; the file's dominant line-ending style and BOM are preserved on write, and only one occurrence is replaced as before. `write_file` preserves an existing file's dominant line-ending style and BOM (new files are LF, no BOM). Repo-wide `.gitattributes` (`* text=auto eol=lf`, `*.bat/*.cmd/*.ps1` as CRLF) and `.editorconfig` (LF, UTF-8) added so contributors and agents stop drifting between CRLF and LF.
 - **CLI startup table shows the resolved shell** — `SharpCoder.Cli` now reports the shell `execute_bash_command` will actually launch (e.g. `pwsh (auto: C:\path\to\pwsh.exe)` or `cmd.exe (auto; no PowerShell found)`) instead of the unresolved `--shell` preference, via the new public `CodingAgent.ResolvedBashShell` property. When bash is disabled the configured preference is still shown.
 - **CLI markdown rendering** — assistant output is now rendered as markdown in the terminal (headings, paragraphs, bold/italic/strikethrough, inline code, fenced code blocks with language label, ordered/unordered/task lists, blockquotes, tables, links, horizontal rules). Blocks stream as they complete, so output still appears live; tool-call narration is shown as dim one-liners rather than being parsed as markdown. New `--markdown <auto|live|full|raw>` option and `/markdown` slash command. `auto` (the default) uses `live` on an interactive terminal and `raw` when output is redirected.
@@ -18,6 +19,11 @@ The format is based on [Keep a Changelog](ht Sub-agents started through the sub-
 - **Windows shell selection for `execute_bash_command`** — the library now resolves pwsh → powershell.exe → cmd.exe (bash → /bin/sh on Unix) once when the agent is constructed (so a bad configuration fails at startup), instead of hard-wiring `cmd.exe` on Windows. New `AgentOptions.BashShell` (`SharpCoder.ShellPreference`) selects the preference (`Auto`, `Pwsh`, `PowerShell`, `Cmd`, `Bash`); `BashShellPath` still overrides everything. Resolution failures (e.g. `BashShell = Pwsh` with no pwsh installed, or an unresolvable override) now throw `InvalidOperationException` at construction rather than at the first command. Session diagnostics (`AgentResult.Diagnostics.BashShell`) report the shell actually resolved (e.g. `pwsh (auto: C:\Program Files\PowerShell\7\pwsh.exe)`), not the raw preference. On PowerShell the command is launched via `-EncodedCommand` with a UTF-8 console prelude (`$ProgressPreference='SilentlyContinue'` + `[Console]::OutputEncoding`), so Unicode and any shell quoting round-trip losslessly and PowerShell's CLIXML progress records no longer leak onto stderr; stdout/stderr are decoded as UTF-8. Commands sent to cmd.exe keep the command text verbatim after `/d /s /c ` because cmd.exe does not understand .NET's argument quoting. ``BashShellArgsFormat`` now documents and implements a simple contract: its output is split on whitespace with single/double quote grouping and **no escape processing**. Sub-agents started through the sub-agent tools also inherit the parent's `BashShell`, `BashShellPath` and `BashShellArgsFormat`.
 - **Non-streaming context-overflow retry** — `ExecuteAsync` now mirrors the streaming path: when the provider rejects the request as too large, the session is force-compacted and the request retried once before the error surfaces.
 - **Context-size measurement for streaming calls** — `LastKnownContextTokens` now uses the largest single input token count reported in the call instead of the sum of all usage updates, so providers that re-report cumulative usage snapshots no longer inflate the context estimate (which triggered premature and repeated compaction). Token accounting (`TokenUsage.InputTokens`, `session.InputTokensUsed`) still sums per-call usage as before.
+
+### Fixed
+
+- **Changelog boilerplate link** — restored the Keep-a-Changelog URL on line 5, which had a shell-selection sentence accidentally spliced into it.
+- **CLI `--shell` help accuracy** — the help text now says `auto` falls back to `/bin/sh` on Unix when bash is not on PATH, matching `ShellPreference` and the resolved-shell display (rather than claiming `/bin/bash` unconditionally).
 
 ### Changed
 

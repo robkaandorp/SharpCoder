@@ -54,8 +54,16 @@ public sealed class CliOptions
     public bool EnableBash { get; init; }
 
     /// <summary>
+    /// When <see langword="true"/>, the agent can only read and search files: <c>write_file</c> and
+    /// <c>edit_file</c> are not registered. Set by <c>--read-only</c> / <c>--no-writes</c>.
+    /// Defaults to <see langword="false"/> (file writes are enabled without confirmation).
+    /// </summary>
+    public bool ReadOnly { get; init; }
+
+    /// <summary>
     /// Which shell <c>execute_bash_command</c> launches. Defaults to <see cref="SharpCoder.ShellPreference.Auto"/>
-    /// (pwsh on Windows when installed, else Windows PowerShell, then cmd.exe; /bin/bash on Unix).
+    /// (pwsh on Windows when installed, else Windows PowerShell, then cmd.exe; bash on PATH,
+    /// falling back to /bin/sh, on Unix).
     /// </summary>
     public SharpCoder.ShellPreference Shell { get; init; } = SharpCoder.ShellPreference.Auto;
 
@@ -111,9 +119,13 @@ public sealed class CliOptions
                 --markdown <mode>     auto | live | full | raw. Render assistant output as
                                       markdown (default: auto — live on a terminal, raw when piped).
                 --bash                Enable the bash tool (off by default; see README security notes).
+                --read-only, --no-writes
+                                      Disable write_file/edit_file; the agent can only read and
+                                      search files. Off by default — file writes are enabled
+                                      without confirmation; see README security notes.
                 --shell <shell>       auto | pwsh | powershell | cmd | bash. Which shell the
                                       bash tool launches. Default: auto (pwsh → powershell.exe →
-                                      cmd.exe on Windows; /bin/bash elsewhere).
+                                      cmd.exe on Windows; bash on PATH, else /bin/sh elsewhere).
                 --session <file>      Resume a saved session (JSON).
                 --save <file>         Save the session to a file after every turn and on exit.
             -v, --version             Print the version and exit.
@@ -145,6 +157,7 @@ public sealed class CliOptions
         var workDirectory = Directory.GetCurrentDirectory();
         var maxSteps = 25;
         var enableBash = false;
+        var readOnly = false;
         var shell = SharpCoder.ShellPreference.Auto;
         ReasoningEffortLevel? reasoning = null;
         int? contextTokens = null;
@@ -200,6 +213,10 @@ public sealed class CliOptions
                 case "--bash":
                     enableBash = true;
                     break;
+                case "--read-only":
+                case "--no-writes":
+                    readOnly = true;
+                    break;
                 case "--shell":
                     shell = ParseShell(RequireValue(args, ref i, arg));
                     break;
@@ -243,6 +260,7 @@ public sealed class CliOptions
             WorkDirectory = workDirectory,
             MaxSteps = maxSteps,
             EnableBash = enableBash,
+            ReadOnly = readOnly,
             Shell = shell,
             ReasoningEffort = reasoning,
             Markdown = markdown,
