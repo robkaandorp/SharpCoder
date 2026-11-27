@@ -49,10 +49,30 @@ public sealed class AgentOptions
     public bool EnableBash { get; set; } = false;
 
     /// <summary>
+    /// Selects which shell <c>execute_bash_command</c> launches. Defaults to
+    /// <see cref="SharpCoder.ShellPreference.Auto"/>: on Windows it prefers PowerShell 7+
+    /// (<c>pwsh</c>) when found on PATH, then Windows PowerShell (<c>powershell.exe</c>),
+    /// then <c>cmd.exe</c>; on Linux/macOS it prefers <c>bash</c> from PATH and falls back to
+    /// <c>/bin/sh</c>. <see cref="SharpCoder.ShellPreference.PowerShell"/>,
+    /// <see cref="SharpCoder.ShellPreference.Pwsh"/> and <see cref="SharpCoder.ShellPreference.Cmd"/>
+    /// are Windows-only and throw <see cref="System.InvalidOperationException"/> elsewhere.
+    /// <see cref="SharpCoder.ShellPreference.Bash"/> is valid on both platforms (bash from PATH on
+    /// Windows, e.g. Git for Windows or WSL).
+    /// <para>
+    /// The shell is resolved once, when the agent is constructed, not per command.
+    /// If the requested shell cannot be found, construction throws <see cref="System.InvalidOperationException"/>;
+    /// a misconfigured <see cref="BashShell"/> fails fast at startup rather than on the first command.
+    /// </para>
+    /// In <see cref="SharpCoder.ShellPreference.Auto"/> on Unix, falling back to <c>/bin/sh</c> is only
+    /// an option when no <c>bash</c> is found on PATH.
+    /// Ignored when <see cref="BashShellPath"/> is set.
+    /// </summary>
+    public SharpCoder.ShellPreference BashShell { get; set; } = SharpCoder.ShellPreference.Auto;
+
+    /// <summary>
     /// Optional shell executable override used by <c>execute_bash_command</c>. When set,
-    /// this path is used instead of the platform default (<c>cmd.exe</c> on Windows,
-    /// <c>/bin/bash</c> elsewhere). Typical uses on Windows: <c>bash.exe</c> (WSL),
-    /// <c>C:\Program Files\Git\bin\bash.exe</c> (Git Bash), or <c>pwsh.exe</c>.
+    /// this path is used instead of <see cref="BashShell"/>. Typical uses on Windows: <c>bash.exe</c> (WSL),
+    /// <c>C:\Program Files\Git\bin\bash.exe</c> (Git Bash), or a fully pinned <c>pwsh.exe</c> path.
     /// <para>
     /// When overriding, also set <see cref="BashShellArgsFormat"/> if the shell's flag
     /// for passing a single command string is not <c>-c "..."</c>.
@@ -61,10 +81,12 @@ public sealed class AgentOptions
     public string? BashShellPath { get; set; }
 
     /// <summary>
-    /// Optional formatter that converts the LLM-supplied command string into the
-    /// arguments passed to <see cref="BashShellPath"/>. Receives the raw command,
-    /// returns the full argument string. Defaults to <c>-c "{command}"</c> with
-    /// double-quote escaping (bash-style) when <see cref="BashShellPath"/> is set.
+    /// Optional formatter that converts the LLM-supplied command string into the argument
+    /// string passed to <see cref="BashShellPath"/>. The returned string is split on whitespace
+    /// into individual arguments; runs of single- or double-quoted text are grouped into one
+    /// argument (quote characters are dropped) and there is no escape processing —
+    /// <c>\</c> is not special. When <see cref="BashShellPath"/> is set without this formatter,
+    /// the command is passed as a single argument after <c>-c</c>.
     /// </summary>
     public Func<string, string>? BashShellArgsFormat { get; set; }
 

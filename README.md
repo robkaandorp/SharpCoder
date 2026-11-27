@@ -302,6 +302,9 @@ var options = new AgentOptions
 
     // Enable shell command execution (default: false — security risk!)
     EnableBash = false,
+    // Which shell execute_bash_command launches (default: Auto —
+    // pwsh → powershell.exe → cmd.exe on Windows; bash → /bin/sh on Linux/macOS)
+    BashShell = SharpCoder.ShellPreference.Auto,
 
     // File system tools (default: true)
     EnableFileOps = true,
@@ -362,6 +365,23 @@ var options = new AgentOptions
 | `grep` | Search file contents with regex | `EnableFileOps` |
 | `execute_bash_command` | Run shell commands | `EnableBash` |
 | `list_skills` / `load_skill` | Discover and load project skills | `EnableSkills` |
+
+On Windows the command runs under PowerShell 7+ (`pwsh`) when it is installed, falling
+back to Windows PowerShell (`powershell.exe`), then to `cmd.exe` if neither is present. On
+Linux and macOS it uses `bash` found on `PATH`, falling back to `/bin/sh`. Shells are located via `PATH`, never via fixed install locations. The shell is resolved once when the
+agent is built; if the configured shell cannot be found, construction throws instead of failing
+on the first command. On PowerShell the command is executed with a UTF-8 console encoding prelude
+and a `-EncodedCommand` wrapper, so Unicode in the command and in output round-trips correctly and
+no shell quoting rules leak into your command text; output is UTF-8. Cmdlet error records are
+emitted by PowerShell as CLIXML on stderr (e.g. `#< CLIXML`), which is how PowerShell surfaces
+them when nobody is attached to the console — that is normal, not corruption. Prefer
+`pwsh`/PowerShell syntax (`Get-ChildItem`, `;`) over cmd.exe syntax; `&&`/`||` only work in
+PowerShell 7+. To force a specific shell set `BashShell` (`SharpCoder.ShellPreference.Pwsh`,
+`PowerShell`, `Cmd`, `Bash`, or `Auto`) — or `BashShellPath` for an arbitrary executable such as
+Git Bash or WSL bash. On cmd.exe the command tail is passed through verbatim after
+`/d /s /c ` (cmd.exe does not understand .NET argument quoting). If you set
+`BashShellArgsFormat`, its output is split on whitespace with quote-grouping and no escape
+processing — it is not a shell-quoted string.
 
 `execute_bash_command` accepts an optional `timeout_ms` tool argument: a positive integer in milliseconds for that invocation. If omitted or `null`, the instance-configured default applies (normally 120000 ms); for example, `900000` provides a 15-minute budget. Zero or negative values are rejected before process launch, and each invocation starts a fresh shell process. The original C# caller signature remains compatible. Each stdout and stderr stream is capped at about 50,000 characters; for full output, redirect it to a file and use `grep` or `tail` to inspect it. A valid tool call is:
 
@@ -458,7 +478,7 @@ dotnet run --project src/SharpCoder.Cli -- \
 dotnet run --project src/SharpCoder.Cli
 ```
 
-In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash`, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
 
 ### Markdown rendering
 

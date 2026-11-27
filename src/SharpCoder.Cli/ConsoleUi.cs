@@ -45,6 +45,18 @@ public sealed class ConsoleUi
         AnsiConsole.WriteLine();
     }
 
+    private static string ShellDescription(SharpCoder.ShellPreference shell) => shell switch
+    {
+        SharpCoder.ShellPreference.Auto => IsWindows ? "auto (pwsh → powershell.exe → cmd.exe)" : "auto (bash, then /bin/sh)",
+        SharpCoder.ShellPreference.Pwsh => "pwsh (PowerShell 7+)",
+        SharpCoder.ShellPreference.PowerShell => "powershell.exe (Windows PowerShell 5.1)",
+        SharpCoder.ShellPreference.Cmd => "cmd.exe",
+        SharpCoder.ShellPreference.Bash => IsWindows ? "bash (Git for Windows or WSL)" : "bash (or /bin/sh)",
+        _ => shell.ToString(),
+    };
+
+    private static bool IsWindows => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+
     /// <summary>Renders the resolved configuration table after startup.</summary>
     public void Configuration(
         string? model,
@@ -53,6 +65,7 @@ public sealed class ConsoleUi
         bool enableBash,
         ReasoningEffort? reasoning,
         int? contextTokens,
+        SharpCoder.ShellPreference shell,
         string? savePath)
     {
         var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
@@ -68,6 +81,7 @@ public sealed class ConsoleUi
         table.AddRow("Bash tool", enableBash
             ? $"[{Warn}]enabled[/] [dim](the agent can run arbitrary shell commands)[/]"
             : "[dim]disabled[/]");
+        table.AddRow("Shell", $"[dim]{Markup.Escape(ShellDescription(shell))}[/]");
         table.AddRow("Reasoning", reasoning?.ToString() ?? "[dim]provider default[/]");
         if (savePath is not null)
             table.AddRow("Session file", Markup.Escape(savePath));

@@ -74,6 +74,9 @@ public sealed class SubAgentManager : IAsyncDisposable
         public IChatClient? CompactionClient;
         public int? CompactionMaxTokens;
         public ReasoningEffort? ReasoningEffort;
+        public ShellPreference BashShell;
+        public string? BashShellPath;
+        public Func<string, string>? BashShellArgsFormat;
         public IReadOnlyList<ImageAttachment>? Images;
 
         /// <summary>
@@ -552,6 +555,9 @@ public sealed class SubAgentManager : IAsyncDisposable
                 CompactionClient = _parentOptions.CompactionClient,
                 CompactionMaxTokens = _parentOptions.CompactionMaxTokens,
                 ReasoningEffort = _parentOptions.ReasoningEffort,
+                BashShell = _parentOptions.BashShell,
+                BashShellPath = _parentOptions.BashShellPath,
+                BashShellArgsFormat = _parentOptions.BashShellArgsFormat,
                 Images = SnapshotImages(request.Images),
 
                 // Copied from the manager's fixed creation-time pair while the request is being
@@ -725,6 +731,9 @@ public sealed class SubAgentManager : IAsyncDisposable
                 CompactionClient = spec.CompactionClient,
                 CompactionMaxTokens = spec.CompactionMaxTokens,
                 ReasoningEffort = spec.ReasoningEffort,
+                BashShell = spec.BashShell,
+                BashShellPath = spec.BashShellPath,
+                BashShellArgsFormat = spec.BashShellArgsFormat,
                 Logger = _logger
             };
             if (spec.SystemPrompt != null)

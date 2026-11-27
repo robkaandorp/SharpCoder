@@ -66,7 +66,7 @@ public class BashToolsTests
 
     private static string LongRunningCommand() =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? "ping -n 30 127.0.0.1 > nul"
+            ? "ping -n 30 127.0.0.1 > $null"
             : "sleep 30";
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
@@ -79,9 +79,9 @@ public class BashToolsTests
     public async Task ExecuteBashCommand_Echo_ReturnsOutput()
     {
         var tools = new BashTools(Environment.CurrentDirectory);
-        var result = await tools.execute_bash_command("echo Hello XUnit", Ct);
+        var result = await tools.execute_bash_command("echo Hello-XUnit", Ct);
 
-        Assert.Contains("Hello XUnit", result);
+        Assert.Contains("Hello-XUnit", result);
         Assert.Contains("--- STDOUT ---", result);
     }
 
@@ -246,7 +246,7 @@ public class BashToolsTests
     /// </summary>
     private static string FloodStdoutCommand(int bodyLines) =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? $"echo OUT-FIRST-LINE && (for /L %i in (1,1,{bodyLines}) do @echo OUTBODY-%i) && echo OUT-LAST-LINE"
+            ? $"Write-Output OUT-FIRST-LINE; 1..{bodyLines} | ForEach-Object {{ Write-Output ('OUTBODY-' + $_) }}; Write-Output OUT-LAST-LINE"
             : $"echo OUT-FIRST-LINE; for i in $(seq 1 {bodyLines}); do echo OUTBODY-$i; done; echo OUT-LAST-LINE";
 
     /// <summary>
@@ -255,8 +255,8 @@ public class BashToolsTests
     /// </summary>
     private static string FloodBothStreamsCommand(int bodyLines) =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? $"echo OUT-FIRST-LINE && (for /L %i in (1,1,{bodyLines}) do @echo OUTBODY-%i) && echo OUT-LAST-LINE " +
-              $"&& echo ERR-FIRST-LINE 1>&2 && (for /L %j in (1,1,{bodyLines}) do @echo ERRBODY-%j 1>&2) && echo ERR-LAST-LINE 1>&2"
+            ? $"Write-Output OUT-FIRST-LINE; 1..{bodyLines} | ForEach-Object {{ Write-Output ('OUTBODY-' + $_) }}; Write-Output OUT-LAST-LINE; " +
+              $"[Console]::Error.WriteLine('ERR-FIRST-LINE'); 1..{bodyLines} | ForEach-Object {{ [Console]::Error.WriteLine('ERRBODY-' + $_) }}; [Console]::Error.WriteLine('ERR-LAST-LINE')"
             : $"echo OUT-FIRST-LINE; for i in $(seq 1 {bodyLines}); do echo OUTBODY-$i; done; echo OUT-LAST-LINE; " +
               $"echo ERR-FIRST-LINE >&2; for i in $(seq 1 {bodyLines}); do echo ERRBODY-$i >&2; done; echo ERR-LAST-LINE >&2";
 
@@ -682,6 +682,74 @@ public class BashToolsTests
         AutoLoadWorkspaceInstructions = false,
     };
 
+    [Fact]
+    public void ResolvedShellDescription_IsPopulated_AndMatchesTheRequestedShell()
+    {
+        var tools = new BashTools(Environment.CurrentDirectory);
+
+        Assert.False(string.IsNullOrWhiteSpace(tools.ResolvedShellDescription));
+        // The auto-resolved description names the concrete shell, not the bare preference word.
+        Assert.NotEqual("Auto", tools.ResolvedShellDescription, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("(", tools.ResolvedShellDescription);
+    }
+
+    [Fact]
+    public void ResolvedShellDescription_ForExplicitCmd_ReportsCmd()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // cmd is Windows-only; constructing it elsewhere throws instead.
+            Assert.Throws<InvalidOperationException>(
+                () => new BashTools(Environment.CurrentDirectory, shell: ShellPreference.Cmd));
+            return;
+        }
+
+        var tools = new BashTools(Environment.CurrentDirectory, shell: ShellPreference.Cmd);
+        Assert.Equal("cmd.exe", tools.ResolvedShellDescription);
+    }
+
+    [Fact]
+    public void Constructor_ThrowsForWindowsOnlyShell_OnNonWindows()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return; // nothing to assert here on Windows
+        }
+
+        Assert.Throws<InvalidOperationException>(
+            () => new BashTools(Environment.CurrentDirectory, shell: ShellPreference.Pwsh));
+    }
+
+    [Fact]
+    public async Task Diagnostics_ReportTheResolvedShell_NotTheRawPreference()
+    {
+        var options = BashAgentOptions();
+        options.BashShell = ShellPreference.Auto;
+        var client = new OptionsCapturingClient();
+        var agent = new CodingAgent(client, options);
+
+        var result = await agent.ExecuteAsync("hello", Ct);
+
+        Assert.NotNull(result.Diagnostics);
+        Assert.False(string.IsNullOrWhiteSpace(result.Diagnostics!.BashShell));
+        Assert.NotEqual("Auto", result.Diagnostics.BashShell, StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Diagnostics_ReportTheConfiguredShell_WhenBashIsDisabled()
+    {
+        var options = BashAgentOptions();
+        options.EnableBash = false;
+        options.BashShell = ShellPreference.Pwsh;
+        var client = new OptionsCapturingClient();
+        var agent = new CodingAgent(client, options);
+
+        var result = await agent.ExecuteAsync("hello", Ct);
+
+        Assert.NotNull(result.Diagnostics);
+        // With bash disabled nothing is resolved, so the configured preference is reported verbatim.
+        Assert.Equal("Pwsh", result.Diagnostics!.BashShell);
+    }
     private static async Task<AIFunction> GetRegisteredBashToolAsync()
     {
         var client = new OptionsCapturingClient();

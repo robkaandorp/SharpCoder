@@ -55,6 +55,16 @@ public sealed class CodingAgent : IAsyncDisposable
     private SubAgentManager? _subAgentManager;
     private SubAgentOptions? _subAgentSnapshot;
     private readonly object _subAgentLock = new();
+
+    /// <summary>
+    /// The single <see cref="BashTools"/> instance backing the bash tool, created once in the
+    /// constructor. Creating it eagerly means the shell is resolved (and an unresolvable
+    /// configuration fails) at agent construction, not on the first execution.
+    /// </summary>
+    private readonly BashTools? _bashTools;
+
+    /// <summary>Human-readable description of the resolved bash shell, or null when bash is disabled.</summary>
+    private readonly string? _resolvedBashShell;
     private int _subAgentManagerCreateCount;
 
     /// <summary>Test seam: how many times a sub-agent manager was created for this instance.</summary>
@@ -186,6 +196,20 @@ public sealed class CodingAgent : IAsyncDisposable
 
         if (SubAgentsEffectivelyEnabled)
             ThrowOnReservedToolNames(options.CustomTools);
+
+        // Resolve the shell once, here, so a misconfigured bash tool fails at construction
+        // rather than on the first command (or never surfaces on a code path that never runs).
+        if (options.EnableBash)
+        {
+            _bashTools = new BashTools(
+                options.WorkDirectory,
+                timeoutMs: 120000,
+                logger: _logger,
+                shellPathOverride: options.BashShellPath,
+                shellArgsFormat: options.BashShellArgsFormat,
+                shell: options.BashShell);
+            _resolvedBashShell = _bashTools.ResolvedShellDescription;
+        }
     }
 
     /// <summary>
@@ -883,17 +907,11 @@ public sealed class CodingAgent : IAsyncDisposable
             chatOptions.Reasoning = new ReasoningOptions { Effort = _options.ReasoningEffort.Value };
         }
 
-        if (_options.EnableBash)
+        if (_bashTools is not null)
         {
-            var bashTools = new BashTools(
-                _options.WorkDirectory,
-                timeoutMs: 120000,
-                logger: _logger,
-                shellPathOverride: _options.BashShellPath,
-                shellArgsFormat: _options.BashShellArgsFormat);
             // Register the timeout-aware overload explicitly: the LLM-facing schema exposes the
             // optional timeout_ms parameter (the CancellationToken is injected, not part of the schema).
-            Func<string, CancellationToken, int?, Task<string>> bashInvoke = bashTools.execute_bash_command;
+            Func<string, CancellationToken, int?, Task<string>> bashInvoke = _bashTools.execute_bash_command;
             tools.Add(Guard(AIFunctionFactory.Create(bashInvoke)));
         }
 
@@ -1110,6 +1128,7 @@ public sealed class CodingAgent : IAsyncDisposable
                         ?? new List<string>(),
             WorkDirectory = _options.WorkDirectory,
             EnableBash = _options.EnableBash,
+            BashShell = _resolvedBashShell ?? _options.BashShell.ToString(),
             EnableFileWrites = _options.EnableFileWrites,
             AutoLoadedWorkspaceInstructions = _options.AutoLoadWorkspaceInstructions,
             SkillsEnabled = _options.EnableSkills,

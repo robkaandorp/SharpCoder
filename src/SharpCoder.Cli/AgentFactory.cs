@@ -42,6 +42,7 @@ public sealed class AgentFactory : IAsyncDisposable
             WorkDirectory = _options.WorkDirectory,
             MaxSteps = _options.MaxSteps,
             EnableBash = _options.EnableBash,
+            BashShell = _options.Shell,
             ShowToolCallsInStream = true,
             ReasoningEffort = _options.ReasoningEffort,
             OnCompacting = _ui.Compacting,
@@ -67,6 +68,7 @@ public sealed class AgentFactory : IAsyncDisposable
             workDirectory: _options.WorkDirectory,
             maxSteps: _options.MaxSteps,
             enableBash: _options.EnableBash,
+            shell: _options.Shell,
             reasoning: _options.ReasoningEffort,
             contextTokens: _options.ContextTokens,
             savePath: _options.SavePath);

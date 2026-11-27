@@ -53,6 +53,12 @@ public sealed class CliOptions
     /// <summary>Enables the bash tool. Off by default; see the security notes in the README.</summary>
     public bool EnableBash { get; init; }
 
+    /// <summary>
+    /// Which shell <c>execute_bash_command</c> launches. Defaults to <see cref="SharpCoder.ShellPreference.Auto"/>
+    /// (pwsh on Windows when installed, else Windows PowerShell, then cmd.exe; /bin/bash on Unix).
+    /// </summary>
+    public SharpCoder.ShellPreference Shell { get; init; } = SharpCoder.ShellPreference.Auto;
+
     /// <summary>Reasoning effort for models with extended thinking; <c>null</c> leaves the provider default.</summary>
     public ReasoningEffort? ReasoningEffort { get; init; }
 
@@ -105,6 +111,9 @@ public sealed class CliOptions
                 --markdown <mode>     auto | live | full | raw. Render assistant output as
                                       markdown (default: auto — live on a terminal, raw when piped).
                 --bash                Enable the bash tool (off by default; see README security notes).
+                --shell <shell>       auto | pwsh | powershell | cmd | bash. Which shell the
+                                      bash tool launches. Default: auto (pwsh → powershell.exe →
+                                      cmd.exe on Windows; /bin/bash elsewhere).
                 --session <file>      Resume a saved session (JSON).
                 --save <file>         Save the session to a file after every turn and on exit.
             -v, --version             Print the version and exit.
@@ -136,6 +145,7 @@ public sealed class CliOptions
         var workDirectory = Directory.GetCurrentDirectory();
         var maxSteps = 25;
         var enableBash = false;
+        var shell = SharpCoder.ShellPreference.Auto;
         ReasoningEffortLevel? reasoning = null;
         int? contextTokens = null;
         int? retainTokens = null;
@@ -190,6 +200,9 @@ public sealed class CliOptions
                 case "--bash":
                     enableBash = true;
                     break;
+                case "--shell":
+                    shell = ParseShell(RequireValue(args, ref i, arg));
+                    break;
                 case "--session":
                     sessionPath = RequireValue(args, ref i, arg);
                     break;
@@ -230,6 +243,7 @@ public sealed class CliOptions
             WorkDirectory = workDirectory,
             MaxSteps = maxSteps,
             EnableBash = enableBash,
+            Shell = shell,
             ReasoningEffort = reasoning,
             Markdown = markdown,
             ContextTokens = contextTokens,
@@ -253,6 +267,19 @@ public sealed class CliOptions
         if (!long.TryParse(text, out var parsed) || parsed <= 0 || parsed > int.MaxValue / multiplier)
             throw new ArgumentException($"{flagName} expects a positive token count (e.g. 200000, 200k, or 1m), got '{value}'.");
         return (int)(parsed * multiplier);
+    }
+
+    private static SharpCoder.ShellPreference ParseShell(string value)
+    {
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "auto" => SharpCoder.ShellPreference.Auto,
+            "pwsh" or "pwsh7" or "powershell7" => SharpCoder.ShellPreference.Pwsh,
+            "powershell" or "powershell5" or "winps" => SharpCoder.ShellPreference.PowerShell,
+            "cmd" or "cmd.exe" => SharpCoder.ShellPreference.Cmd,
+            "bash" or "sh" => SharpCoder.ShellPreference.Bash,
+            _ => throw new ArgumentException($"Unknown --shell '{value}'. Use auto, pwsh, powershell, cmd or bash."),
+        };
     }
 
     private static MarkdownMode ParseMarkdownMode(string value)

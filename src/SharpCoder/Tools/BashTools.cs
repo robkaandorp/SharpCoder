@@ -45,13 +45,253 @@ public sealed class BashTools
     private readonly ILogger _logger;
     private readonly string? _shellPathOverride;
     private readonly Func<string, string>? _shellArgsFormat;
+    private readonly ShellPreference _shellPreference;
+
+    /// <summary>
+    /// Preamble prepended to every PowerShell invocation. Sets UTF-8 on the console so redirected
+    /// output is not mangled by the legacy OEM code page, and silences the CLIXML progress record
+    /// PowerShell emits on stderr when it detects a non-interactive host. No input encoding is set:
+    /// nothing is fed to stdin, and touching it only risks a "no input buffer" failure.
+    /// </summary>
+    private const string PowerShellPreamble =
+        "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
+
+    /// <summary>
+    /// Resolved launch data for the shell this tool instance will use. Exactly one of
+    /// <see cref="ArgumentList"/> (passed through .NET's argument quoting) and
+    /// <see cref="RawArguments"/> (a verbatim command line, used only for cmd.exe, which does not
+    /// understand .NET argument quoting) is populated.
+    /// </summary>
+    private sealed class ShellLaunch
+    {
+        internal ShellLaunch(string fileName, string[]? argumentList, string? rawArguments, string description)
+        {
+            FileName = fileName;
+            ArgumentList = argumentList;
+            RawArguments = rawArguments;
+            Description = description;
+        }
+
+        internal string FileName { get; }
+        internal string[]? ArgumentList { get; }
+        internal string? RawArguments { get; }
+        /// <summary>Human-readable name of the resolved shell (for diagnostics).</summary>
+        internal string Description { get; }
+    }
+
+    /// <summary>
+    /// What the constructor resolved the shell to: either an absolute executable path or a
+    /// well-known name resolvable by the OS. Resolved once at construction so a misconfigured
+    /// environment fails fast instead of on the first tool call.
+    /// </summary>
+    private sealed class ResolvedShell
+    {
+        private ResolvedShell(LaunchKind kind, string fileName, string description)
+        {
+            Kind = kind;
+            FileName = fileName;
+            Description = description;
+        }
+
+        internal enum LaunchKind
+        {
+            /// <summary>Bash/sh with <c>-c command</c>.</summary>
+            PosixShell,
+            /// <summary>PowerShell (pwsh or Windows PowerShell) with <c>-EncodedCommand</c>.</summary>
+            PowerShell,
+            /// <summary>cmd.exe with a verbatim command tail after <c>/d /s /c</c>.</summary>
+            Cmd,
+            /// <summary>Caller-supplied executable via <see cref="BashTools._shellPathOverride"/>.</summary>
+            Override,
+        }
+
+        internal LaunchKind Kind { get; }
+        /// <summary>Executable name or path passed to <see cref="ProcessStartInfo.FileName"/>.</summary>
+        internal string FileName { get; }
+        /// <summary>Human-readable description used in diagnostics.</summary>
+        internal string Description { get; }
+
+        internal static ResolvedShell Posix(string fileName, string description) => new(LaunchKind.PosixShell, fileName, description);
+        internal static ResolvedShell PowerShell(string fileName, string description) => new(LaunchKind.PowerShell, fileName, description);
+        internal static ResolvedShell Cmd(string description) => new(LaunchKind.Cmd, "cmd.exe", description);
+        internal static ResolvedShell Override(string fileName) => new(LaunchKind.Override, fileName, $"{fileName} (override)");
+    }
+
+    /// <summary>
+    /// Resolved once in the constructor. The tool can never be in an unresolved state: either the
+    /// requested shell was located, or the constructor threw.
+    /// </summary>
+    private readonly ResolvedShell _resolvedShell;
+
+    /// <summary>
+    /// Description of the shell this instance will actually launch (e.g. <c>pwsh (auto)</c>,
+    /// <c>cmd.exe</c>, <c>/bin/bash</c>, or <c>C:\tools\bash.exe (override)</c>). Used by
+    /// diagnostics; never reports the unresolved preference when the preference was "auto".
+    /// </summary>
+    internal string ResolvedShellDescription => _resolvedShell.Description;
+
+    /// <summary>
+    /// Resolves the shell once, at construction. Throws <see cref="InvalidOperationException"/>
+    /// when the requested preference cannot be satisfied on this machine.
+    /// </summary>
+    private ResolvedShell ResolveShell()
+    {
+        var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+
+        if (!string.IsNullOrEmpty(_shellPathOverride))
+            return ResolvedShell.Override(_shellPathOverride!);
+
+        if (!isWindows)
+        {
+            if (_shellPreference is ShellPreference.Pwsh or ShellPreference.PowerShell or ShellPreference.Cmd)
+                throw new InvalidOperationException($"ShellPreference.{_shellPreference} is only available on Windows; use ShellPreference.Bash or ShellPreference.Auto on this platform.");
+
+            var bash = FindOnPath("bash");
+            if (bash is not null)
+                return ResolvedShell.Posix(bash, DescribeResolved(bash, auto: _shellPreference == ShellPreference.Auto));
+
+            if (_shellPreference == ShellPreference.Bash)
+                throw new InvalidOperationException("ShellPreference.Bash was requested but no bash was found on PATH.");
+
+            // Auto on Unix: fall back to the POSIX-guaranteed /bin/sh.
+            if (File.Exists("/bin/sh"))
+                return ResolvedShell.Posix("/bin/sh", "/bin/sh (auto; bash not found)");
+
+            throw new InvalidOperationException("ShellPreference.Auto could not find a usable shell: no 'bash' on PATH and /bin/sh does not exist.");
+        }
+
+        if (_shellPreference is ShellPreference.Bash)
+        {
+            var bash = FindOnPath("bash");
+            if (bash is null)
+                throw new InvalidOperationException("ShellPreference.Bash was requested but no bash was found on PATH. Install Git for Windows or WSL, or use ShellPreference.Auto.");
+            return ResolvedShell.Posix(bash, DescribeResolved(bash, auto: false));
+        }
+
+        var preferPwsh = _shellPreference is ShellPreference.Auto or ShellPreference.Pwsh;
+        var preferWindowsPowerShell = _shellPreference is ShellPreference.Auto or ShellPreference.PowerShell;
+
+        if (preferPwsh)
+        {
+            var pwsh = FindOnPath("pwsh");
+            if (pwsh is not null)
+                return ResolvedShell.PowerShell(pwsh, DescribeResolved(pwsh, _shellPreference == ShellPreference.Auto));
+            if (_shellPreference == ShellPreference.Pwsh)
+                throw new InvalidOperationException("PowerShell 7+ (pwsh) was requested but was not found on PATH.");
+        }
+
+        if (preferWindowsPowerShell)
+        {
+            var powershell = FindOnPath("powershell");
+            if (powershell is not null)
+                return ResolvedShell.PowerShell(powershell, DescribeResolved(powershell, _shellPreference == ShellPreference.Auto));
+            if (_shellPreference == ShellPreference.PowerShell)
+                throw new InvalidOperationException("Windows PowerShell (powershell.exe) was requested but was not found on PATH.");
+        }
+
+        // Cmd is the last resort under Auto, or the explicit choice.
+        return ResolvedShell.Cmd(_shellPreference == ShellPreference.Auto ? "cmd.exe (auto; no PowerShell found)" : "cmd.exe");
+    }
+
+    private static string DescribeResolved(string path, bool auto)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        return auto ? $"{name} (auto: {path})" : path;
+    }
+
+    /// <summary>Builds the command-specific launch from the shell resolved at construction.</summary>
+    private ShellLaunch BuildLaunch(string command)
+    {
+        switch (_resolvedShell.Kind)
+        {
+            case ResolvedShell.LaunchKind.Override:
+                var shell = _shellPathOverride!;
+                if (_shellArgsFormat is not null)
+                    // The formatter returns the argument string for the override shell. It is split
+                    // on whitespace honoring single/double quotes; there is no escape processing.
+                    return new ShellLaunch(shell, SplitArguments(_shellArgsFormat(command)), null, _resolvedShell.Description);
+                return new ShellLaunch(shell, new[] { "-c", command }, null, _resolvedShell.Description);
+
+            case ResolvedShell.LaunchKind.PowerShell:
+            {
+                // Encode as UTF-16LE base64: no quoting rules to get wrong, no code page involved.
+                var script = PowerShellPreamble + command;
+                var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+                return new ShellLaunch(_resolvedShell.FileName,
+                    new[] { "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded },
+                    null,
+                    _resolvedShell.Description);
+            }
+
+            case ResolvedShell.LaunchKind.Cmd:
+                // cmd.exe does not understand .NET's argument quoting (it sees backslashes
+                // literally), so the command is passed as a verbatim tail after /d /s /c.
+                return new ShellLaunch("cmd.exe", null, "/d /s /c " + command, _resolvedShell.Description);
+
+            case ResolvedShell.LaunchKind.PosixShell:
+            default:
+                return new ShellLaunch(_resolvedShell.FileName,
+                    new[] { "-c", command },
+                    null,
+                    _resolvedShell.Description);
+        }
+    }
+
+    private static string? FindOnPath(string toolName)
+    {
+        var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+        var executable = isWindows ? toolName + ".exe" : toolName;
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(path)) return null;
+        foreach (var dir in path.Split(System.IO.Path.PathSeparator))
+        {
+            var trimmed = dir.Trim().Trim('"');
+            if (trimmed.Length == 0) continue;
+            var candidate = System.IO.Path.Combine(trimmed, executable);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Minimal command-line splitter for the legacy <c>shellArgsFormat</c> hook: splits on
+    /// whitespace, honouring single- and double-quoted spans. Not a general parser.
+    /// </summary>
+    private static string[] SplitArguments(string formatted)
+    {
+        var parts = new List<string>();
+        var sb = new StringBuilder();
+        char? quote = null;
+        foreach (var ch in formatted)
+        {
+            if (quote is not null)
+            {
+                if (ch == quote.Value) { quote = null; continue; }
+                sb.Append(ch);
+                continue;
+            }
+            if (ch == '"' || ch == '\'') { quote = ch; continue; }
+            if (char.IsWhiteSpace(ch))
+            {
+                if (sb.Length > 0) { parts.Add(sb.ToString()); sb.Clear(); }
+                continue;
+            }
+            sb.Append(ch);
+        }
+        if (sb.Length > 0) parts.Add(sb.ToString());
+        return parts.ToArray();
+    }
 
     /// <summary>Creates shell tools using the platform's default shell.</summary>
     /// <param name="workingDirectory">Working directory for each command process.</param>
     /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Defaults to 120000; values less than or equal to zero also use 120000.</param>
     /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
-    public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null)
-        : this(workingDirectory, timeoutMs, logger, null, null)
+    /// <param name="shell">Which shell to launch. <see cref="ShellPreference.Auto"/> (the default) prefers pwsh on Windows, then Windows PowerShell, then cmd.exe; on Linux/macOS it uses bash, falling back to /bin/sh.</param>
+    /// <exception cref="InvalidOperationException">The requested shell is not available on this machine. The shell is resolved once, here, so a bad configuration fails before any command is attempted.</exception>
+    public BashTools(string workingDirectory, int timeoutMs = 120000, ILogger? logger = null, ShellPreference shell = ShellPreference.Auto)
+        : this(workingDirectory, timeoutMs, logger, null, null, shell)
     {
     }
 
@@ -60,19 +300,24 @@ public sealed class BashTools
     /// <param name="timeoutMs">Default whole-capture timeout in milliseconds. Values less than or equal to zero use 120000.</param>
     /// <param name="logger">Optional logger for command and cleanup diagnostics.</param>
     /// <param name="shellPathOverride">Optional shell executable path; when omitted, the platform default is used.</param>
-    /// <param name="shellArgsFormat">Optional formatter that turns the command into the shell's argument string. When omitted with an override, bash-style <c>-c</c> arguments are used.</param>
+    /// <param name="shellArgsFormat">Optional formatter that turns the command into the argument string passed to the override shell. The result is split on whitespace into individual arguments; single and double quotes group words and are dropped; there is no escape processing. When omitted with an override, bash-style <c>-c</c> arguments are used.</param>
+    /// <param name="shell">Which shell to launch. Ignored when <paramref name="shellPathOverride"/> is set.</param>
+    /// <exception cref="InvalidOperationException">The requested shell is not available on this machine. The shell is resolved once, here, so a bad configuration fails before any command is attempted.</exception>
     public BashTools(
         string workingDirectory,
         int timeoutMs,
         ILogger? logger,
         string? shellPathOverride,
-        Func<string, string>? shellArgsFormat)
+        Func<string, string>? shellArgsFormat,
+        ShellPreference shell = ShellPreference.Auto)
     {
         _workingDirectory = workingDirectory;
         _timeoutMs = timeoutMs > 0 ? timeoutMs : 120000;
         _logger = logger ?? NullLogger.Instance;
         _shellPathOverride = shellPathOverride;
         _shellArgsFormat = shellArgsFormat;
+        _shellPreference = shell;
+        _resolvedShell = ResolveShell();
     }
 
     /// <summary>
@@ -149,7 +394,7 @@ public sealed class BashTools
     /// <returns>A command transcript containing captured output and exit status, or truthful timeout/error diagnostics; cancellation is not returned as text.</returns>
     /// <exception cref="ArgumentOutOfRangeException">Propagated through the returned task when <paramref name="timeout_ms"/> is zero or negative; validation occurs before the first await.</exception>
     /// <exception cref="System.OperationCanceledException">Propagated through the returned task when <paramref name="ct"/> is cancelled or cancellation is raised during command execution or cleanup.</exception>
-    [Description("Executes a given bash command. Each invocation starts a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). The timeout is a deadline over the whole capture: it stays active until the process has exited and its stdout/stderr have been fully drained, so a lingering child holding the output pipes open cannot make the call hang. Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected. Long output is shortened to its head and tail with an explicit marker in between; redirect large output to a file and read it back with grep, tail/head, or read_file with offset/limit.")]
+    [Description("Executes a command in a fresh shell process; no shell state (working directory, variables, background jobs) is carried between calls. On Windows the shell is PowerShell 7+ (pwsh) when installed, falling back to Windows PowerShell, then cmd.exe; on Linux/macOS it is bash. Sequence statements with ; (PowerShell 7+ also supports && and ||; Windows PowerShell 5.1 supports neither — use 'if ($?)' or ';' instead). Prefer single quotes for literal strings in PowerShell. On PowerShell prefer cmdlet or native-tool syntax over cmd.exe batch syntax. An optional per-invocation timeout (timeout_ms, in milliseconds) selects how long the shell is waited on for this call only; when it is omitted the tool's configured default timeout is used (normally 120000 ms). The timeout is a deadline over the whole capture: it stays active until the process has exited and its stdout/stderr have been fully drained, so a lingering child holding the output pipes open cannot make the call hang. Pass a larger budget for known long-running work, for example 900000 for a multi-minute validation run. timeout_ms must be greater than zero; zero or negative values are rejected. Long output is shortened to its head and tail with an explicit marker in between; redirect large output to a file and read it back with grep, tail/head, or read_file with offset/limit.")]
     public async Task<string> execute_bash_command(
         [Description("The command to execute")] string command,
         CancellationToken ct,
@@ -179,33 +424,29 @@ public sealed class BashTools
 
         try
         {
-            var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
-            string shell;
-            string args;
-            if (!string.IsNullOrEmpty(_shellPathOverride))
-            {
-                shell = _shellPathOverride!;
-                args = _shellArgsFormat is not null
-                    ? _shellArgsFormat(command)
-                    // Default assumes a bash-compatible shell: -c "<cmd>" with "-escaping.
-                    : $"-c \"{command.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"";
-            }
-            else
-            {
-                shell = isWindows ? "cmd.exe" : "/bin/bash";
-                args = isWindows ? $"/c \"{command}\"" : $"-c \"{command.Replace("\"", "\\\"")}\"";
-            }
-
+            var launch = BuildLaunch(command);
             var processStartInfo = new ProcessStartInfo
             {
-                FileName = shell,
-                Arguments = args,
+                FileName = launch.FileName,
                 WorkingDirectory = _workingDirectory,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
             };
+            if (launch.RawArguments is not null)
+            {
+                // cmd.exe does not understand .NET's argument quoting; the command tail must be
+                // passed through verbatim, including any quotes it contains.
+                processStartInfo.Arguments = launch.RawArguments;
+            }
+            else
+            {
+                foreach (var argument in launch.ArgumentList!)
+                    processStartInfo.ArgumentList.Add(argument);
+            }
 
             // The synchronous launch itself sits outside the timeout budget.
             process = Process.Start(processStartInfo);

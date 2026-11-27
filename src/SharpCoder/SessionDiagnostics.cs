@@ -29,6 +29,13 @@ public sealed class SessionDiagnostics
     /// <summary>Whether bash/shell execution was enabled.</summary>
     public bool EnableBash { get; set; }
 
+    /// <summary>
+    /// The shell the bash tool actually resolved to, e.g. <c>pwsh (auto: C:\...\pwsh.exe)</c>,
+    /// <c>cmd.exe</c> or <c>/bin/bash</c>. When bash is disabled this holds the configured
+    /// <see cref="SharpCoder.ShellPreference"/> name.
+    /// </summary>
+    public string BashShell { get; set; } = string.Empty;
+
     /// <summary>Whether file write operations were enabled.</summary>
     public bool EnableFileWrites { get; set; }
 
