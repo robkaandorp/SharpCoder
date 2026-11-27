@@ -91,7 +91,8 @@ public class BashToolsLifecycleTests
                 "The sentinel liveness probe must be able to observe a terminated process.");
 
             // The tool is reusable after cleanup.
-            var after = await new BashTools(fixture.WorkDirectory).execute_bash_command("echo reusable-after-timeout", Ct);
+            var after = await new BashTools(fixture.WorkDirectory, 120_000, null, FixturePaths.PreferredShell)
+                .execute_bash_command("echo reusable-after-timeout", Ct);
             Assert.Contains("reusable-after-timeout", after);
         }
         finally
@@ -134,7 +135,8 @@ public class BashToolsLifecycleTests
                 await WaitUntilNotRunningAsync(sentinel.Pid, LivenessGuardMs, Ct),
                 "The sentinel liveness probe must be able to observe a terminated process.");
 
-            var after = await new BashTools(fixture.WorkDirectory).execute_bash_command("echo reusable-after-cancel", Ct);
+            var after = await new BashTools(fixture.WorkDirectory, 120_000, null, FixturePaths.PreferredShell)
+                .execute_bash_command("echo reusable-after-cancel", Ct);
             Assert.Contains("reusable-after-cancel", after);
         }
         finally
@@ -155,11 +157,17 @@ public class BashToolsLifecycleTests
         try
         {
             var tools = fixture.CreateTools();
+            var launched = CaptureLaunchedPid(tools);
             var run = tools.execute_bash_command(fixture.RootCommand(), Ct, 45_000);
             await fixture.WaitUntilTreeReadyAsync(BarrierGuardMs, Ct);
 
             // The vector requires the ROOT to be gone while a descendant still holds the pipe.
+            // On Windows the launched process is the shell wrapper (pwsh) around the fixture
+            // root, so wait for it to exit too — otherwise the timeout can trip while the
+            // wrapper is still alive and production takes the terminate-tree path instead of
+            // the deterministic root-already-gone degraded path.
             await fixture.WaitUntilRootExitedAsync(LivenessGuardMs, Ct);
+            await WaitForLaunchedProcessExitAsync(launched, LivenessGuardMs, Ct);
             fixture.TripTimeout();
 
             // Failure guard only: the assertion is that the call returns at all.
@@ -211,7 +219,7 @@ public class BashToolsLifecycleTests
         callerCts.Cancel();
         try
         {
-            var tools = new BashTools(fixture.WorkDirectory);
+            var tools = new BashTools(fixture.WorkDirectory, 120_000, null, FixturePaths.PreferredShell);
             var observed = BashToolsTests.ObserveTimeouts(tools);
 
             var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
@@ -368,6 +376,11 @@ public class BashToolsLifecycleTests
             var tools = fixture.CreateTools(log);
             var capability = new StubTreeTerminator(supported: false);
             tools.TreeTerminator = capability;
+            var launchedPids = new List<int>();
+            tools.ProcessStarted = process =>
+            {
+                lock (launchedPids) launchedPids.Add(process.Id);
+            };
 
             var run = tools.execute_bash_command(fixture.RootCommand(), Ct, 30_000);
             await fixture.WaitUntilTreeReadyAsync(BarrierGuardMs, Ct);
@@ -377,11 +390,13 @@ public class BashToolsLifecycleTests
 
             Assert.False(capability.TerminateTreeCalled, "An unsupported capability must never be invoked.");
 
-            // Root-only fallback actually happened: the recorded root is gone.
-            var root = fixture.RecordedProcesses.Single(p => p.Role == "root");
+            // Root-only fallback actually happened: the process BashTools launched is gone. (Its
+            // pid need not equal the fixture root's pid — on Windows the shell is a separate
+            // wrapper process around the fixture, so production's root-only kill targets the shell.)
+            var launchedRootPid = Assert.Single(launchedPids);
             Assert.True(
-                await WaitUntilNotRunningAsync(root.Pid, LivenessGuardMs, Ct),
-                "The root-only fallback kill must still terminate the root process.");
+                await WaitUntilNotRunningAsync(launchedRootPid, LivenessGuardMs, Ct),
+                "The root-only fallback kill must still terminate the process it launched.");
 
             // Explicit degraded diagnostics in the result and the logs; never a success claim.
             Assert.Contains("--- CLEANUP DIAGNOSTICS ---", result);
@@ -409,6 +424,11 @@ public class BashToolsLifecycleTests
                 supported: true,
                 onTerminate: () => throw new InvalidOperationException("simulated-tree-kill-failure"));
             tools.TreeTerminator = capability;
+            var launchedPids = new List<int>();
+            tools.ProcessStarted = process =>
+            {
+                lock (launchedPids) launchedPids.Add(process.Id);
+            };
 
             var run = tools.execute_bash_command(fixture.RootCommand(), Ct, 30_000);
             await fixture.WaitUntilTreeReadyAsync(BarrierGuardMs, Ct);
@@ -418,10 +438,10 @@ public class BashToolsLifecycleTests
 
             Assert.True(capability.TerminateTreeCalled, "A supported capability must be invoked.");
 
-            var root = fixture.RecordedProcesses.Single(p => p.Role == "root");
+            var launchedRootPid = Assert.Single(launchedPids);
             Assert.True(
-                await WaitUntilNotRunningAsync(root.Pid, LivenessGuardMs, Ct),
-                "The root-only fallback kill must still terminate the root process.");
+                await WaitUntilNotRunningAsync(launchedRootPid, LivenessGuardMs, Ct),
+                "The root-only fallback kill must still terminate the process it launched.");
 
             Assert.Contains("Descendant cleanup was NOT established", result);
             Assert.Contains("simulated-tree-kill-failure", result);
@@ -454,7 +474,7 @@ public class BashToolsLifecycleTests
         using var fixture = new ProcessTreeFixture(maxDepth: 0, lifetimeMs: 1);
         try
         {
-            var tools = new BashTools(fixture.WorkDirectory);
+            var tools = new BashTools(fixture.WorkDirectory, 120_000, null, FixturePaths.PreferredShell);
             var result = await WithGuardAsync(
                 tools.execute_bash_command(fixture.RootCommand(), Ct, 60_000),
                 LivenessGuardMs,
@@ -1285,6 +1305,36 @@ public class BashToolsLifecycleTests
         return await task.ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Registers an observation hook that records the pid of the process
+    /// <see cref="BashTools"/> actually launches. On Windows that is a shell wrapper around the
+    /// fixture; on POSIX the shell execs the fixture and the pid is the fixture's own.
+    /// </summary>
+    private static List<int> CaptureLaunchedPid(BashTools tools)
+    {
+        var launched = new List<int>();
+        tools.ProcessStarted = process =>
+        {
+            lock (launched) launched.Add(process.Id);
+        };
+        return launched;
+    }
+
+    /// <summary>Waits for the process BashTools launched to exit (failure-guarded).</summary>
+    private static async Task WaitForLaunchedProcessExitAsync(List<int> launched, int guardMs, CancellationToken ct)
+    {
+        int pid;
+        lock (launched)
+        {
+            Assert.True(launched.Count > 0, "The launched process was not recorded.");
+            pid = launched[0];
+        }
+
+        Assert.True(
+            await WaitUntilNotRunningAsync(pid, guardMs, ct).ConfigureAwait(false),
+            $"The launched process (pid={pid}) did not exit within {guardMs}ms.");
+    }
+
     // --------------------------------------------------------------------
     // Test doubles
     // --------------------------------------------------------------------
@@ -1514,10 +1564,8 @@ public class BashToolsLifecycleTests
                 parts.Add("root");
             }
 
-            return string.Join(" ", parts.Select(Quote));
+            return FixturePaths.BuildCommand(parts);
         }
-
-        private static string Quote(string value) => "'" + value.Replace("'", "'\\''") + "'";
 
         /// <summary>
         /// Releases the timing seam used by <see cref="BashTools.DelayFactory"/> for this fixture's
@@ -1668,7 +1716,7 @@ public class BashToolsLifecycleTests
         /// </summary>
         public BashTools CreateTools(ILogger? logger = null)
         {
-            var tools = new BashTools(WorkDirectory, 120_000, logger);
+            var tools = new BashTools(WorkDirectory, 120_000, logger, FixturePaths.PreferredShell);
             tools.DelayFactory = (timeoutMs, token) =>
             {
                 lock (_observedTimeouts) _observedTimeouts.Add(timeoutMs);
@@ -1700,6 +1748,43 @@ public class BashToolsLifecycleTests
 
         public static string FixtureAssemblyPath { get; } =
             Path.Combine(FixtureDirectory, FixtureAssemblyName + ".dll");
+
+        /// <summary>
+        /// The shell the fixture launch commands are built for, and the shell the tests pin
+        /// <see cref="BashTools"/> to so quoting and shell can never drift apart.
+        /// On Windows the auto-resolved shell is PowerShell (pwsh, else Windows PowerShell); pinning
+        /// <see cref="ShellPreference.PowerShell"/> keeps the command line valid for the shell that
+        /// will actually interpret it (Windows PowerShell 5.1 ships with every supported Windows).
+        /// Elsewhere <see cref="ShellPreference.Auto"/> resolves to bash or /bin/sh and POSIX quoting applies.
+        /// </summary>
+        public static ShellPreference PreferredShell =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ShellPreference.PowerShell : ShellPreference.Auto;
+
+        private static bool UsePowerShellSyntax =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        /// <summary>Builds a command line in syntax valid for <see cref="PreferredShell"/>.</summary>
+        public static string BuildCommand(IReadOnlyList<string> argv)
+        {
+            var quoted = new List<string>(argv.Count + 1);
+            if (UsePowerShellSyntax)
+            {
+                // PowerShell needs the call operator to invoke a quoted command path; single-quoted
+                // strings are literal and a single quote is escaped by doubling it.
+                quoted.Add("&");
+                quoted.AddRange(argv.Select(QuotePowerShell));
+            }
+            else
+            {
+                quoted.AddRange(argv.Select(QuotePosix));
+            }
+
+            return string.Join(" ", quoted);
+        }
+
+        private static string QuotePosix(string value) => "'" + value.Replace("'", "'\\''") + "'";
+
+        private static string QuotePowerShell(string value) => "'" + value.Replace("'", "''") + "'";
 
         private static string ResolveFixtureDirectory()
         {
