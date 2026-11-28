@@ -498,19 +498,19 @@ Per-turn autosaves from `--save` are silent; only an explicit `/save` prints a c
 
 The CLI renders tool calls in two modes, switched with `/verbose [on|off]` (or `--verbose` at startup):
 
-- **Compact** (default) — one line per call (two for bash), driven by structured `ToolCallFacts` rather than by scraping result text. A width-aware path emphasises the filename and elides directories from the left when needed. Examples:
+- **Compact** (default) — one line per call (two for bash), driven by structured `ToolCallFacts` rather than by scraping result text. Each line is **two columns**: the icon, label and subject (a filename, search pattern or skill name) flush **left**, and the metrics + elapsed time flush **right** at the terminal margin. This keeps the numbers in a fixed column across a stream of calls, so they are easy to scan. A width-aware path emphasises the filename and elides directories from the left when needed. Examples at 80 columns:
 
   ```
-  🔧 ✓ Read   …/SharpCoder.Cli/ConsoleUi.cs  138–210 · 4,182 chars · 8ms
-  🔧 ✓ Write  …/SharpCoder.Cli/Program.cs    1× · −27/+41 chars · 4ms
-  🔧 ✓ Create …/CHANGELOG.md                2,910 chars · 2ms
-  🔧 ✓ Grep   FlushPending  *.cs            7 matches in 3 files · 41ms
-  🔧 ✓ Skill  build                         1ms
-  🔧 ✓ Bash   ⏱ 2m (default) timeout · 1.4s · exit 0
+  🔧 ✓ Read  src/SharpCoder.Cli/ConsoleUi.cs     138–210 · 4,182 chars · 8ms
+  🔧 ✓ Edit  src/SharpCoder.Cli/Program.cs          1× · −27/+41 chars · 4ms
+  🔧 ✓ Write CHANGELOG.md                                 2,910 chars · 2ms
+  🔧 ✓ Grep  FlushPending  *.cs               7 matches in 3 files · 41ms
+  🔧 ✓ Skill build                                                   1ms
+  🔧 ✓ Bash  ⏱ 2m (default) timeout                        1.4s · exit 0
               dotnet build SharpCoder.slnx --nologo -v q
   ```
 
-  `read_file` shows the line range and characters read; `edit_file` shows occurrences replaced plus characters removed/added; `glob`/`grep` show match and file counts; `load_skill`/`list_skills` show the skill name or count; bash additionally shows the effective timeout (human-readable, "(default)" when it came from `--bash-timeout`), elapsed time, exit code and the command on a second line. Unknown/custom tools fall back to a generic one-liner. Errors are red with `✗` and the first result line.
+  `read_file` shows the line range and characters read; `edit_file` shows occurrences replaced plus characters removed/added; `glob`/`grep` show match and file counts; `load_skill`/`list_skills` show the skill name or count; bash shows the effective timeout (human-readable, "(default)" when it came from `--bash-timeout`) on the left and elapsed time + exit code on the right, with the command on a second line. Unknown/custom tools fall back to a generic one-liner. On very narrow terminals whole metric segments are dropped (keeping the elapsed time) so the filename never vanishes and the line never wraps. Errors are red with `✗`.
 
 - **Verbose** — one Spectre panel per call with all arguments, the full untruncated result, running/success/error status, elapsed time, and a round/step progress line. Useful for build/test logs.
 

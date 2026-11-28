@@ -56,40 +56,6 @@ internal static class ToolDisplayFormatters
     /// <summary>Formats a millisecond timeout in the same compact style as <see cref="Duration"/>.</summary>
     public static string Timeout(long milliseconds) => Duration(TimeSpan.FromMilliseconds(milliseconds));
 
-    /// <summary>
-    /// Produces Spectre markup for a file path that keeps the filename emphasised when the whole
-    /// path does not fit: the directory part is dim and elided from the left with a leading ellipsis,
-    /// while the filename is bold. Both parts are escaped so brackets in paths cannot inject markup.
-    /// </summary>
-    /// <param name="path">Path as supplied by the model.</param>
-    /// <param name="maxWidth">Available visible characters.</param>
-    public static string CompactPath(string? path, int maxWidth)
-    {
-        if (string.IsNullOrEmpty(path))
-            return "[dim](no path)[/]";
-
-        var normalized = path.Replace('\\', '/');
-        var slash = normalized.LastIndexOf('/');
-        var directory = slash >= 0 ? normalized[..(slash + 1)] : string.Empty;
-        var name = slash >= 0 ? normalized[(slash + 1)..] : normalized;
-
-        // Always keep the filename. Shrink the directory from the left until the visible length fits.
-        var plain = directory + name;
-        if (plain.Length > maxWidth)
-        {
-            var keepForName = Math.Min(name.Length, Math.Max(4, maxWidth));
-            var budget = Math.Max(0, maxWidth - keepForName - 1); // 1 for the leading "…"
-            if (directory.Length > budget)
-                directory = "…" + directory[^budget..];
-            else
-                directory = "…" + directory;
-            name = name.Length > keepForName ? "…" + name[^(keepForName - 1)..] : name;
-        }
-
-        var dirMarkup = directory.Length == 0 ? string.Empty : $"[dim]{Markup.Escape(directory)}[/]";
-        return dirMarkup + $"[bold]{Markup.Escape(name)}[/]";
-    }
-
     /// <summary>Escapes and truncates arbitrary text to a visible width, adding an ellipsis when cut.</summary>
     public static string Clip(string? text, int maxWidth)
     {
@@ -98,6 +64,46 @@ internal static class ToolDisplayFormatters
         if (singleLine.Length > maxWidth)
             singleLine = singleLine[..Math.Max(1, maxWidth - 1)] + "…";
         return Markup.Escape(singleLine);
+    }
+
+    /// <summary>
+    /// Clips plain text from the LEFT, keeping the tail (used for right-aligned metrics on
+    /// very narrow consoles so the elapsed time stays flush right). Adds a leading ellipsis.
+    /// </summary>
+    public static string ClipStart(string text, int maxWidth)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0) return string.Empty;
+        if (CellWidth(text) <= maxWidth) return text;
+
+        // Prefer a clean tail with no ellipsis when the budget is very small: "8ms" is
+        // far more useful than "…ms". For larger budgets keep the leading ellipsis so
+        // the reader can tell content was dropped.
+        if (maxWidth <= 3)
+        {
+            var shortTail = text;
+            while (shortTail.Length > 0 && CellWidth(shortTail) > maxWidth)
+                shortTail = shortTail[1..];
+            return shortTail;
+        }
+
+        var tail = text;
+        while (tail.Length > 0 && CellWidth("…" + tail) > maxWidth)
+            tail = tail[1..];
+        return tail.Length == 0 ? "…" : "…" + tail;
+    }
+
+    /// <summary>
+    /// Visible cell width of plain (already-de-markup'd) text, using Spectre's own cell-width
+    /// table so wide characters such as the 🔧 emoji are counted correctly. Public via
+    /// <c>CharExtensions.GetCellWidth</c>; surrogate halves each count as one, which is exactly
+    /// how Spectre measured them when rendering (verified against <c>TestConsole.Profile.Width</c>).
+    /// </summary>
+    public static int CellWidth(string text)
+    {
+        var width = 0;
+        foreach (var c in text)
+            width += c.GetCellWidth();
+        return width;
     }
 
     /// <summary>Reads a string argument from the structured tool-call payload.</summary>

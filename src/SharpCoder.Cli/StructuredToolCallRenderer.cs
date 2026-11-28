@@ -70,32 +70,95 @@ internal sealed class StructuredToolCallRenderer
         var label = Label(detail.Name);
         var facts = detail.Facts;
         var args = detail.Arguments;
-        var body = detail.Name switch
-        {
-            "read_file" => ReadFileBody(args, facts),
-            "edit_file" => EditFileBody(args, facts),
-            "write_file" => WriteFileBody(args, facts),
-            "load_skill" => SkillBody(args, facts),
-            "list_skills" => SkillsBody(facts),
-            "glob" => GlobBody(args, facts),
-            "grep" => GrepBody(args, facts),
-            "execute_bash_command" => string.Empty, // handled as a two-line case below
-            _ => GenericBody(detail),
-        };
-
         var elapsed = ToolDisplayFormatters.Duration(detail.Elapsed);
 
         if (detail.Name == "execute_bash_command")
         {
-            RenderBash(detail, status, label, facts, args, elapsed);
+            RenderBash(status, label, facts, args, elapsed);
             return;
         }
 
-        var suffix = string.IsNullOrEmpty(body) ? elapsed : $"{body} · {elapsed}";
-        _console.MarkupLine($"  🔧 {status} [cyan]{label}[/]  {suffix}");
+        // Compact layout is two columns: icon + label + the primary subject (a filename,
+        // pattern or skill name) on the LEFT, and metrics + elapsed time flush RIGHT.
+        // Padding is computed against the console width so the right column always ends
+        // at the same margin, which makes a stream of tool calls easy to scan.
+        var (subject, metrics) = detail.Name switch
+        {
+            "read_file" => ReadFileParts(args, facts),
+            "edit_file" => EditFileParts(args, facts),
+            "write_file" => WriteFileParts(args, facts),
+            "load_skill" => SkillParts(args, facts),
+            "list_skills" => SkillsParts(facts),
+            "glob" => GlobParts(args, facts),
+            "grep" => GrepParts(args, facts),
+            _ => GenericParts(detail),
+        };
+
+        var right = string.IsNullOrEmpty(metrics) ? elapsed : $"{metrics} · {elapsed}";
+        RenderColumns(status, label, subject, right);
     }
 
-    private void RenderBash(ToolCallUpdate detail, string status, string label,
+    /// <summary>
+    /// Writes one compact line: the icon, label and subject flush LEFT, and the metrics
+    /// flush RIGHT at the terminal margin. Widths are measured on the plain fragments
+    /// (markup tags are zero-width), so the padding is exact and the line never wraps —
+    /// even with the wide 🔧 emoji in the prefix.
+    /// </summary>
+    private void RenderColumns(string status, string label, CompactSubject subject,
+        string right, string? rightMarkup = null)
+    {
+        var glyph = status.Contains("✗") ? "✗" : "✓";
+        var prefixWidth = ToolDisplayFormatters.CellWidth($"  🔧 {glyph} {label}  ");
+
+        // Give the subject at least a short visible slice (the tail of a filename) before
+        // sacrificing anything else. On very narrow consoles drop whole leading metric
+        // segments at the " · " boundaries, keeping at least the elapsed time; that avoids
+        // nonsense like "…2 chars" while still landing the right column flush right.
+        const int MinSubjectWidth = 12;
+        var maxRightWidth = Math.Max(1, _width - prefixWidth - MinSubjectWidth - 1);
+        var rightText = TrimMetrics(right, maxRightWidth);
+        var rightWidth = ToolDisplayFormatters.CellWidth(rightText);
+
+        var budget = Math.Max(0, _width - prefixWidth - rightWidth - 1);
+        var clipped = subject.Clip(budget);
+
+        var leftWidth = prefixWidth + ToolDisplayFormatters.CellWidth(clipped.Plain);
+        var gap = Math.Max(0, _width - leftWidth - rightWidth);
+
+        // Use the caller's coloured markup only when nothing was clipped; otherwise escape
+        // the (possibly shortened) plain text so the visible width stays exact.
+        var renderedRight = rightMarkup is not null && rightText == right
+            ? rightMarkup
+            : Markup.Escape(rightText);
+        var prefix = $"  🔧 {status} [cyan]{label}[/]  ";
+        _console.MarkupLine(prefix + clipped.Markup + new string(' ', gap) + renderedRight);
+    }
+
+    /// <summary>
+    /// Drops whole leading "segment · " chunks until the metrics fit; if even a single
+    /// segment is too wide, it is clipped from the left as a last resort. Never returns
+    /// an empty string, so the right column always has something to render.
+    /// </summary>
+    private static string TrimMetrics(string right, int maxWidth)
+    {
+        if (ToolDisplayFormatters.CellWidth(right) <= maxWidth) return right;
+
+        var text = right;
+        while (ToolDisplayFormatters.CellWidth(text) > maxWidth)
+        {
+            var separator = text.IndexOf(" · ", StringComparison.Ordinal);
+            if (separator < 0) break;
+            var next = text[(separator + 3)..];
+            if (next.Length == 0) break;
+            text = next;
+        }
+
+        return ToolDisplayFormatters.CellWidth(text) <= maxWidth
+            ? text
+            : ToolDisplayFormatters.ClipStart(text, maxWidth);
+    }
+
+    private void RenderBash(string status, string label,
         ToolCallFacts? facts, IReadOnlyDictionary<string, object?> args, string elapsed)
     {
         var timeout = facts?.TimeoutMs is { } ms
@@ -106,71 +169,78 @@ internal sealed class StructuredToolCallRenderer
             : facts?.ExitCode is { } code
                 ? (code == 0 ? "[green]exit 0[/]" : $"[red]exit {code}[/]")
                 : "[dim]exit ?[/]";
+        var exitPlain = facts?.TimedOut == true
+            ? "timed out"
+            : facts?.ExitCode is { } exitCode ? $"exit {exitCode}" : "exit ?";
         var command = ToolDisplayFormatters.Argument(args, "command");
         var commandWidth = Math.Max(20, _width - 14);
 
-        _console.MarkupLine($"  🔧 {status} [cyan]{label}[/]  ⏱ {Markup.Escape(timeout)} timeout · {Markup.Escape(elapsed)} · {exit}");
+        // Same two columns as the other tools: the effective timeout on the left, the
+        // elapsed time and colour-coded exit status flush right.
+        RenderColumns(status, label, CompactSubject.Plain($"⏱ {timeout} timeout"),
+            $"{elapsed} · {exitPlain}", $"{Markup.Escape(elapsed)} · {exit}");
         if (!string.IsNullOrWhiteSpace(command))
             _console.MarkupLine($"     [dim]{ToolDisplayFormatters.Clip(command, commandWidth)}[/]");
     }
 
-    private string ReadFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    /// <summary>File read/edit/write share the same subject: an emphasised, compact file path.</summary>
+    private (CompactSubject, string) ReadFileParts(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
-        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
         var range = facts?.StartLine is { } start && facts.EndLine is { } end
             ? $"{start}–{end}"
             : "?";
         var chars = facts?.CharactersRead is { } n ? $"{n:n0} chars" : "? chars";
-        return $"{path}  {range} · {chars}";
+        return (CompactSubject.Path(ToolDisplayFormatters.Argument(args, "filePath")), $"{range} · {chars}");
     }
 
-    private string EditFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    private (CompactSubject, string) EditFileParts(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
-        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
         var occurrences = facts?.OccurrencesReplaced is { } n ? $"{n}×" : "?×";
         var removed = facts?.CharactersRemoved is { } r ? $"−{r:n0}" : "−?";
         var added = facts?.CharactersAdded is { } a ? $"+{a:n0}" : "+?";
-        return $"{path}  {occurrences} · {removed}/{added} chars";
+        return (CompactSubject.Path(ToolDisplayFormatters.Argument(args, "filePath")),
+            $"{occurrences} · {removed}/{added} chars");
     }
 
-    private string WriteFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    private (CompactSubject, string) WriteFileParts(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
-        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
         var chars = facts?.CharactersWritten is { } n ? $"{n:n0} chars" : "? chars";
-        return $"{path}  {chars}";
+        return (CompactSubject.Path(ToolDisplayFormatters.Argument(args, "filePath")), chars);
     }
 
-    private string SkillBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    private static (CompactSubject, string) SkillParts(
+        IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
         var name = ToolDisplayFormatters.Argument(args, "name") ?? facts?.SkillName ?? "?";
-        return $"[bold]{Markup.Escape(name)}[/]";
+        return (CompactSubject.Bold(name), string.Empty);
     }
 
-    private static string SkillsBody(ToolCallFacts? facts) =>
-        facts?.SkillCount is { } n ? $"{n} available" : "? available";
+    private static (CompactSubject, string) SkillsParts(ToolCallFacts? facts) =>
+        (CompactSubject.Plain(string.Empty), facts?.SkillCount is { } n ? $"{n} available" : "? available");
 
-    private string GlobBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    private static (CompactSubject, string) GlobParts(
+        IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
-        var pattern = ToolDisplayFormatters.Clip(ToolDisplayFormatters.Argument(args, "pattern"), 30);
         var count = facts?.MatchCount is { } n ? $"{n:n0} matches" : "? matches";
-        return $"{pattern} · {count}";
+        return (CompactSubject.Bold(ToolDisplayFormatters.Argument(args, "pattern") ?? "?"), count);
     }
 
-    private string GrepBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    private static (CompactSubject, string) GrepParts(
+        IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
     {
-        var pattern = ToolDisplayFormatters.Clip(ToolDisplayFormatters.Argument(args, "pattern"), 30);
+        var pattern = ToolDisplayFormatters.Argument(args, "pattern") ?? "?";
         var include = ToolDisplayFormatters.Argument(args, "include");
-        var includeText = string.IsNullOrEmpty(include) ? string.Empty : $" [dim]{ToolDisplayFormatters.Clip(include, 16)}[/]";
+        var subject = string.IsNullOrEmpty(include) ? pattern : $"{pattern}  {include}";
         var count = facts?.MatchCount is { } m ? $"{m:n0} matches" : "? matches";
         var files = facts?.FileCount is { } f ? $" in {f:n0} files" : string.Empty;
-        return $"{pattern}{includeText} · {count}{files}";
+        return (CompactSubject.Bold(subject), $"{count}{files}");
     }
 
-    private string GenericBody(ToolCallUpdate detail)
+    private static (CompactSubject, string) GenericParts(ToolCallUpdate detail)
     {
         var parts = detail.Arguments.Take(3)
-            .Select(a => $"{Markup.Escape(a.Key)}={ToolDisplayFormatters.Clip(a.Value?.ToString(), 24)}");
-        return string.Join(", ", parts);
+            .Select(a => $"{a.Key}={a.Value?.ToString()}");
+        return (CompactSubject.Plain(string.Join(", ", parts)), string.Empty);
     }
 
     private static string Label(string name) => name switch
