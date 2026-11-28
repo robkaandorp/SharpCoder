@@ -124,6 +124,62 @@ public sealed class WebToolRendererTests
         Assert.True(OllamaWebTools.MinimumDisplayBytes >= 26);
     }
 
+    [Fact]
+    public void Search_BothNotices_RetainsOmissionFirstAndTruncatedLastWithContent()
+    {
+        const string title = "Title: T";
+        var cap = Encoding.UTF8.GetByteCount(title + "\n\nRESULTS-OMITTED\n\nTRUNCATED");
+        Assert.Equal(title + "\n\nRESULTS-OMITTED\n\nTRUNCATED", WebToolRenderer.Search([Row], true, cap));
+    }
+
+    [Fact]
+    public void Fetch_MultibyteOneByteShort_DropsWholeLineWithoutSplittingUtf8()
+    {
+        const string full = "Title: é\nContent: C";
+        var cap = Encoding.UTF8.GetByteCount(full);
+        Assert.Equal(full, Fetch("é", "C", [], displayBytes: cap));
+        Assert.Equal("Title: é\n\nTRUNCATED", Fetch("é", "C", [], displayBytes: cap - 1));
+    }
+
+    [Fact]
+    public void Fetch_ByteCap_JoiningLfAlsoRequiresCapacity()
+    {
+        const string full = "Title: T\nContent: ";
+        var cap = Encoding.UTF8.GetByteCount(full);
+        Assert.Equal(full, Fetch("T", "", [], displayBytes: cap));
+        Assert.Equal("Title: T\n\nTRUNCATED", Fetch("T", "", [], displayBytes: cap - 1));
+    }
+
+    [Fact]
+    public void LiteralTable_IsExhaustiveAndMinimumIsExactMaximum()
+    {
+        var expected = new[]
+        {
+            WebToolErrorMessages.Validation,
+            WebToolErrorMessages.CredentialUnavailable,
+            WebToolErrorMessages.HttpFailure,
+            WebToolErrorMessages.TransportFailure,
+            WebToolErrorMessages.MalformedResponse,
+            WebToolErrorMessages.ResponseTooLarge,
+            WebToolErrorMessages.Timeout,
+            "Tool request failed.",
+            "Unexpected tool failure.",
+            "Tool output transformation failed.",
+            "No results found.",
+            "Empty page.",
+            "Title: ",
+            "Content: ",
+            "Links:",
+            "URL: ",
+            "RESULTS-OMITTED",
+            "TRUNCATED",
+            "RESULTS-OMITTED\n\nTRUNCATED",
+        };
+        Assert.Equal(expected.OrderBy(x => x, StringComparer.Ordinal),
+            WebToolDisplayLiterals.All.OrderBy(x => x, StringComparer.Ordinal));
+        Assert.Equal(expected.Max(Encoding.UTF8.GetByteCount), WebToolDisplayLiterals.MinimumDisplayBytes);
+    }
+
     private static string Fetch(
         string title,
         string content,

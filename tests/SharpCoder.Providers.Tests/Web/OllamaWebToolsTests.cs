@@ -45,14 +45,17 @@ public sealed class OllamaWebToolsTests
     }
 
     [Theory]
+    [InlineData(null, 5)]
     [InlineData(0, 1)]
     [InlineData(-4, 1)]
     [InlineData(99, 10)]
-    public async Task Search_CountRules_SelectAndRequestClampedValues(int requested, int expected)
+    public async Task Search_CountRules_SelectAndRequestClampedValues(int? requested, int expected)
     {
         var handler = SearchOk();
         var tools = Tools(handler);
-        Assert.Equal("No results found.", await tools.SearchAsync("q", requested, TestContext.Current.CancellationToken));
+        Assert.Equal("No results found.", requested is null
+            ? await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken)
+            : await tools.SearchAsync("q", requested.Value, TestContext.Current.CancellationToken));
         Assert.Equal(expected, JsonDocument.Parse(handler.Requests[0].Body).RootElement.GetProperty("max_results").GetInt32());
     }
 
@@ -82,6 +85,9 @@ public sealed class OllamaWebToolsTests
         Assert.EndsWith("😀", snippet, StringComparison.Ordinal);
         Assert.DoesNotContain(SecretSentinel, snippet, StringComparison.Ordinal);
         Assert.Equal(input, Assert.Single(seen, value => value.Contains(SecretSentinel, StringComparison.Ordinal)));
+        var control = await Tools(SearchOk("[{\"title\":\"T\",\"url\":\"U\",\"content\":\"" + new string('B', 501) + "\"}]"))
+            .SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.EndsWith("Content: " + new string('B', 500), control, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -112,16 +118,59 @@ public sealed class OllamaWebToolsTests
         Assert.EndsWith("\nTRUNCATED", output, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task Fetch_NonpositiveLines_ReturnsValidationWithoutTransport()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task Fetch_NonpositiveLines_ReturnsValidationWithoutCredentialOrTransport(int requested)
     {
         var handler = FetchOk();
         var seen = new List<string>();
-        var tools = Tools(handler, (value, _) => { seen.Add(value); return Task.FromResult<string?>(value); });
+        var accessorCalls = 0;
+        var tools = Tools(handler, (value, _) => { seen.Add(value); return Task.FromResult<string?>(value); },
+            accessor: () => { accessorCalls++; return Credential; });
         Assert.Equal(WebToolErrorMessages.Validation,
-            await tools.FetchAsync("https://page.example.test", 0, TestContext.Current.CancellationToken));
+            await tools.FetchAsync("https://page.example.test", requested, TestContext.Current.CancellationToken));
         Assert.Equal(0, handler.SendCount);
+        Assert.Equal(0, accessorCalls);
         Assert.Equal(WebToolErrorMessages.Validation, Assert.Single(seen));
+    }
+
+    [Fact]
+    public async Task Fetch_ExplicitAboveHostCap_UsesHostCapRatherThanGlobalMaximum()
+    {
+        var content = string.Join("\\n", Enumerable.Range(0, 20));
+        var tools = Tools(FetchOk("{\"title\":\"T\",\"content\":\"" + content + "\"}"), maxFetchLines: 7);
+        var output = await tools.FetchAsync("https://page.example.test", 999, TestContext.Current.CancellationToken);
+        Assert.Equal(7, output.Split('\n').Length);
+        Assert.Equal("Title: T\nContent: 0\n1\n2\n3\n\nTRUNCATED", output);
+    }
+
+    [Fact]
+    public async Task BackendInputs_AreSentBeforeTransform_WithViableQueryAndUrlControls()
+    {
+        var search = SearchOk("[{\"title\":\"T\"}]");
+        var searchTransformCalls = 0;
+        var searchTools = Tools(search, (value, _) =>
+        {
+            searchTransformCalls++;
+            Assert.Equal(1, search.SendCount);
+            return Task.FromResult<string?>(value);
+        });
+        await searchTools.SearchAsync("query+with spaces", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal("query+with spaces", JsonDocument.Parse(search.Requests[0].Body).RootElement.GetProperty("query").GetString());
+        Assert.Equal(3, searchTransformCalls);
+
+        var fetch = FetchOk("{\"title\":\"T\"}");
+        var fetchTransformCalls = 0;
+        var fetchTools = Tools(fetch, (value, _) =>
+        {
+            fetchTransformCalls++;
+            Assert.Equal(1, fetch.SendCount);
+            return Task.FromResult<string?>(value);
+        });
+        await fetchTools.FetchAsync("https://page.example.test/a b?q=x y", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal("https://page.example.test/a b?q=x y", JsonDocument.Parse(fetch.Requests[0].Body).RootElement.GetProperty("url").GetString());
+        Assert.Equal(2, fetchTransformCalls);
     }
 
     [Fact]
@@ -202,6 +251,22 @@ public sealed class OllamaWebToolsTests
         Assert.DoesNotContain(SecretSentinel, output, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task TypedFailure_CallerCancellationAfterThrowingTransform_PropagatesCallerToken()
+    {
+        using var caller = new CancellationTokenSource();
+        // Cancel after the awaited callback yields, then throw: the caller check must follow the catch.
+        var tools = Tools(SearchOk(), async (_, _) =>
+        {
+            await Task.Yield();
+            caller.Cancel();
+            throw new InvalidOperationException(SecretSentinel);
+        }, accessor: () => null);
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            tools.SearchAsync("q", cancellationToken: caller.Token));
+        Assert.Equal(caller.Token, thrown.CancellationToken);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -258,6 +323,30 @@ public sealed class OllamaWebToolsTests
         }
     }
 
+    [Theory]
+    [InlineData("cancel-null")]
+    [InlineData("cancel-throw")]
+    [InlineData("throw-cancel")]
+    public async Task CallerCancellation_WinsAcrossAwaitedTransformOutcomes(string outcome)
+    {
+        using var caller = new CancellationTokenSource();
+        var tools = Tools(SearchOk(), async (_, _) =>
+        {
+            await Task.Yield();
+            if (outcome == "throw-cancel")
+            {
+                caller.Cancel();
+                throw new InvalidOperationException(SecretSentinel);
+            }
+            caller.Cancel();
+            if (outcome == "cancel-throw") throw new InvalidOperationException(SecretSentinel);
+            return null;
+        });
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            tools.SearchAsync("q", cancellationToken: caller.Token));
+        Assert.Equal(caller.Token, thrown.CancellationToken);
+    }
+
     [Fact]
     public void Tools_AreFactoryBuiltWithExactNames_AndDirectMethodsRemainIndependent()
     {
@@ -265,6 +354,113 @@ public sealed class OllamaWebToolsTests
         Assert.Equal(new[] { "web_search", "web_fetch" }, tools.Tools.Select(t => t.Name));
         Assert.All(tools.Tools, t => Assert.IsAssignableFrom<AIFunction>(t));
         Assert.All(tools.Tools, t => Assert.Equal(JsonValueKind.Object, Assert.IsAssignableFrom<AIFunction>(t).JsonSchema.ValueKind));
+    }
+
+    [Theory]
+    [InlineData("empty")]
+    [InlineData("whitespace")]
+    public async Task TypedFailure_EmptyOrWhitespaceTransform_ReturnsFixedFallback(string outcome)
+    {
+        var tools = Tools(SearchOk(), (_, _) => Task.FromResult<string?>(outcome == "empty" ? "" : " \r\n\t"),
+            accessor: () => null);
+        Assert.Equal("Tool request failed.",
+            await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TypedFailure_NullOrThrowTransform_ReturnsFallbackOnceWithoutRawDiagnostic(bool throwing)
+    {
+        var calls = 0;
+        var tools = Tools(FailureHandler(WebToolErrorKind.HttpFailure), (value, _) =>
+        {
+            calls++;
+            Assert.Equal(WebToolErrorMessages.HttpFailure, value);
+            return throwing ? throw new InvalidOperationException(SecretSentinel) : Task.FromResult<string?>(null);
+        });
+        var output = await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(WebToolDisplayLiterals.TransformFailure, output);
+        Assert.Equal(1, calls);
+        Assert.DoesNotContain(SecretSentinel, output, StringComparison.Ordinal);
+        Assert.True(Encoding.UTF8.GetByteCount(output) <= OllamaWebTools.MinimumDisplayBytes);
+    }
+
+    [Fact]
+    public async Task HttpFailure_ReasonPhraseBodyAndCredential_NeverReachTransformOrOutput()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.BadGateway)
+        {
+            ReasonPhrase = SecretSentinel + "-REASON",
+            Content = new StringContent(SecretSentinel + "-BODY"),
+        };
+        var handler = RecordingWebHandler.With(HttpStatusCode.BadGateway, response.Content);
+        // Install the actual reason phrase through a factory so the adapter receives it verbatim.
+        handler.ResponseFactory = _ => response;
+        var seen = new List<string>();
+        var tools = Tools(handler, (value, _) => { seen.Add(value); return Task.FromResult<string?>(value); },
+            accessor: () => SecretSentinel + "-CREDENTIAL");
+        var output = await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(WebToolErrorMessages.HttpFailure, output);
+        Assert.Equal(WebToolErrorMessages.HttpFailure, Assert.Single(seen));
+        Assert.DoesNotContain(SecretSentinel, output, StringComparison.Ordinal);
+        Assert.DoesNotContain(SecretSentinel, seen.Single(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Search_AllOrdinaryFieldsRedacted_RetainsNormalGrammar()
+    {
+        var tools = Tools(SearchOk("[{\"title\":\"T\",\"url\":\"U\",\"content\":\"C\"}]"),
+            (_, _) => Task.FromResult<string?>(string.Empty));
+        Assert.Equal("Title: \nURL: \nContent: ",
+            await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task Fetch_MultilineTransformedFieldsAndLinks_PreserveExactGrammar()
+    {
+        var tools = Tools(FetchOk("{\"title\":\"t\",\"content\":\"c\",\"links\":[\"l\"]}"), (value, _) =>
+            Task.FromResult<string?>(value switch { "t" => "T\r\nT2\rT3", "c" => "C\n", _ => "L1\rL2" }));
+        Assert.Equal("Title: T\nT2\nT3\nContent: C\n\nLinks:\nL1\nL2",
+            await tools.FetchAsync("https://page.example.test", cancellationToken: TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task StructuralEmptyPage_MissingFields_TransformsFixedEmptyPageMessage()
+    {
+        var seen = new List<string>();
+        var tools = Tools(FetchOk("{}"), (value, _) => { seen.Add(value); return Task.FromResult<string?>("redacted page"); });
+        Assert.Equal("redacted page", await tools.FetchAsync("https://page.example.test", cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(WebToolDisplayLiterals.EmptyPage, Assert.Single(seen));
+    }
+
+    [Fact]
+    public async Task SuccessfulNoResults_TransformsFixedMessage_AndSupportsMultilineOutput()
+    {
+        var seen = new List<string>();
+        var tools = Tools(SearchOk(), (value, _) => { seen.Add(value); return Task.FromResult<string?>("none\r\nreally"); });
+        Assert.Equal("none\nreally", await tools.SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(WebToolDisplayLiterals.NoResults, Assert.Single(seen));
+    }
+
+    [Fact]
+    public async Task LateTransformNullOrThrow_AfterAllPriorFieldsTransformed_DiscardsPartialOutput()
+    {
+        foreach (var throwing in new[] { false, true })
+        {
+            var seen = new List<string>();
+            var tools = Tools(FetchOk("{\"title\":\"T\",\"content\":\"C\",\"links\":[\"L1\",\"L2\"]}"), (value, _) =>
+            {
+                seen.Add(value);
+                if (value == "L2") return throwing
+                    ? throw new InvalidOperationException(SecretSentinel)
+                    : Task.FromResult<string?>(null);
+                return Task.FromResult<string?>(new string('é', 100));
+            }, displayBytes: 40);
+            Assert.Equal(WebToolDisplayLiterals.TransformFailure,
+                await tools.FetchAsync("https://page.example.test", cancellationToken: TestContext.Current.CancellationToken));
+            Assert.Equal(new[] { "T", "C", "L1", "L2" }, seen);
+        }
     }
 
     private static OllamaWebToolsOptions ValidOptions(int? displayBytes = null, int maxFetchLines = 1000) => new()
