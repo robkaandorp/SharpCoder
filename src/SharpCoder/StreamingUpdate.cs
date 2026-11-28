@@ -60,6 +60,13 @@ public sealed class ToolCallUpdate
 
     /// <summary>Wall-clock duration of the invocation.</summary>
     public TimeSpan Elapsed { get; set; }
+
+    /// <summary>
+    /// Optional tool-specific metrics (line ranges, character counts, exit code, timeout, match
+    /// counts) published by built-in tools as structured data. Null for custom tools or when the
+    /// tool reported nothing. Hosts should use these instead of scraping <see cref="Result"/>.
+    /// </summary>
+    public ToolCallFacts? Facts { get; set; }
 }
 
 /// <summary>Progress detail for a model round in a streaming execution.</summary>

@@ -40,6 +40,7 @@ public sealed class SkillTools
         try
         {
             var content = await File.ReadAllTextAsync(skillFile, ct);
+            ToolCallMetrics.Publish(new ToolCallFacts { SkillName = name });
             return $"Loaded skill '{name}':\n\n{content}";
         }
         catch (Exception ex)
@@ -54,6 +55,9 @@ public sealed class SkillTools
     [Description("Lists all available skills in the project.")]
     public Task<string> list_skills(CancellationToken ct = default)
     {
+        var skillsDir = Path.Combine(_workingDirectory, ".github", "skills");
+        var count = Directory.Exists(skillsDir) ? EnumerateSkillEntries(skillsDir).Count : 0;
+        ToolCallMetrics.Publish(new ToolCallFacts { SkillCount = count });
         return Task.FromResult(ListSkillsSummary() ?? "No skills found.");
     }
 

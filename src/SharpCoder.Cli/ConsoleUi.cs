@@ -35,8 +35,22 @@ public sealed class ConsoleUi
     /// <summary>How assistant markdown is rendered. Set by the caller from <c>--markdown</c>.</summary>
     public MarkdownMode MarkdownMode { get; set; } = MarkdownMode.Auto;
 
-    /// <summary>When true, structured tool results are printed in full rather than one truncated line.</summary>
-    public bool VerboseToolResults { get; set; }
+    /// <summary>
+    /// How tool calls are displayed: compact one-liners (default) or full panels. Controlled by
+    /// <c>/verbose</c> and <c>--verbose</c>. Kept as a separate property so the mode can be set
+    /// without implying anything about result truncation.
+    /// </summary>
+    public ToolDisplayMode ToolDisplay { get; set; } = ToolDisplayMode.Compact;
+
+    /// <summary>
+    /// Compatibility shim over <see cref="ToolDisplay"/>: the old <c>--verbose</c> flag now selects
+    /// the full panel display. Existing callers/tests that set it keep working.
+    /// </summary>
+    public bool VerboseToolResults
+    {
+        get => ToolDisplay == ToolDisplayMode.Verbose;
+        set => ToolDisplay = value ? ToolDisplayMode.Verbose : ToolDisplayMode.Compact;
+    }
 
     /// <summary>
     /// Console used for rendered widgets such as the startup configuration table. Defaults to
@@ -86,7 +100,8 @@ public sealed class ConsoleUi
         SharpCoder.ShellPreference shell,
         string? savePath,
         string? resolvedShell = null,
-        double? compactionThreshold = null)
+        double? compactionThreshold = null,
+        int? bashTimeoutMs = null)
     {
         // Read the library's real default instead of duplicating a magic 0.8 here. Callers may
         // pass the effective value when they have one (e.g. the factory's AgentOptions instance).
@@ -104,6 +119,10 @@ public sealed class ConsoleUi
         table.AddRow("Bash tool", enableBash
             ? $"[{Warn}]enabled[/] [dim](the agent can run arbitrary shell commands)[/]"
             : "[dim]disabled[/]");
+        var effectiveTimeout = bashTimeoutMs ?? new SharpCoder.AgentOptions().BashTimeoutMs;
+        table.AddRow("Bash timeout",
+            $"[dim]{Markup.Escape(ToolDisplayFormatters.Timeout(effectiveTimeout))}" +
+            (bashTimeoutMs is null ? " (default)" : string.Empty) + "[/]");
         table.AddRow("File writes", readOnly
             ? "[dim]disabled (--read-only)[/]"
             : $"[{Warn}]enabled[/] [dim](write_file/edit_file run without confirmation)[/]");
@@ -153,7 +172,7 @@ public sealed class ConsoleUi
         var receivedText = false;
         var writer = new StreamingMarkdownWriter(RenderConsole, MarkdownMode);
         var toolRenderer = new StructuredToolCallRenderer(
-            RenderConsole, VerboseToolResults, writer.EffectiveMode == MarkdownMode.Raw);
+            RenderConsole, ToolDisplay, writer.EffectiveMode == MarkdownMode.Raw);
         var structuredSeen = false;
         var expectingLegacyResultLine = false;
         AgentResult? result = null;
@@ -275,7 +294,7 @@ public sealed class ConsoleUi
         table.AddRow("/save [[path]]", "Save the session (defaults to --save path)");
         table.AddRow("/session", "Show session statistics");
         table.AddRow("/markdown [[mode]]", "Show or set markdown rendering (auto, live, full, raw)");
-        table.AddRow("/verbose [[on|off]]", "Show or set full tool-result rendering");
+        table.AddRow("/verbose [[on|off]]", "Show or set tool display: compact one-liners (default) or full panels");
         table.AddRow("/clear", "Clear the screen");
         table.AddRow("/exit, /quit", "Save (if --save) and exit");
         AnsiConsole.Write(table);

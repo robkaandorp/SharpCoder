@@ -478,7 +478,7 @@ dotnet run --project src/SharpCoder.Cli -- \
 dotnet run --project src/SharpCoder.Cli
 ```
 
-In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--confirm-tools auto|always|never` (or `-y`/`--yes`) to control consent prompts for write and bash tools, `--verbose` (or `/verbose`) for full tool results, `--no-env-context` to skip the startup environment snapshot, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
+In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--confirm-tools auto|always|never` (or `-y`/`--yes`) to control consent prompts for write and bash tools, `--verbose` (or `/verbose`) for full tool-call panels, `--bash-timeout <ms>` for the default bash timeout, `--no-env-context` to skip the startup environment snapshot, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
 
 #### REPL commands
 
@@ -488,7 +488,7 @@ In interactive mode the banner is followed by a prompt; `/help` lists the slash 
 | `/save [path]` | Save the session (defaults to the `--save` path). Reports the path it wrote |
 | `/session` | Show session statistics: id, message/tool/token counts, context window and compaction point |
 | `/markdown [mode]` | Show or set markdown rendering (`auto`, `live`, `full`, `raw`) |
-| `/verbose [on\|off]` | Show or set full tool-result rendering |
+| `/verbose [on\|off]` | Show or set tool display: compact one-liners (default) or full panels |
 | `/clear` | Clear the screen (does not clear the conversation history) |
 | `/exit`, `/quit`, `/q` | Save (if `--save`) and exit |
 
@@ -496,7 +496,25 @@ Per-turn autosaves from `--save` are silent; only an explicit `/save` prints a c
 
 ### Structured tool updates
 
-The CLI renders tool calls as distinct terminal lines: a cyan call line with arguments, a result line (red when the tool failed), elapsed time, and a round/step progress line. By default only the first line of a tool result is shown; `--verbose` (or `/verbose on` in the REPL) prints the full, untruncated result, which is useful for build/test logs. When output is redirected (`--markdown raw`), tool annotations are kept off stdout, so `SharpCoder.Cli run "..." > out.txt` contains only the model's text.
+The CLI renders tool calls in two modes, switched with `/verbose [on|off]` (or `--verbose` at startup):
+
+- **Compact** (default) — one line per call (two for bash), driven by structured `ToolCallFacts` rather than by scraping result text. A width-aware path emphasises the filename and elides directories from the left when needed. Examples:
+
+  ```
+  🔧 ✓ Read   …/SharpCoder.Cli/ConsoleUi.cs  138–210 · 4,182 chars · 8 ms
+  🔧 ✓ Write  …/SharpCoder.Cli/Program.cs    1× · −27/+41 chars · 4 ms
+  🔧 ✓ Create …/CHANGELOG.md                2,910 chars · 2 ms
+  🔧 ✓ Grep   FlushPending  *.cs            7 matches in 3 files · 41 ms
+  🔧 ✓ Skill  build                         1 ms
+  🔧 ✓ Bash   2 m timeout (default) · 1.4 s · exit 0
+              dotnet build SharpCoder.slnx --nologo -v q
+  ```
+
+  `read_file` shows the line range and characters read; `edit_file` shows occurrences replaced plus characters removed/added; `glob`/`grep` show match and file counts; `load_skill`/`list_skills` show the skill name or count; bash additionally shows the effective timeout (human-readable, "(default)" when it came from `--bash-timeout`), elapsed time, exit code and the command on a second line. Unknown/custom tools fall back to a generic one-liner. Errors are red with `✗` and the first result line.
+
+- **Verbose** — one Spectre panel per call with all arguments, the full untruncated result, running/success/error status, elapsed time, and a round/step progress line. Useful for build/test logs.
+
+In `--markdown raw` mode (redirected output) neither mode writes anything, so `SharpCoder.Cli run "..." > out.txt` contains only the model's text. The compact/verbose choice applies only to tool-call display; markdown rendering of assistant prose is controlled separately by `--markdown`.
 
 These come from the library's additive `AgentOptions.EmitStructuredToolUpdates` flag. When enabled on the manual streaming tool loop, `CodingAgent` emits `StreamingUpdateKind.ToolCallStarted`, `ToolCallCompleted` and `RoundProgress` updates carrying `ToolCallUpdate` (full arguments, untruncated result, error flag, elapsed time) and `RoundProgressUpdate`. The flag defaults to `false`; the pre-existing markdown text narration is still emitted unchanged, so existing hosts that only read `TextDelta` see exactly the same output:
 

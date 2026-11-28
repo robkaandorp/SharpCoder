@@ -4,91 +4,245 @@ using Spectre.Console;
 namespace SharpCoder.Cli;
 
 /// <summary>
-/// Renders the structured tool-call updates emitted by <c>CodingAgent</c> as real terminal widgets
-/// (rather than dim one-liners sniffed out of the markdown stream).
+/// Renders structured tool-call updates. Two modes:
+/// <list type="bullet">
+/// <item><b>Compact</b> (default): one line per call (two for bash), driven entirely by
+/// <see cref="ToolCallFacts"/> — never by parsing <see cref="ToolCallUpdate.Result"/> text.</item>
+/// <item><b>Verbose</b>: a Spectre panel per call with arguments, the full result and status.</item>
+/// </list>
+/// Raw mode (redirected output) writes nothing, so stdout stays plain model text.
 /// </summary>
 internal sealed class StructuredToolCallRenderer
 {
     private readonly IAnsiConsole _console;
-    private readonly bool _verbose;
+    private readonly ToolDisplayMode _mode;
     private readonly bool _raw;
+    private readonly int _width;
 
     /// <summary>Number of completed tool calls rendered this turn.</summary>
     public int CompletedCount { get; private set; }
 
-    /// <summary>Creates a renderer.</summary>
-    /// <param name="console">Console to write to.</param>
-    /// <param name="verbose">When true, print full (untruncated, multi-line) tool results.</param>
-    /// <param name="raw">When true, keep output free of ANSI styling (redirected output).</param>
-    public StructuredToolCallRenderer(IAnsiConsole console, bool verbose, bool raw)
+    public StructuredToolCallRenderer(IAnsiConsole console, ToolDisplayMode mode, bool raw)
     {
         _console = console;
-        _verbose = verbose;
+        _mode = mode;
         _raw = raw;
+        _width = Math.Max(40, console.Profile.Width);
     }
 
+    /// <summary>Compact mode emits nothing at start; verbose shows an in-flight panel shell.</summary>
     public void Started(ToolCallUpdate detail)
     {
-        var args = FormatArguments(detail.Arguments);
-        Write($"  🔧 {detail.Name}({args})", started: true);
+        if (_raw || _mode == ToolDisplayMode.Compact)
+            return;
+
+        _console.MarkupLine($"[dim]⏳ {Markup.Escape(detail.Name)} — running…[/]");
     }
 
     public void Finished(ToolCallUpdate detail)
     {
         CompletedCount++;
-        var result = detail.Result ?? "(no result)";
-        if (_verbose)
-        {
-            Write("  ↳ result:", started: false);
-            foreach (var line in result.Replace("\r\n", "\n").Split('\n'))
-                Write("    " + line, started: false, plain: true);
-        }
-        else
-        {
-            var firstLine = result.Replace("\r\n", "\n").Split('\n')[0];
-            if (firstLine.Length > 160) firstLine = firstLine[..159] + "…";
-            Write($"  ↳ {firstLine}", started: false, error: detail.IsError);
-        }
-
-        if (detail.IsError && !_verbose)
-            Write("    (tool reported an error)", started: false, error: true);
-        Write($"  ⏱ {detail.Elapsed.TotalMilliseconds:n0} ms", started: false);
-    }
-
-    public void Progress(RoundProgressUpdate progress)
-    {
-        Write($"  … round {progress.Round + 1}, {progress.ToolCallsSoFar}/{progress.MaxSteps} steps", started: false);
-    }
-
-    private static string FormatArguments(IReadOnlyDictionary<string, object?> arguments)
-    {
-        if (arguments.Count == 0) return string.Empty;
-        var parts = arguments.Select(a =>
-        {
-            var value = a.Value?.ToString() ?? "null";
-            if (value.Length > 80) value = value[..79] + "…";
-            return $"{a.Key}={value}";
-        });
-        var joined = string.Join(", ", parts);
-        return joined.Length > 200 ? joined[..199] + "…" : joined;
-    }
-
-    private void Write(string text, bool started, bool error = false, bool plain = false)
-    {
         if (_raw)
+            return;
+
+        if (_mode == ToolDisplayMode.Verbose)
         {
-            // In raw mode keep annotations off stdout entirely — they are not model text.
+            RenderPanel(detail);
             return;
         }
 
-        var escaped = Markup.Escape(text);
-        if (plain)
-            _console.MarkupLine($"[dim]{escaped}[/]");
-        else if (error)
-            _console.MarkupLine($"[red]{escaped}[/]");
-        else if (started)
-            _console.MarkupLine($"[cyan]{escaped}[/]");
+        RenderCompact(detail);
+    }
+
+    /// <summary>Round progress is suppressed in compact mode.</summary>
+    public void Progress(RoundProgressUpdate progress)
+    {
+        if (_raw || _mode == ToolDisplayMode.Compact)
+            return;
+        _console.MarkupLine($"[dim]  … round {progress.Round + 1}, {progress.ToolCallsSoFar}/{progress.MaxSteps} steps[/]");
+    }
+
+    // ---------------------------------------------------------------- compact
+
+    private void RenderCompact(ToolCallUpdate detail)
+    {
+        var status = detail.IsError ? "[red]✗[/]" : "[green]✓[/]";
+        var label = Label(detail.Name);
+        var facts = detail.Facts;
+        var args = detail.Arguments;
+        var body = detail.Name switch
+        {
+            "read_file" => ReadFileBody(args, facts),
+            "edit_file" => EditFileBody(args, facts),
+            "write_file" => WriteFileBody(args, facts),
+            "load_skill" => SkillBody(args, facts),
+            "list_skills" => SkillsBody(facts),
+            "glob" => GlobBody(args, facts),
+            "grep" => GrepBody(args, facts),
+            "execute_bash_command" => string.Empty, // handled as a two-line case below
+            _ => GenericBody(detail),
+        };
+
+        var elapsed = ToolDisplayFormatters.Duration(detail.Elapsed);
+
+        if (detail.Name == "execute_bash_command")
+        {
+            RenderBash(detail, status, label, facts, args, elapsed);
+            return;
+        }
+
+        var suffix = string.IsNullOrEmpty(body) ? elapsed : $"{body} · {elapsed}";
+        _console.MarkupLine($"  🔧 {status} [cyan]{label}[/]  {suffix}");
+    }
+
+    private void RenderBash(ToolCallUpdate detail, string status, string label,
+        ToolCallFacts? facts, IReadOnlyDictionary<string, object?> args, string elapsed)
+    {
+        var timeout = facts?.TimeoutMs is { } ms
+            ? ToolDisplayFormatters.Timeout(ms) + (facts.TimeoutIsDefault == true ? " (default)" : string.Empty)
+            : "unknown";
+        var exit = facts?.TimedOut == true
+            ? "[red]timed out[/]"
+            : facts?.ExitCode is { } code
+                ? (code == 0 ? "[green]exit 0[/]" : $"[red]exit {code}[/]")
+                : "[dim]exit ?[/]";
+        var command = ToolDisplayFormatters.Argument(args, "command");
+        var commandWidth = Math.Max(20, _width - 14);
+
+        _console.MarkupLine($"  🔧 {status} [cyan]{label}[/]  ⏱ {Markup.Escape(timeout)} timeout · {Markup.Escape(elapsed)} · {exit}");
+        if (!string.IsNullOrWhiteSpace(command))
+            _console.MarkupLine($"     [dim]{ToolDisplayFormatters.Clip(command, commandWidth)}[/]");
+    }
+
+    private string ReadFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
+        var range = facts?.StartLine is { } start && facts.EndLine is { } end
+            ? $"{start}–{end}"
+            : "?";
+        var chars = facts?.CharactersRead is { } n ? $"{n:n0} chars" : "? chars";
+        return $"{path}  {range} · {chars}";
+    }
+
+    private string EditFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
+        var occurrences = facts?.OccurrencesReplaced is { } n ? $"{n}×" : "?×";
+        var removed = facts?.CharactersRemoved is { } r ? $"−{r:n0}" : "−?";
+        var added = facts?.CharactersAdded is { } a ? $"+{a:n0}" : "+?";
+        return $"{path}  {occurrences} · {removed}/{added} chars";
+    }
+
+    private string WriteFileBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var path = ToolDisplayFormatters.CompactPath(ToolDisplayFormatters.Argument(args, "filePath"), _width - 45);
+        var chars = facts?.CharactersWritten is { } n ? $"{n:n0} chars" : "? chars";
+        return $"{path}  {chars}";
+    }
+
+    private string SkillBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var name = ToolDisplayFormatters.Argument(args, "name") ?? facts?.SkillName ?? "?";
+        return $"[bold]{Markup.Escape(name)}[/]";
+    }
+
+    private static string SkillsBody(ToolCallFacts? facts) =>
+        facts?.SkillCount is { } n ? $"{n} available" : "? available";
+
+    private string GlobBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var pattern = ToolDisplayFormatters.Clip(ToolDisplayFormatters.Argument(args, "pattern"), 30);
+        var count = facts?.MatchCount is { } n ? $"{n:n0} matches" : "? matches";
+        return $"{pattern} · {count}";
+    }
+
+    private string GrepBody(IReadOnlyDictionary<string, object?> args, ToolCallFacts? facts)
+    {
+        var pattern = ToolDisplayFormatters.Clip(ToolDisplayFormatters.Argument(args, "pattern"), 30);
+        var include = ToolDisplayFormatters.Argument(args, "include");
+        var includeText = string.IsNullOrEmpty(include) ? string.Empty : $" [dim]{ToolDisplayFormatters.Clip(include, 16)}[/]";
+        var count = facts?.MatchCount is { } m ? $"{m:n0} matches" : "? matches";
+        var files = facts?.FileCount is { } f ? $" in {f:n0} files" : string.Empty;
+        return $"{pattern}{includeText} · {count}{files}";
+    }
+
+    private string GenericBody(ToolCallUpdate detail)
+    {
+        var parts = detail.Arguments.Take(3)
+            .Select(a => $"{Markup.Escape(a.Key)}={ToolDisplayFormatters.Clip(a.Value?.ToString(), 24)}");
+        return string.Join(", ", parts);
+    }
+
+    private static string Label(string name) => name switch
+    {
+        "read_file" => "Read",
+        "edit_file" => "Edit",
+        "write_file" => "Write",
+        "load_skill" => "Skill",
+        "list_skills" => "Skills",
+        "glob" => "Glob",
+        "grep" => "Grep",
+        "execute_bash_command" => "Bash",
+        _ => Markup.Escape(name),
+    };
+
+    // ---------------------------------------------------------------- verbose
+
+    private void RenderPanel(ToolCallUpdate detail)
+    {
+        var status = detail.IsError ? "[red]✗ error[/]" : "[green]✓ ok[/]";
+        var elapsed = ToolDisplayFormatters.Duration(detail.Elapsed);
+        var grid = new Grid().AddColumn();
+
+        grid.AddRow(new Markup($"[dim]ARGUMENTS[/]"));
+        if (detail.Arguments.Count == 0)
+        {
+            grid.AddRow(new Markup("  [dim](none)[/]"));
+        }
         else
-            _console.MarkupLine($"[dim]{escaped}[/]");
+        {
+            foreach (var (key, value) in detail.Arguments)
+            {
+                var text = value?.ToString() ?? "(null)";
+                if (text.Length > 600) text = text[..599] + "…";
+                foreach (var line in text.Replace("\r\n", "\n").Split('\n').Take(8))
+                    grid.AddRow(new Markup($"  [dim]{Markup.Escape(key)}:[/] {Markup.Escape(line)}"));
+            }
+        }
+
+        if (detail.Facts is { } facts)
+        {
+            var metrics = new List<string>();
+            if (facts.StartLine is { } s && facts.EndLine is { } e) metrics.Add($"lines {s}–{e}");
+            if (facts.CharactersRead is { } cr) metrics.Add($"{cr:n0} chars read");
+            if (facts.OccurrencesReplaced is { } o) metrics.Add($"{o}× replaced");
+            if (facts.CharactersRemoved is { } r) metrics.Add($"−{r:n0} chars");
+            if (facts.CharactersAdded is { } a) metrics.Add($"+{a:n0} chars");
+            if (facts.CharactersWritten is { } w) metrics.Add($"{w:n0} chars written");
+            if (facts.MatchCount is { } m) metrics.Add($"{m:n0} matches");
+            if (facts.FileCount is { } f) metrics.Add($"{f:n0} files");
+            if (facts.SkillCount is { } sc) metrics.Add($"{sc:n0} skills");
+            if (facts.TimeoutMs is { } t) metrics.Add($"timeout {ToolDisplayFormatters.Timeout(t)}{(facts.TimeoutIsDefault == true ? " (default)" : string.Empty)}");
+            if (facts.ExitCode is { } ec) metrics.Add($"exit {ec}");
+            if (metrics.Count > 0)
+                grid.AddRow(new Markup($"  [dim]{Markup.Escape(string.Join(" · ", metrics))}[/]"));
+        }
+
+        grid.AddRow(new Markup("[dim]RESULT[/]"));
+        var result = detail.Result ?? "(no result)";
+        var resultLines = result.Replace("\r\n", "\n").Split('\n');
+        foreach (var line in resultLines.Take(40))
+            grid.AddRow(new Markup("  " + Markup.Escape(line)));
+        if (resultLines.Length > 40)
+            grid.AddRow(new Markup($"  [dim]… {resultLines.Length - 40} more lines[/]"));
+
+        var panel = new Panel(grid)
+        {
+            Header = new PanelHeader($" 🔧 {Label(detail.Name)}  {status}  {Markup.Escape(elapsed)} "),
+            Border = BoxBorder.Rounded,
+            BorderStyle = new Style(detail.IsError ? Color.Red : Color.Cyan1),
+            Expand = true,
+        };
+        _console.Write(panel);
     }
 }

@@ -70,11 +70,23 @@ public sealed class FileTools
             var result = new StringBuilder();
             result.AppendLine($"[file: {lineEnding} line endings, UTF-8{(hadBom ? " with BOM" : string.Empty)}, {lines.Length} line(s)]");
 
+            // Publish the exact metrics as structured data rather than leaving hosts to scrape the
+            // numbered rendering below. charactersRead is the raw content length (excluding the
+            // "N: " prefixes and the header), so it matches what the model actually received.
+            long charactersRead = 0;
             for (var i = 0; i < count && startIndex + i < lines.Length; i++)
             {
                 var lineIndex = startIndex + i;
                 result.AppendLine($"{lineIndex + 1}: {lines[lineIndex]}");
+                charactersRead += lines[lineIndex].Length;
             }
+
+            ToolCallMetrics.Publish(new ToolCallFacts
+            {
+                StartLine = count > 0 ? startIndex + 1 : (int?)null,
+                EndLine = count > 0 ? startIndex + count : (int?)null,
+                CharactersRead = (int)Math.Min(charactersRead, int.MaxValue),
+            });
 
             if (startIndex + count < lines.Length)
             {
@@ -116,6 +128,11 @@ public sealed class FileTools
             var payload = NormalizeLineEndings(content, lineEnding);
             await WriteRawAsync(fullPath, payload, preservedBom, ct);
             _logger.LogDebug("Wrote {Chars} chars to {Path}", payload.Length, filePath);
+            ToolCallMetrics.Publish(new ToolCallFacts
+            {
+                CharactersWritten = payload.Length,
+                CharactersAdded = payload.Length,
+            });
             return $"Successfully wrote {payload.Length} characters to '{filePath}' ({lineEnding} line endings{(preservedBom ? ", UTF-8 BOM preserved" : string.Empty)}).";
         }
         catch (OperationCanceledException) { throw; }
@@ -181,6 +198,15 @@ public sealed class FileTools
             await WriteRawAsync(fullPath, output, hadBom, ct);
             _logger.LogDebug("Edited {Path}: replaced {OldLen} chars with {NewLen} chars at position {Pos}",
                 filePath, needle.Length, replacement.Length, firstIndex);
+            // Metrics are measured on the LF-normalized needle/replacement that was actually
+            // matched, so they are exact even on CRLF files (the on-disk delta can differ by the
+            // line-ending conversion).
+            ToolCallMetrics.Publish(new ToolCallFacts
+            {
+                OccurrencesReplaced = 1,
+                CharactersRemoved = needle.Length,
+                CharactersAdded = replacement.Length,
+            });
             return $"Successfully replaced 1 occurrence of oldString in '{filePath}' ({lineEnding} line endings{(hadBom ? ", UTF-8 BOM preserved" : string.Empty)}).";
         }
         catch (OperationCanceledException) { throw; }
@@ -268,6 +294,7 @@ public sealed class FileTools
                 sb.AppendLine($"... and {files.Length - limit} more.");
             }
 
+            ToolCallMetrics.Publish(new ToolCallFacts { MatchCount = files.Length });
             return sb.ToString();
         }
         catch (Exception ex)
@@ -311,7 +338,8 @@ public sealed class FileTools
 
             var sb = new StringBuilder();
             int matchCount = 0;
-            
+            int fileCount = 0;
+
             foreach (var file in files)
             {
                 ct.ThrowIfCancellationRequested();
@@ -336,6 +364,7 @@ public sealed class FileTools
                             {
                                 sb.AppendLine($"\n{relPath}:");
                                 fileHeaderAdded = true;
+                                fileCount++;
                             }
                             sb.AppendLine($"{i + 1}: {lines[i].Trim()}");
                             matchCount++;
@@ -343,6 +372,7 @@ public sealed class FileTools
                             if (matchCount > 100)
                             {
                                 sb.AppendLine("... too many matches, truncating.");
+                                ToolCallMetrics.Publish(new ToolCallFacts { MatchCount = matchCount, FileCount = fileCount });
                                 return sb.ToString();
                             }
                         }
@@ -355,7 +385,12 @@ public sealed class FileTools
                 }
             }
 
-            if (matchCount == 0) return "No matches found.";
+            if (matchCount == 0)
+            {
+                ToolCallMetrics.Publish(new ToolCallFacts { MatchCount = 0, FileCount = 0 });
+                return "No matches found.";
+            }
+            ToolCallMetrics.Publish(new ToolCallFacts { MatchCount = matchCount, FileCount = fileCount });
             return sb.ToString();
         }
         catch (OperationCanceledException) { throw; }

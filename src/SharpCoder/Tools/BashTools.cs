@@ -530,12 +530,27 @@ public sealed class BashTools
                 throw new OperationCanceledException(ct);
             }
 
+            // Publish the effective timeout (explicit or configured default), whether the default
+            // was used, and the observed exit code as structured data. Hosts must not have to
+            // scrape these out of the transcript text.
+            var timedOutResult = "";
+            int? exitCode = null;
             if (timedOut)
             {
-                return BuildInterruptedResult($"Command timed out after {effectiveTimeoutMs}ms.", outputTask, errorTask, report);
+                timedOutResult = BuildInterruptedResult($"Command timed out after {effectiveTimeoutMs}ms.", outputTask, errorTask, report);
             }
-
-            return BuildCompletedResult(process, outputTask, errorTask, report);
+            else
+            {
+                timedOutResult = BuildCompletedResult(process, outputTask, errorTask, report, out exitCode);
+            }
+            ToolCallMetrics.Publish(new ToolCallFacts
+            {
+                TimeoutMs = effectiveTimeoutMs,
+                TimeoutIsDefault = !timeout_ms.HasValue,
+                ExitCode = exitCode,
+                TimedOut = timedOut,
+            });
+            return timedOutResult;
         }
         catch (OperationCanceledException)
         {
@@ -567,6 +582,11 @@ public sealed class BashTools
             }
 
             _logger.LogWarning("Error executing command: {Message}", ex.Message);
+            ToolCallMetrics.Publish(new ToolCallFacts
+            {
+                TimeoutMs = effectiveTimeoutMs,
+                TimeoutIsDefault = !timeout_ms.HasValue,
+            });
             return BuildInterruptedResult($"Error executing command: {ex.Message}", outputTask, errorTask, report);
         }
         finally
@@ -840,11 +860,12 @@ public sealed class BashTools
         Process process,
         Task<string>? outputTask,
         Task<string>? errorTask,
-        CleanupReport report)
+        CleanupReport report,
+        out int? exitCode)
     {
         var output = CapStreamOutput(CompletedText(outputTask));
         var error = CapStreamOutput(CompletedText(errorTask));
-        var exitCode = TryGetExitCode(process);
+        exitCode = TryGetExitCode(process);
 
         var sb = new StringBuilder();
         if (!string.IsNullOrEmpty(output))

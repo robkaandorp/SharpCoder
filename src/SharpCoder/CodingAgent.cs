@@ -210,7 +210,7 @@ public sealed class CodingAgent : IAsyncDisposable
         {
             _bashTools = new BashTools(
                 options.WorkDirectory,
-                timeoutMs: 120000,
+                timeoutMs: options.BashTimeoutMs,
                 logger: _logger,
                 shellPathOverride: options.BashShellPath,
                 shellArgsFormat: options.BashShellArgsFormat,
@@ -773,15 +773,21 @@ public sealed class CodingAgent : IAsyncDisposable
 
                 // Find and invoke the matching tool
                 var tool = chatOptions.Tools?.OfType<AIFunction>().FirstOrDefault(f => f.Name == fc.Name);
-                object? result;
+                object? result = null;
                 var isError = false;
                 var startedAt = structured ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                ToolCallFacts? facts = null;
                 if (tool != null)
                 {
                     try
                     {
-                        result = await tool.InvokeAsync(
-                            new AIFunctionArguments(fc.Arguments ?? new Dictionary<string, object?>()), ct);
+                        // Built-in tools publish structured metrics into this async-local scope;
+                        // hosts consume ToolCallUpdate.Facts instead of scraping the result text.
+                        var invokeArgs = new AIFunctionArguments(fc.Arguments ?? new Dictionary<string, object?>());
+                        facts = await ToolCallMetrics.CaptureAsync(async () =>
+                        {
+                            result = await tool.InvokeAsync(invokeArgs, ct);
+                        }).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -818,6 +824,7 @@ public sealed class CodingAgent : IAsyncDisposable
                         Result = resultStr,
                         IsError = isError,
                         Elapsed = elapsed,
+                        Facts = facts,
                     });
                 }
 

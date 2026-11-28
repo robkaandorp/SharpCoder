@@ -266,29 +266,29 @@ internal static class Program
         return false;
     }
 
-    /// <summary>Handles /verbose [on|off].</summary>
+    /// <summary>Handles /verbose [on|off]: compact one-liners vs full tool-call panels.</summary>
     private static bool HandleVerboseCommand(string? arg, ConsoleUi ui)
     {
         if (string.IsNullOrWhiteSpace(arg))
         {
-            ui.Info($"verbose tool results: {(ui.VerboseToolResults ? "on" : "off")} (on|off)");
+            ui.Info($"tool display: {(ui.VerboseToolResults ? "verbose" : "compact")} (on|off)");
             return false;
         }
 
         switch (arg.Trim().ToLowerInvariant())
         {
             case "on" or "true" or "yes":
-                ui.VerboseToolResults = true;
+                ui.ToolDisplay = ToolDisplayMode.Verbose;
                 break;
             case "off" or "false" or "no":
-                ui.VerboseToolResults = false;
+                ui.ToolDisplay = ToolDisplayMode.Compact;
                 break;
             default:
                 ui.Error($"unknown verbose setting '{arg}' — use on or off");
                 return false;
         }
 
-        ui.Info($"verbose tool results: {(ui.VerboseToolResults ? "on" : "off")}");
+        ui.Info($"tool display: {(ui.VerboseToolResults ? "verbose (full panels)" : "compact (one line)")}");
         return false;
     }
 

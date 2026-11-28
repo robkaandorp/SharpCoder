@@ -92,6 +92,8 @@ public sealed class AgentFactory : IAsyncDisposable
         agentOptions.MaxContextTokens = _options.ContextTokens ?? CliOptions.DefaultContextTokens;
         if (_options.RetainTokens is { } retainTokens)
             agentOptions.CompactionRetainTokens = retainTokens;
+        if (_options.BashTimeoutMs is { } bashTimeoutMs)
+            agentOptions.BashTimeoutMs = bashTimeoutMs;
 
         _agentOptions = agentOptions;
         _agent = new CodingAgent(_client, agentOptions);
@@ -126,7 +128,8 @@ public sealed class AgentFactory : IAsyncDisposable
             contextTokens: _options.ContextTokens,
             savePath: _options.SavePath,
             resolvedShell: _agent?.ResolvedBashShell,
-            compactionThreshold: _agentOptions?.CompactionThreshold);
+            compactionThreshold: _agentOptions?.CompactionThreshold,
+            bashTimeoutMs: _options.BashTimeoutMs);
 
     public async ValueTask DisposeAsync()
     {

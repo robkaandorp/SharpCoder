@@ -24,6 +24,8 @@ public class RenderStreamStructuredTests
         {
             Name = "write_file",
             CallId = "c1",
+            // CodingAgent includes the argument snapshot on both Started and Finished.
+            Arguments = new Dictionary<string, object?> { ["filePath"] = "a.cs" },
             Result = "wrote 3 lines\nsecond line",
             Elapsed = TimeSpan.FromMilliseconds(4),
         });
@@ -56,15 +58,22 @@ public class RenderStreamStructuredTests
     [Fact]
     public async Task LiveMode_RendersStructuredLinesNotLegacyNarration()
     {
-        var console = new TestConsole { EmitAnsiSequences = false };
+        var console = TestConsoleFactory.Create(width: 160);
         console.Profile.Capabilities.Interactive = true;
-        var ui = new ConsoleUi { MarkdownMode = MarkdownMode.Live, RenderConsole = console };
+        var ui = new ConsoleUi
+        {
+            MarkdownMode = MarkdownMode.Live,
+            ToolDisplay = ToolDisplayMode.Verbose,
+            RenderConsole = console,
+        };
 
         var result = await ui.RenderStreamAsync(Script(TestContext.Current.CancellationToken), TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
         Assert.Contains("write_file", console.Output);
-        Assert.Contains("filePath=a.cs", console.Output);
+        // The verbose panel renders arguments as "key: value" (the old flat line used "key=value").
+        Assert.Contains("filePath:", console.Output);
+        Assert.Contains("a.cs", console.Output);
         Assert.Contains("wrote 3 lines", console.Output);
         Assert.Contains("round 1", console.Output);
         // The legacy narration must not be rendered twice.
@@ -86,7 +95,9 @@ public class RenderStreamStructuredTests
 
         var output = console.Output;
         var before = output.IndexOf("Before.", StringComparison.Ordinal);
-        var toolLine = output.IndexOf("write_file(filePath=a.cs)", StringComparison.Ordinal);
+        // Compact mode is the default: the tool line is now the friendly label + icon,
+        // not the raw `write_file(...)` narration (which is deliberately suppressed).
+        var toolLine = output.IndexOf("🔧", StringComparison.Ordinal);
         var after = output.IndexOf("After.", StringComparison.Ordinal);
 
         Assert.True(before >= 0, "preceding prose must be rendered");

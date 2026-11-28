@@ -90,6 +90,15 @@ public sealed class AgentOptions
     /// </summary>
     public Func<string, string>? BashShellArgsFormat { get; set; }
 
+    /// <summary>
+    /// Default whole-capture timeout for <c>execute_bash_command</c>, in milliseconds. The model can
+    /// still override it per call with <c>timeout_ms</c>. Values less than or equal to zero use
+    /// 120000. Defaults to <c>120000</c>, preserving the previous hard-coded behaviour. The
+    /// effective value (and whether the default was used) is reported in
+    /// <see cref="ToolCallFacts.TimeoutMs"/> / <see cref="ToolCallFacts.TimeoutIsDefault"/>.
+    /// </summary>
+    public int BashTimeoutMs { get; set; } = 120000;
+
     /// <summary>Registers tools for reading files and searching paths and contents. File paths are checked for lexical containment within <see cref="WorkDirectory"/>, but symlinks and reparse points are not resolved, so a workspace link can allow a read or search to reach a file outside the workspace. Defaults to <see langword="true"/>.</summary>
     public bool EnableFileOps { get; set; } = true;
     /// <summary>Registers <c>write_file</c> and <c>edit_file</c> in addition to the read/search tools when <see cref="EnableFileOps"/> is enabled. Defaults to <see langword="true"/>.</summary>

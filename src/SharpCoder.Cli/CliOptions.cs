@@ -67,6 +67,13 @@ public sealed class CliOptions
     /// </summary>
     public SharpCoder.ShellPreference Shell { get; init; } = SharpCoder.ShellPreference.Auto;
 
+    /// <summary>
+    /// Default whole-capture timeout for <c>execute_bash_command</c>, from <c>--bash-timeout</c>
+    /// (milliseconds). Null keeps the library default (120,000 ms). The effective value — including
+    /// the default — is reported by SharpCoder as a structured fact and shown in the compact line.
+    /// </summary>
+    public int? BashTimeoutMs { get; init; }
+
     /// <summary>Reasoning effort for models with extended thinking; <c>null</c> leaves the provider default.</summary>
     public ReasoningEffort? ReasoningEffort { get; init; }
 
@@ -139,7 +146,7 @@ public sealed class CliOptions
                 --reasoning <level>   none | low | medium | high | extra-high (aliases: off, xhigh).
                 --markdown <mode>     auto | live | full | raw. Render assistant output as
                                       markdown (default: auto — live on a terminal, raw when piped).
-                --verbose             Print full tool results instead of a one-line summary.
+                --verbose             Show tool calls as full panels (default: compact one-liners).
                 --bash                Enable the bash tool (off by default; see README security notes).
                 --read-only, --no-writes
                                       Disable write_file/edit_file; the agent can only read and
@@ -148,6 +155,8 @@ public sealed class CliOptions
                 --shell <shell>       auto | pwsh | powershell | cmd | bash. Which shell the
                                       bash tool launches. Default: auto (pwsh → powershell.exe →
                                       cmd.exe on Windows; bash on PATH, else /bin/sh elsewhere).
+                --bash-timeout <ms>   Default bash tool timeout in milliseconds (default: 120000).
+                                      The model can still override it per call with timeout_ms.
                 --no-env-context      Do not add the startup environment snapshot (OS, SDK, git
                                       state, workspace layout, enabled tools) to the system prompt.
                 --confirm-tools <mode>
@@ -191,6 +200,7 @@ public sealed class CliOptions
         ReasoningEffortLevel? reasoning = null;
         int? contextTokens = null;
         int? retainTokens = null;
+        int? bashTimeoutMs = null;
         string? sessionPath = null;
         string? savePath = null;
         var markdown = MarkdownMode.Auto;
@@ -255,6 +265,12 @@ public sealed class CliOptions
                 case "--shell":
                     shell = ParseShell(RequireValue(args, ref i, arg));
                     break;
+                case "--bash-timeout":
+                    var timeoutText = RequireValue(args, ref i, arg);
+                    if (!int.TryParse(timeoutText, out var parsedTimeout) || parsedTimeout <= 0)
+                        throw new ArgumentException($"--bash-timeout expects a positive integer (milliseconds), got '{timeoutText}'.");
+                    bashTimeoutMs = parsedTimeout;
+                    break;
                 case "--no-env-context":
                     noEnvContext = true;
                     break;
@@ -314,6 +330,7 @@ public sealed class CliOptions
             ConfirmTools = confirmTools,
             ContextTokens = contextTokens,
             RetainTokens = retainTokens,
+            BashTimeoutMs = bashTimeoutMs,
             SessionPath = sessionPath,
             SavePath = savePath,
         };

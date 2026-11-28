@@ -47,9 +47,16 @@ internal static class MarkdownRenderer
         }
     }
 
-    internal static IRenderable? RenderBlock(Block block, int depth) => block switch
+    // Nested quotes/lists recurse through RenderBlock <-> RenderChildren. Bound it for the same
+    // reason as the inline tree: degenerate model output must never kill the process.
+    private const int MaxBlockDepth = 32;
+
+    internal static IRenderable? RenderBlock(Block block, int depth)
     {
-        HeadingBlock heading => RenderHeading(heading),
+        if (depth > MaxBlockDepth)
+            return new Text(string.Empty);
+        return block switch
+        {
         ParagraphBlock paragraph => RenderParagraph(paragraph.Inline),
         FencedCodeBlock fenced => RenderCodeBlock(fenced.Lines.Lines.Select(l => l.ToString()), fenced.Info),
         CodeBlock indented => RenderCodeBlock(indented.Lines.Lines.Select(l => l.ToString()), null),
@@ -60,7 +67,8 @@ internal static class MarkdownRenderer
         HtmlBlock html => new Text(string.Join('\n', html.Lines.Lines.Select(l => l.ToString())), DimGrey),
         LinkReferenceDefinitionGroup => null,
         _ => PlainFallback(block),
-    };
+        };
+    }
 
     private static IRenderable? PlainFallback(Block block)
     {
@@ -249,14 +257,19 @@ internal static class MarkdownRenderer
         public Style? Style { get; }
     }
 
-    private static void AppendInlines(Paragraph paragraph, ContainerInline? container, InlineStyle baseStyle)
+    // Markdig builds a deeply nested inline tree for degenerate input (e.g. thousands of '*'
+    // characters). Without a bound, AppendInline <-> AppendInlines recurses until the stack
+    // overflows and the whole process dies; the runtime cannot catch StackOverflowException.
+    private const int MaxInlineDepth = 32;
+
+    private static void AppendInlines(Paragraph paragraph, ContainerInline? container, InlineStyle baseStyle, int depth = 0)
     {
-        if (container is null) return;
+        if (container is null || depth > MaxInlineDepth) return;
         foreach (var inline in container)
-            AppendInline(paragraph, inline, baseStyle);
+            AppendInline(paragraph, inline, baseStyle, depth);
     }
 
-    private static void AppendInline(Paragraph paragraph, Inline inline, InlineStyle baseStyle)
+    private static void AppendInline(Paragraph paragraph, Inline inline, InlineStyle baseStyle, int depth)
     {
         switch (inline)
         {
@@ -270,7 +283,7 @@ internal static class MarkdownRenderer
 
             case EmphasisInline emphasis:
                 var style = Merge(baseStyle.Style, EmphasisStyle(emphasis));
-                AppendInlines(paragraph, emphasis, new InlineStyle(style));
+                AppendInlines(paragraph, emphasis, new InlineStyle(style), depth + 1);
                 break;
 
             case LinkInline { IsImage: false } link:
@@ -299,7 +312,7 @@ internal static class MarkdownRenderer
                 break; // handled by the list renderer
 
             case ContainerInline nested:
-                AppendInlines(paragraph, nested, baseStyle);
+                AppendInlines(paragraph, nested, baseStyle, depth + 1);
                 break;
 
             default:
@@ -354,15 +367,15 @@ internal static class MarkdownRenderer
         return sb.ToString();
     }
 
-    private static void AppendPlain(StringBuilder sb, ContainerInline? container)
+    private static void AppendPlain(StringBuilder sb, ContainerInline? container, int depth = 0)
     {
-        if (container is null) return;
+        if (container is null || depth > MaxInlineDepth) return;
         foreach (var inline in container)
         {
             switch (inline)
             {
                 case ContainerInline nested:
-                    AppendPlain(sb, nested);
+                    AppendPlain(sb, nested, depth + 1);
                     break;
                 case LineBreakInline lineBreak:
                     sb.Append(lineBreak.IsHard ? '\n' : ' ');
