@@ -60,7 +60,7 @@ internal static class OllamaWebClientTestHarness
         where T : class
     {
         Assert.False(result.IsSuccess);
-        Assert.Null(result.Data);
+        Assert.Null(result.GetRawData());
         Assert.Equal(kind, result.ErrorKind);
         Assert.Equal(WebToolErrorMessages.For(kind), result.DisplayMessage);
         Assert.DoesNotContain(SecretSentinel, result.DisplayMessage, StringComparison.Ordinal);

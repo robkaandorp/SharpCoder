@@ -29,15 +29,29 @@ internal static class WebToolBearerCredential
         while (end > start && (raw[end - 1] == ' ' || raw[end - 1] == '\t')) end--;
         if (start == end) return false;
 
+        // RFC 6750: b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=".
+        // At least one base character is required, and padding may appear only at the end.
+        var paddingStarted = false;
+        var baseCharacters = 0;
         for (var i = start; i < end; i++)
         {
             var c = raw[i];
+            if (c == '=')
+            {
+                paddingStarted = true;
+                continue;
+            }
+
+            if (paddingStarted) return false;
             var allowed = (c >= 'A' && c <= 'Z')
                 || (c >= 'a' && c <= 'z')
                 || (c >= '0' && c <= '9')
-                || c == '-' || c == '.' || c == '_' || c == '~' || c == '+' || c == '/' || c == '=';
+                || c == '-' || c == '.' || c == '_' || c == '~' || c == '+' || c == '/';
             if (!allowed) return false;
+            baseCharacters++;
         }
+
+        if (baseCharacters == 0) return false;
 
         credential = raw[start..end];
         return true;

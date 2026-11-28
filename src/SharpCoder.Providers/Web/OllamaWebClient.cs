@@ -8,74 +8,35 @@ namespace SharpCoder.Providers.Web;
 
 /// <summary>
 /// Typed, host-configured transport for the Ollama <c>api/web_search</c> and
-/// <c>api/web_fetch</c> endpoints. Returns a discriminated
-/// <see cref="WebToolResult{TData}"/> for every expected outcome; never throws raw backend or
-/// exception text into a result.
+/// <c>api/web_fetch</c> endpoints, returning discriminated typed outcomes with fixed safe messages.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <strong>HOST-ONLY SUCCESS PAYLOADS.</strong> <see cref="WebSearchData"/> and
-/// <see cref="WebFetchData"/> contain untruncated, untransformed backend content that may echo
-/// sensitive values. This client never logs, formats, serializes, or renders it. A mandatory
-/// host-supplied output transform (iteration 2) is the ONLY route by which anything derived from a
-/// successful payload may become model-visible. Direct callers must branch on
-/// <see cref="WebToolErrorKind"/>, not on <see cref="WebToolResult{TData}.DisplayMessage"/>.
+/// <strong>HOST-ONLY SUCCESS PAYLOADS.</strong> Successful DTOs may echo sensitive backend data.
+/// Raw fields require explicit accessors, but hosts must still never destructure, serialize, or log
+/// them. The mandatory host output transform (iteration 2) is the only model-visible route. Queries
+/// and fetch URLs are sent to the configured backend before that transform; host authorization of
+/// that backend/input disclosure is therefore separate from output redaction.
 /// </para>
 /// <para>
-/// <strong>NO GLOBAL CREDENTIAL READS.</strong> The host supplies exactly one
-/// <see cref="HttpClient"/>, one credential accessor, the endpoint, the deadline and the byte cap
-/// in <see cref="OllamaWebClientOptions"/>. Nothing here reads environment variables,
-/// configuration files, or ambient credentials, and no core/CLI dependency is introduced. The
-/// accessor runs once per call before any transport. Clear of inherited
-/// <c>Authorization</c>, each request carries only its own request-scoped Bearer credential for
-/// the configured endpoint — never for a model-supplied fetch URL.
+/// The host supplies one <see cref="HttpClient"/>, credentials, endpoint, limits and clock. The
+/// library reads no ambient/global credentials, adds no core/CLI dependency, and never disposes the
+/// supplied client. Authorization is request-scoped for the configured endpoint only; the host owns
+/// redirect credential forwarding, egress policy, normal TLS validation, logging, and buffering.
 /// </para>
 /// <para>
-/// <strong>HOST OWNS THE HTTP PIPELINE.</strong> The supplied client retains its ownership,
-/// lifetime and normal TLS certificate validation. The host is responsible for redirect policy and
-/// for preventing credential forwarding to untrusted rewritten hosts, for backend URL/egress
-/// policy, for logging (which must not record credentials or raw content), and for any buffering
-/// inside its own handlers, proxies or <see cref="HttpContent"/>. The <see cref="HttpClient.Timeout"/>
-/// configured on that client normally applies only up to the point response headers are received;
-/// it is NOT a guarantee that a later body read is bounded. This library therefore installs its own
-/// deadline over the whole send/header/body operation, but the byte cap
-/// (<see cref="OllamaWebClientOptions.MaxResponseBytes"/>) bounds ONLY the bytes Providers reads and
-/// retains — not upstream host buffering. Remote content and remote errors are untrusted data, never
-/// instructions.
+/// <see cref="HttpClient.Timeout"/> normally covers only receipt of headers, not a later body read.
+/// The library deadline therefore covers send through the final body read. Expiry is determined by
+/// elapsed monotonic time at EVERY send/open/read completion or throw; the timer exists only to
+/// request cooperative cancellation. Delayed timer delivery cannot weaken classification. Caller
+/// cancellation is checked first and propagates the caller-linked cancellation. A host timeout uses
+/// <see cref="WebToolTimeoutException"/>; its message and inner exception are never surfaced.
 /// </para>
 /// <para>
-/// <strong>COOPERATIVE DEADLINE.</strong> The library deadline starts after a valid credential has
-/// been obtained, immediately before sending, and uses <see cref="HttpCompletionOption.ResponseHeadersRead"/>.
-/// The library NEVER abandons an outstanding handler or stream operation: every awaited
-/// send/header/read operation is allowed to complete or throw, and only then is precedence
-/// applied. Caller cancellation always wins and propagates the caller-linked cancellation. Next, an
-/// expired library deadline classifies <see cref="WebToolErrorKind.Timeout"/> BEFORE the returned
-/// status or the thrown exception type is examined — including late non-success responses and late
-/// unrelated <see cref="OperationCanceledException"/>, <see cref="IOException"/>,
-/// <see cref="HttpRequestException"/>, <see cref="WebToolTimeoutException"/> and unexpected
-/// <see cref="InvalidOperationException"/>. Before expiry, an awaited
-/// <see cref="WebToolTimeoutException"/> (including one nested in an exception chain) maps to
-/// Timeout; unrelated OCE/IO/HTTP exceptions map to TransportFailure; unexpected direct-client
-/// host exceptions may propagate for host diagnostics ONLY when caller/deadline precedence permits.
-/// Once a success body has been fully read within the deadline, later expiry cannot affect parsing
-/// or the result. Non-success headers before expiry yield immediate HttpFailure without reading the
-/// body.
-/// </para>
-/// <para>
-/// A host implementing its own timeout should raise <see cref="WebToolTimeoutException"/> from its
-/// handler or response stream and preserve that type through wrapping. Its dynamic message and
-/// inner exception are never surfaced. Requests, responses, streams, linked token sources and
-/// deadline timers are disposed deterministically, including on every failure path.
-/// </para>
-/// <para>
-/// <strong>ITERATION 1 SCOPE.</strong> This is a typed protocol/DTO/transport layer only. Count
-/// selection, clipping, rendering, display caps, and registered tool invocation are deliberately
-/// deferred. The later invocation wrapper will be a Providers-owned <c>AIFunction</c> decorator
-/// following <c>ToolAuthorizationGuard.AuthorizedAIFunction</c>: it wraps the inner
-/// <c>InvokeAsync</c>, preserves schema metadata, propagates caller cancellation, and returns the
-/// fixed <c>Unexpected tool failure.</c> for unexpected binding/invocation faults. It is NOT an
-/// HTTP/client abstraction, and no SharpCoder core reference is required (Microsoft.Extensions.AI is
-/// already referenced by this project).
+/// The byte cap limits bytes this library requests, reads, and retains, not upstream host buffering.
+/// Non-success before expiry returns HttpFailure without reading the body. Once EOF is observed
+/// within the deadline, later expiry cannot change parsing or the result. Awaited work is always
+/// joined, never abandoned, and cleanup faults never replace an established outcome.
 /// </para>
 /// </remarks>
 public sealed class OllamaWebClient
@@ -98,59 +59,36 @@ public sealed class OllamaWebClient
     private readonly TimeSpan _deadline;
     private readonly TimeProvider _timeProvider;
 
-    /// <summary>
-    /// Creates a typed transport from host-supplied configuration. Nothing is read from ambient
-    /// state and the host's <see cref="HttpClient"/> is never disposed by this instance.
-    /// </summary>
+    /// <summary>Creates a typed transport from host-supplied configuration.</summary>
     /// <param name="options">Host-owned endpoint, client, credential accessor, deadline and limits.</param>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
-    /// <exception cref="ArgumentException">
-    /// A required option is missing, the base URI is not absolute HTTPS (or carries user info,
-    /// query, or fragment), the byte cap is not positive, or the deadline is outside 1–300 seconds
-    /// and is not <see cref="Timeout.InfiniteTimeSpan"/>.
-    /// </exception>
+    /// <exception cref="ArgumentException">An endpoint, host component, cap, or deadline is invalid.</exception>
     public OllamaWebClient(OllamaWebClientOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-
         _httpClient = options.HttpClient ?? throw new ArgumentException("A host-supplied HttpClient is required.", nameof(options));
         _credentialAccessor = options.CredentialAccessor ?? throw new ArgumentException("A host-supplied credential accessor is required.", nameof(options));
         (_searchUri, _fetchUri) = OllamaWebEndpoint.Resolve(options.BaseUri);
-
         if (options.MaxResponseBytes <= 0)
             throw new ArgumentException("MaxResponseBytes must be positive.", nameof(options));
-
         if (options.Deadline != Timeout.InfiniteTimeSpan &&
             (options.Deadline < OllamaWebClientOptions.MinimumDeadline ||
              options.Deadline > OllamaWebClientOptions.MaximumDeadline))
             throw new ArgumentException("Deadline must be between 1 and 300 seconds inclusive, or Timeout.InfiniteTimeSpan.", nameof(options));
-
         _maxResponseBytes = options.MaxResponseBytes;
         _deadline = options.Deadline;
         _timeProvider = options.TimeProvider ?? TimeProvider.System;
     }
 
-    /// <summary>
-    /// POSTs exactly <c>{query,max_results}</c> to <c>api/web_search</c> and returns every valid
-    /// upstream entry, untruncated. Count selection is the later adapter's responsibility.
-    /// </summary>
-    /// <param name="query">The search query. Blank (whitespace-only) yields Validation before transport.</param>
-    /// <param name="maxResults">
-    /// Requested result count. Defaults to <see cref="DefaultMaxResults"/> (5); nonpositive
-    /// values map to 1; values above <see cref="MaximumMaxResults"/> (10) clamp to 10.
-    /// </param>
-    /// <param name="cancellationToken">Caller cancellation; always takes precedence.</param>
-    /// <returns>A discriminated success or failure. Never throws for an expected transport outcome.</returns>
+    /// <summary>POSTs exactly <c>{query,max_results}</c>; the complete valid entry list is retained.</summary>
     public async Task<WebToolResult<WebSearchData>> SearchAsync(
         string? query,
         int maxResults = DefaultMaxResults,
         CancellationToken cancellationToken = default)
     {
-        // Caller cancellation wins over every classification, including a no-send validation.
         cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(query))
             return WebToolResult<WebSearchData>.Failure(WebToolErrorKind.Validation);
-
         var selected = maxResults <= 0 ? 1 : Math.Min(maxResults, MaximumMaxResults);
         var body = "{\"query\":" + JsonSerializer.Serialize(query) +
                    ",\"max_results\":" + selected.ToString(CultureInfo.InvariantCulture) + "}";
@@ -160,13 +98,7 @@ public sealed class OllamaWebClient
             : ParseSearch(outcome.Result);
     }
 
-    /// <summary>
-    /// POSTs exactly <c>{url}</c> to <c>api/web_fetch</c>. There is deliberately NO
-    /// <c>max_lines</c> argument at this layer; display limits belong to the later renderer.
-    /// </summary>
-    /// <param name="url">The URL to fetch. Blank (whitespace-only) yields Validation before transport.</param>
-    /// <param name="cancellationToken">Caller cancellation; always takes precedence.</param>
-    /// <returns>A discriminated success or failure. Never throws for an expected transport outcome.</returns>
+    /// <summary>POSTs exactly <c>{url}</c>; there is deliberately no max_lines transport argument.</summary>
     public async Task<WebToolResult<WebFetchData>> FetchAsync(
         string? url,
         CancellationToken cancellationToken = default)
@@ -174,7 +106,6 @@ public sealed class OllamaWebClient
         cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(url))
             return WebToolResult<WebFetchData>.Failure(WebToolErrorKind.Validation);
-
         var body = "{\"url\":" + JsonSerializer.Serialize(url) + "}";
         var outcome = await SendAsync(_fetchUri, body, cancellationToken).ConfigureAwait(false);
         return outcome.Result is null
@@ -182,301 +113,177 @@ public sealed class OllamaWebClient
             : ParseFetch(outcome.Result);
     }
 
-    /// <summary>
-    /// The single cooperative send/header/body pipeline. The deadline covers everything from just
-    /// before <c>SendAsync</c> through the last body read; it is not applied to credential
-    /// resolution or to parsing.
-    /// </summary>
     private async Task<(byte[]? Result, WebToolErrorKind Kind)> SendAsync(
         Uri endpoint,
         string requestJson,
-        CancellationToken cancellationToken)
+        CancellationToken callerToken)
     {
-        // Caller cancellation wins before any side effect, including credential resolution.
-        cancellationToken.ThrowIfCancellationRequested();
+        callerToken.ThrowIfCancellationRequested();
 
-        string credential;
+        // Contain ALL accessor outcomes in one place, then re-check caller cancellation before ANY
+        // credential-unavailable result. Cancellation identity is never converted to a typed error.
+        string? rawCredential = null;
         try
         {
-            // No implicit/global reads: the only credential source is the host accessor. Its
-            // exception text (and any credential it may have been about to return) never escapes.
-            if (!WebToolBearerCredential.TryNormalize(_credentialAccessor(), out credential))
-                return (null, WebToolErrorKind.CredentialUnavailable);
+            rawCredential = _credentialAccessor();
         }
         catch (Exception)
         {
+            // Exception text is deliberately discarded.
+        }
+        callerToken.ThrowIfCancellationRequested();
+        if (!WebToolBearerCredential.TryNormalize(rawCredential, out var credential))
             return (null, WebToolErrorKind.CredentialUnavailable);
-        }
+        callerToken.ThrowIfCancellationRequested();
 
-        // Re-check after credential resolution: the accessor may have taken caller-controlled time.
-        cancellationToken.ThrowIfCancellationRequested();
+        // This object is the sole request owner. A throwing cleanup is contained so it cannot mask
+        // an already-established typed outcome or caller cancellation.
+        using var request = new SafeOwnedResource<HttpRequestMessage>(new HttpRequestMessage(HttpMethod.Post, endpoint));
+        request.Value.Headers.Remove("Authorization");
+        request.Value.Headers.Authorization = new AuthenticationHeaderValue(BearerScheme, credential);
+        request.Value.Content = new StringContent(requestJson, Encoding.UTF8, JsonMediaType);
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-        request.Headers.Remove("Authorization");
-        request.Headers.Authorization = new AuthenticationHeaderValue(BearerScheme, credential);
-        request.Content = new StringContent(requestJson, Encoding.UTF8, JsonMediaType);
-
-        // The deadline starts after a valid credential, immediately before sending. A dedicated
-        // deadline CTS (cancelled by a timer on the HOST-SUPPLIED TimeProvider) is linked with the
-        // caller's token. All three objects are owned by this call and disposed in finally —
-        // including on every failure path.
+        // Capture the start immediately before creating/sending the deadline operation. Expiry is
+        // based on this monotonic timestamp, NOT on whether a host timer callback has run.
+        var deadlineStart = _timeProvider.GetTimestamp();
         var deadlineCts = _deadline == Timeout.InfiniteTimeSpan ? null : new CancellationTokenSource();
-        var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        // Forward deadline expiry to the token handed to the handler/stream. The dedicated
-        // deadlineCts remains the authoritative classification signal, so a caller-cancelled or
-        // otherwise-cancelled linked token can never be mistaken for a library timeout.
-        using var deadlineRegistration = deadlineCts?.Token.Register(
-            static state => ((CancellationTokenSource)state!).Cancel(), linked);
-        try
-        {
-            ITimer? timer = null;
-            if (deadlineCts is not null)
-            {
-                // Tests rendezvous on this exact registered timer (one-shot, non-periodic, with the
-                // deadline CTS as state) before advancing it. The callback is best-effort: a late
-                // firing after the call has already completed (and disposed its CTS) must never
-                // throw, and can never retroactively affect an already-returned result.
-                timer = _timeProvider.CreateTimer(
-                    static state =>
-                    {
-                        try { ((CancellationTokenSource)state!).Cancel(); }
-                        catch (ObjectDisposedException) { }
-                    },
-                    deadlineCts,
-                    _deadline,
-                    Timeout.InfiniteTimeSpan);
-            }
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+        using var linkedOwner = new SafeOwnedResource<CancellationTokenSource>(linked);
+        using var deadlineOwner = new SafeOwnedResource<CancellationTokenSource>(deadlineCts!);
 
-            try
+        // Forwarding is cooperative only. Timer callbacks swallow every host registration fault,
+        // including AggregateException from CancellationTokenSource.Cancel().
+        using var deadlineRegistration = new SafeOwnedRegistration(
+            deadlineCts?.Token.Register(static state =>
             {
-                var sendOutcome = await AwaitSendWithPrecedenceAsync(request, linked, deadlineCts, cancellationToken).ConfigureAwait(false);
-                if (sendOutcome.Response is null) return (null, sendOutcome.Kind);
-
-                // Dispose BOTH the response and its content explicitly. A host content implementation
-                // may lazily create its read stream (so never reading the body still leaves a
-                // host-owned object that must be released), and disposal must be deterministic on
-                // every path — including an immediate non-success or an expired deadline.
-                using (sendOutcome.Response)
-                using (sendOutcome.Response.Content)
+                try { ((CancellationTokenSource)state!).Cancel(); }
+                catch (Exception) { }
+            }, linked) ?? default);
+        using var timerOwner = deadlineCts is null
+            ? null
+            : new SafeOwnedResource<ITimer>(_timeProvider.CreateTimer(
+                static state =>
                 {
-                    var headersOutcome = await ClassifyHeadersAsync(
-                        sendOutcome.Response, deadlineCts, cancellationToken).ConfigureAwait(false);
-                    if (headersOutcome.Response is null) return (null, headersOutcome.Kind);
+                    try { ((CancellationTokenSource)state!).Cancel(); }
+                    catch (Exception) { }
+                }, deadlineCts, _deadline, Timeout.InfiniteTimeSpan));
 
-                    var readOutcome = await ReadWithPrecedenceAsync(
-                        sendOutcome.Response, linked, deadlineCts, cancellationToken).ConfigureAwait(false);
-                    if (readOutcome.Bytes is null) return (null, readOutcome.Kind);
+        var operation = new DeadlineOperation(this, deadlineStart);
+        var send = await AwaitSendAsync(request.Value, linked.Token, callerToken, operation).ConfigureAwait(false);
+        if (send.Response is null) return (null, send.Kind);
 
-                    // SUCCESS BODY FULLY READ: the exit boundary. From here on, expiry is irrelevant —
-                    // parsing and the returned result are never re-checked against the deadline.
-                    return (readOutcome.Bytes, default);
-                }
-            }
-            finally
-            {
-                if (timer is not null) await DisposeTimerAsync(timer).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            linked.Dispose();
-            deadlineCts?.Dispose();
-        }
+        // Single ownership chain: the response owns its content; content owns its source stream.
+        // We do not separately dispose content or a source stream returned by ReadAsStreamAsync.
+        using var responseOwner = new SafeOwnedResource<HttpResponseMessage>(send.Response);
+        var headers = ClassifyHeaders(send.Response, callerToken, operation);
+        if (!headers.Success) return (null, headers.Kind);
+        return await ReadBodyAsync(send.Response, linked.Token, callerToken, operation).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Awaits the send/header operation without ever abandoning it. Applies caller-first, then
-    /// expired-deadline precedence to BOTH completion and throw, before inspecting status or type.
-    /// </summary>
-    private async Task<(HttpResponseMessage? Response, WebToolErrorKind Kind)> AwaitSendWithPrecedenceAsync(
+    private async Task<(HttpResponseMessage? Response, WebToolErrorKind Kind)> AwaitSendAsync(
         HttpRequestMessage request,
-        CancellationTokenSource linked,
-        CancellationTokenSource? deadlineCts,
-        CancellationToken callerToken)
+        CancellationToken linkedToken,
+        CancellationToken callerToken,
+        DeadlineOperation operation)
     {
         HttpResponseMessage? response = null;
         Exception? fault = null;
         try
         {
             response = await _httpClient.SendAsync(
-                request, HttpCompletionOption.ResponseHeadersRead, linked.Token).ConfigureAwait(false);
+                request, HttpCompletionOption.ResponseHeadersRead, linkedToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             fault = ex;
         }
 
-        // PRECEDENCE: caller cancellation, then expired library deadline, then anything else.
-        // The awaited operation has ALWAYS been joined at this point. A response that arrived on a
-        // discarded path (late success/non-success, caller cancellation, or a fault) is disposed
-        // before the outcome is returned or an exception propagated: no response, content, or
-        // stream is ever abandoned.
         try
         {
             callerToken.ThrowIfCancellationRequested();
-            if (IsLibraryDeadlineExpired(deadlineCts, callerToken))
-                return (null, WebToolErrorKind.Timeout);
-
-            if (fault is not null)
-            {
-                if (fault is WebToolTimeoutException || ContainsTimeoutMarker(fault))
-                    return (null, WebToolErrorKind.Timeout);
-                if (fault is OperationCanceledException or IOException or HttpRequestException)
-                    return (null, WebToolErrorKind.TransportFailure);
-                // Unexpected direct-client host exceptions may propagate for host diagnostics, but
-                // ONLY when caller/deadline precedence permits (checked above). Preserve identity.
-                ExceptionDispatchInfo.Capture(fault).Throw();
-                throw fault;
-            }
-
-            // Hand ownership of the live response to the caller (the send/headers/read pipeline).
+            if (operation.IsExpired()) return (null, WebToolErrorKind.Timeout);
+            if (fault is not null) return (null, ClassifyTransportFault(fault));
             var live = response!;
             response = null;
             return (live, default);
         }
         finally
         {
-            DisposeResponse(response);
+            SafeOwnedResource<HttpResponseMessage>.DisposeQuietly(response);
         }
     }
 
-    /// <summary>
-    /// Deterministically releases a response and its content on a classification path that does
-    /// not read the body. Disposal is best-effort with respect to host content implementations: it
-    /// must never throw and change a typed outcome or mask caller cancellation.
-    /// </summary>
-    private static void DisposeResponse(HttpResponseMessage? response)
-    {
-        if (response is null) return;
-        try { response.Content?.Dispose(); }
-        catch (Exception) { /* diagnostics/cleanup never change the classification */ }
-        try { response.Dispose(); }
-        catch (Exception) { /* diagnostics/cleanup never change the classification */ }
-    }
-
-    /// <summary>
-    /// Classifies a returned response. A late response whose deadline already expired is Timeout
-    /// (checked in <see cref="AwaitSendWithPrecedenceAsync"/> before this method is reached), and a
-    /// non-success response before expiry is immediate HttpFailure with NO body consumption.
-    /// </summary>
-    private Task<(HttpResponseMessage? Response, WebToolErrorKind Kind)> ClassifyHeadersAsync(
+    private static (bool Success, WebToolErrorKind Kind) ClassifyHeaders(
         HttpResponseMessage response,
-        CancellationTokenSource? deadlineCts,
-        CancellationToken callerToken)
+        CancellationToken callerToken,
+        DeadlineOperation operation)
     {
         callerToken.ThrowIfCancellationRequested();
-        if (IsLibraryDeadlineExpired(deadlineCts, callerToken))
-            return Task.FromResult<(HttpResponseMessage?, WebToolErrorKind)>((null, WebToolErrorKind.Timeout));
-
+        if (operation.IsExpired()) return (false, WebToolErrorKind.Timeout);
         var success = (int)response.StatusCode >= 200 && (int)response.StatusCode <= 299;
-        return Task.FromResult<(HttpResponseMessage?, WebToolErrorKind)>(
-            success ? (response, default) : (null, WebToolErrorKind.HttpFailure));
+        return (success, success ? default : WebToolErrorKind.HttpFailure);
     }
 
-    /// <summary>
-    /// Reads a successful body incrementally, enforcing the byte cap exactly at the read boundary.
-    /// Each awaited read (including throwing reads) is joined, then precedence is applied.
-    /// </summary>
-    private async Task<(byte[]? Bytes, WebToolErrorKind Kind)> ReadWithPrecedenceAsync(
+    private async Task<(byte[]? Bytes, WebToolErrorKind Kind)> ReadBodyAsync(
         HttpResponseMessage response,
-        CancellationTokenSource linked,
-        CancellationTokenSource? deadlineCts,
-        CancellationToken callerToken)
+        CancellationToken linkedToken,
+        CancellationToken callerToken,
+        DeadlineOperation operation)
     {
         Stream? stream = null;
         Exception? openFault = null;
         try
         {
-            stream = await response.Content.ReadAsStreamAsync(linked.Token).ConfigureAwait(false);
+            stream = await response.Content.ReadAsStreamAsync(linkedToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             openFault = ex;
         }
 
-        // ReadAsStreamAsync is itself an awaited operation: join it, then apply caller-first and
-        // expired-deadline precedence BEFORE inspecting the thrown exception's type.
+        // Stream-open is an awaited operation with the same precedence as send and byte reads.
         callerToken.ThrowIfCancellationRequested();
-        if (IsLibraryDeadlineExpired(deadlineCts, callerToken))
-        {
-            stream?.Dispose();
-            return (null, WebToolErrorKind.Timeout);
-        }
-        if (openFault is not null)
-            return (null, ClassifyReadFault(openFault, deadlineCts, callerToken).Kind);
+        if (operation.IsExpired()) return (null, WebToolErrorKind.Timeout);
+        if (openFault is not null) return (null, ClassifyTransportFault(openFault));
+        if (stream is null) return (null, WebToolErrorKind.MalformedResponse);
 
-        // Dispose the stream itself as well as the response (the response's Dispose would normally
-        // cover it, but we own the reference we obtained here). Non-null: the open operation was
-        // joined above and any fault returned before this point.
-        var bodyStream = stream ?? throw new InvalidOperationException("Response stream was not opened.");
-        using (bodyStream)
+        using var buffer = new MemoryStream();
+        var chunk = new byte[ReadBufferSize];
+        while (true)
         {
-            using var buffer = new MemoryStream();
-            var chunk = new byte[ReadBufferSize];
-            while (true)
+            int read = 0;
+            Exception? readFault = null;
+            // Ask only for remaining capacity plus ONE byte. That byte distinguishes exact-cap EOF
+            // from overflow without ever retaining more than the configured cap.
+            var remaining = _maxResponseBytes - buffer.Length;
+            var requested = (int)Math.Min(chunk.Length, (long)remaining + 1);
+            try
             {
-                int read;
-                Exception? fault = null;
-                try
-                {
-                    read = await bodyStream.ReadAsync(chunk.AsMemory(0, chunk.Length), linked.Token).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    read = 0;
-                    fault = ex;
-                }
-
-                // Join EVERY read operation (including a throwing one) before any classification.
-                callerToken.ThrowIfCancellationRequested();
-                if (IsLibraryDeadlineExpired(deadlineCts, callerToken))
-                    return (null, WebToolErrorKind.Timeout);
-
-                if (fault is not null) return (null, ClassifyReadFault(fault, deadlineCts, callerToken).Kind);
-
-                if (read == 0)
-                {
-                    // Fully read. Caller/deadline checks above are the LAST deadline-sensitive point.
-                    return (buffer.ToArray(), default);
-                }
-
-                // Enforce the cap at the read boundary: never retain more than cap + 0 bytes.
-                if (read > _maxResponseBytes - buffer.Length)
-                    return (null, WebToolErrorKind.ResponseTooLarge);
-                buffer.Write(chunk, 0, read);
+                read = await stream.ReadAsync(chunk.AsMemory(0, requested), linkedToken).ConfigureAwait(false);
             }
+            catch (Exception ex)
+            {
+                readFault = ex;
+            }
+
+            callerToken.ThrowIfCancellationRequested();
+            if (operation.IsExpired()) return (null, WebToolErrorKind.Timeout);
+            if (readFault is not null) return (null, ClassifyTransportFault(readFault));
+            if (read == 0) return (buffer.ToArray(), default); // No deadline check after this exit.
+            if (read > remaining) return (null, WebToolErrorKind.ResponseTooLarge);
+            buffer.Write(chunk, 0, read);
         }
     }
 
-    /// <summary>Classifies a fault from an awaited stream/read operation using the same precedence.</summary>
-    private static (byte[]? Bytes, WebToolErrorKind Kind) ClassifyReadFault(
-        Exception fault,
-        CancellationTokenSource? deadlineCts,
-        CancellationToken callerToken)
+    private static WebToolErrorKind ClassifyTransportFault(Exception fault)
     {
-        callerToken.ThrowIfCancellationRequested();
-        if (IsLibraryDeadlineExpired(deadlineCts, callerToken)) return (null, WebToolErrorKind.Timeout);
-        if (fault is WebToolTimeoutException || ContainsTimeoutMarker(fault))
-            return (null, WebToolErrorKind.Timeout);
+        if (fault is WebToolTimeoutException || ContainsTimeoutMarker(fault)) return WebToolErrorKind.Timeout;
         if (fault is OperationCanceledException or IOException or HttpRequestException)
-            return (null, WebToolErrorKind.TransportFailure);
-        // Unexpected host exception: propagate only when caller/deadline precedence permits.
+            return WebToolErrorKind.TransportFailure;
         ExceptionDispatchInfo.Capture(fault).Throw();
         throw fault;
     }
 
-    /// <summary>
-    /// True only when the library's own deadline token fired and the caller did not cancel. Caller
-    /// cancellation is always checked first by callers of this method.
-    /// </summary>
-    private static bool IsLibraryDeadlineExpired(CancellationTokenSource? deadlineCts, CancellationToken callerToken) =>
-        !callerToken.IsCancellationRequested && deadlineCts is not null && deadlineCts.IsCancellationRequested;
-
-    /// <summary>
-    /// Walks the whole exception graph — including <see cref="AggregateException.InnerExceptions"/> —
-    /// so several host timeout markers, at any nesting depth, still classify as Timeout. Only the
-    /// marker's TYPE is inspected; its message and inner exception are never surfaced.
-    /// </summary>
     private static bool ContainsTimeoutMarker(Exception fault)
     {
         var pending = new Stack<Exception>();
@@ -488,17 +295,10 @@ public sealed class OllamaWebClient
             if (!visited.Add(current)) continue;
             if (current is WebToolTimeoutException) return true;
             if (current is AggregateException aggregate)
-            {
                 foreach (var inner in aggregate.InnerExceptions) pending.Push(inner);
-            }
             if (current.InnerException is not null) pending.Push(current.InnerException);
         }
         return false;
-    }
-
-    private static async ValueTask DisposeTimerAsync(ITimer timer)
-    {
-        await timer.DisposeAsync().ConfigureAwait(false);
     }
 
     private static WebToolResult<WebSearchData> ParseSearch(byte[] bytes)
@@ -511,22 +311,18 @@ public sealed class OllamaWebClient
                 !root.TryGetProperty("results", out var results) ||
                 results.ValueKind != JsonValueKind.Array)
                 return WebToolResult<WebSearchData>.Failure(WebToolErrorKind.MalformedResponse);
-
             var entries = new List<WebSearchResult>();
             foreach (var entry in results.EnumerateArray())
             {
-                // Null and non-object entries are intentionally skipped (not malformed). A valid
-                // array containing only skipped entries is a successful empty result set.
                 if (entry.ValueKind != JsonValueKind.Object) continue;
                 entries.Add(new WebSearchResult(
                     ReadNullableString(entry, "title"),
                     ReadNullableString(entry, "url"),
                     ReadNullableString(entry, "content")));
             }
-
             return WebToolResult<WebSearchData>.Success(new WebSearchData(entries));
         }
-        catch (JsonException)
+        catch (Exception ex) when (IsResponseDecodingException(ex))
         {
             return WebToolResult<WebSearchData>.Failure(WebToolErrorKind.MalformedResponse);
         }
@@ -538,10 +334,8 @@ public sealed class OllamaWebClient
         {
             using var document = JsonDocument.Parse(bytes);
             var root = document.RootElement;
-            // {} is valid: missing and null title/content/links are all tolerated.
             if (root.ValueKind != JsonValueKind.Object)
                 return WebToolResult<WebFetchData>.Failure(WebToolErrorKind.MalformedResponse);
-
             var title = ReadNullableString(root, "title");
             var content = ReadNullableString(root, "content");
             var links = new List<string>();
@@ -550,26 +344,83 @@ public sealed class OllamaWebClient
                 if (linksElement.ValueKind != JsonValueKind.Array)
                     return WebToolResult<WebFetchData>.Failure(WebToolErrorKind.MalformedResponse);
                 foreach (var link in linksElement.EnumerateArray())
-                {
-                    // Null and non-string links are intentionally skipped.
                     if (link.ValueKind == JsonValueKind.String) links.Add(link.GetString()!);
-                }
             }
-
             return WebToolResult<WebFetchData>.Success(new WebFetchData(title, content, links));
         }
-        catch (JsonException)
+        catch (Exception ex) when (IsResponseDecodingException(ex))
         {
             return WebToolResult<WebFetchData>.Failure(WebToolErrorKind.MalformedResponse);
         }
     }
 
-    /// <summary>Reads a missing/null string field as empty; any other type is a shape error.</summary>
+    /// <summary>
+    /// Only JSON syntax/shape/Unicode traversal failures belong here. Unexpected host exceptions are
+    /// intentionally outside this filter and retain their direct-client propagation behavior.
+    /// </summary>
+    private static bool IsResponseDecodingException(Exception ex) =>
+        ex is JsonException or InvalidOperationException or ArgumentException or DecoderFallbackException;
+
     private static string ReadNullableString(JsonElement obj, string name)
     {
         if (!obj.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null) return string.Empty;
-        if (value.ValueKind != JsonValueKind.String)
-            throw new JsonException("Wrong-type field.");
+        if (value.ValueKind != JsonValueKind.String) throw new JsonException("Wrong-type field.");
         return value.GetString()!;
+    }
+
+    /// <summary>Mutable elapsed-time state shared by all classification boundaries for one call.</summary>
+    private sealed class DeadlineOperation
+    {
+        private readonly OllamaWebClient _client;
+        private readonly long _started;
+
+        internal DeadlineOperation(OllamaWebClient client, long started)
+        {
+            _client = client;
+            _started = started;
+        }
+
+        internal bool IsExpired()
+        {
+            if (_client._deadline == Timeout.InfiniteTimeSpan) return false;
+            var now = _client._timeProvider.GetTimestamp();
+            var elapsedTicks = (long)Math.Round(
+                (now - _started) * (double)TimeSpan.TicksPerSecond / _client._timeProvider.TimestampFrequency,
+                MidpointRounding.AwayFromZero);
+            return elapsedTicks >= _client._deadline.Ticks;
+        }
+    }
+
+    /// <summary>One deterministic ownership link; cleanup failures are contained and non-masking.</summary>
+    private sealed class SafeOwnedResource<T> : IDisposable where T : class
+    {
+        internal SafeOwnedResource(T value) => Value = value;
+        internal T Value { get; }
+        public void Dispose() => DisposeQuietly(Value);
+        internal static void DisposeQuietly(T? value)
+        {
+            if (value is null) return;
+            try
+            {
+                switch (value)
+                {
+                    case ITimer timer: timer.DisposeAsync().AsTask().GetAwaiter().GetResult(); break;
+                    case IDisposable disposable: disposable.Dispose(); break;
+                }
+            }
+            catch (Exception) { }
+        }
+    }
+
+    /// <summary>Specialization for CancellationTokenRegistration (a struct, not an IDisposable class).</summary>
+    private sealed class SafeOwnedRegistration : IDisposable
+    {
+        private readonly CancellationTokenRegistration _registration;
+        internal SafeOwnedRegistration(CancellationTokenRegistration registration) => _registration = registration;
+        public void Dispose()
+        {
+            try { _registration.Dispose(); }
+            catch (Exception) { }
+        }
     }
 }

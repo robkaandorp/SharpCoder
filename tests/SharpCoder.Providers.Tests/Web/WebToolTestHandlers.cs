@@ -33,6 +33,9 @@ internal class RecordingWebHandler : HttpMessageHandler
     internal RecordingWebHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) =>
         _respond = respond;
 
+    /// <summary>Optional exact response override, preserving response metadata for protocol tests.</summary>
+    internal Func<HttpRequestMessage, HttpResponseMessage>? ResponseFactory { get; set; }
+
     internal int SendCount;
     internal bool Disposed;
 
@@ -72,7 +75,9 @@ internal class RecordingWebHandler : HttpMessageHandler
             body);
         _requests.Enqueue(snapshot);
 
-        var response = await SendAsyncCore(request, cancellationToken, _respond).ConfigureAwait(false);
+        var response = ResponseFactory is not null && this is not GatedWebHandler
+            ? ResponseFactory(request)
+            : await SendAsyncCore(request, cancellationToken, _respond).ConfigureAwait(false);
         return response;
     }
 
@@ -122,7 +127,13 @@ internal sealed class GatedWebHandler : RecordingWebHandler
         // passed to the gate: this is a cancellation-IGNORING operation that production must never
         // abandon.
         _entered.TrySetResult(true);
-        return await _release.Task.ConfigureAwait(false);
+        // The test observes Entered and configures any late disposers before this gate is released.
+        // ResponseFactory, when present, is used only after release to create the late response.
+        await _release.Task.ConfigureAwait(false);
+        if (ResponseFactory is null) return _release.Task.Result;
+        var response = ResponseFactory(request);
+        await Task.Yield(); // deterministic rendezvous before HttpClient can dispose the response
+        return response;
     }
 
     /// <summary>Waits with a bounded budget so a broken test fails with diagnostics instead of hanging.</summary>
@@ -151,6 +162,10 @@ internal sealed class GatedWebHandler : RecordingWebHandler
     /// <summary>Releases the awaited send with a plain success body.</summary>
     internal void CompleteWithJson(string body) =>
         CompleteWith(HttpStatusCode.OK, new StringContent(body, Encoding.UTF8, "application/json"));
+
+    /// <summary>Releases the gate; a ResponseFactory may then construct the actual late response.</summary>
+    internal void ReleaseWith(HttpStatusCode status) =>
+        _release.TrySetResult(CreateResponse(status, new StringContent("{}")));
 
     /// <summary>
     /// Deterministic cleanup on failure paths: unblocks the awaited send so no test can leave a
@@ -342,8 +357,10 @@ internal sealed class ChunkedWebStream : Stream
 {
     private readonly byte[] _bytes;
     private readonly int _chunkSize;
+    private readonly List<int> _requestedLengths = new();
     private int _offset;
     private int _readCount;
+    private int _totalBytesRead;
     private readonly TaskCompletionSource<bool> _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal ChunkedWebStream(byte[] bytes, int chunkSize)
@@ -353,15 +370,19 @@ internal sealed class ChunkedWebStream : Stream
     }
 
     internal int ReadCount => Volatile.Read(ref _readCount);
+    internal int TotalBytesRead => Volatile.Read(ref _totalBytesRead);
+    internal IReadOnlyList<int> RequestedLengths { get { lock (_requestedLengths) return _requestedLengths.ToArray(); } }
     internal bool Disposed => _disposed.Task.IsCompleted;
 
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
         Interlocked.Increment(ref _readCount);
+        lock (_requestedLengths) _requestedLengths.Add(buffer.Length);
         if (_offset >= _bytes.Length) return ValueTask.FromResult(0);
         var count = Math.Min(Math.Min(_chunkSize, buffer.Length), _bytes.Length - _offset);
         _bytes.AsMemory(_offset, count).CopyTo(buffer);
         _offset += count;
+        Interlocked.Add(ref _totalBytesRead, count);
         return ValueTask.FromResult(count);
     }
 

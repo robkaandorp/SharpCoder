@@ -88,15 +88,17 @@ public sealed class OllamaWebClientDeadlineTests
         Assert.Single(window.Clock.RegisteredTimers);
         Assert.True(window.Handler.Entered.IsCompleted); // positive control
 
-        // Advance fake time WITHOUT firing: the deadline must not be inferred from elapsed time.
+        // Advance fake time WITHOUT firing: elapsed monotonic time, not callback delivery, decides
+        // expiry. The late response therefore times out even though the timer has not fired.
         window.Clock.Advance(TimeSpan.FromHours(1));
         Assert.False(timer.Fired);
         Assert.False(window.Call.IsCompleted);
 
         window.Handler.CompleteWithJson("{}");
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        Assert.True(result.IsSuccess); // positive control: the operation really completed
-        Assert.True(timer.Disposed);   // timer disposed deterministically
+        AssertFailure(result, WebToolErrorKind.Timeout);
+        Assert.False(timer.Fired); // cooperative callback was deliberately never delivered
+        Assert.True(timer.Disposed); // timer disposed deterministically
     }
 
     [Fact]
@@ -426,9 +428,9 @@ public sealed class OllamaWebClientDeadlineTests
         Assert.True(result.IsSuccess);
         Assert.Null(result.ErrorKind);
         Assert.Equal(string.Empty, result.DisplayMessage);
-        Assert.Equal("T", result.Data!.Title);
-        Assert.Equal("C", result.Data.Content);
-        Assert.Equal(new[] { "L" }, result.Data.Links);
+        Assert.Equal("T", result.GetRawData()!.GetRawTitle());
+        Assert.Equal("C", result.GetRawData()!.GetRawContent());
+        Assert.Equal(new[] { "L" }, result.GetRawData()!.GetRawLinks());
         Assert.True(stream.Disposed);
     }
 

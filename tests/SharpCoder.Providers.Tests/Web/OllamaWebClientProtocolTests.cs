@@ -45,6 +45,8 @@ public sealed class OllamaWebClientProtocolTests
     [InlineData("ftp://web.example.test")]
     [InlineData("https://user:pass@web.example.test")]
     [InlineData("https://user@web.example.test")]
+    [InlineData("https://@web.example.test")]
+    [InlineData("https://@web.example.test/prefix")]
     [InlineData("https://web.example.test/api?q=1")]
     [InlineData("https://web.example.test/api?")]
     [InlineData("https://web.example.test/api#frag")]
@@ -117,7 +119,8 @@ public sealed class OllamaWebClientProtocolTests
     [InlineData("\tabcDEF\t")]
     [InlineData(" \t abcDEF \t ")]
     [InlineData("A")]
-    [InlineData("=")]
+    [InlineData("A=")]
+    [InlineData("A==")]
     [InlineData("aaa===")]
     public async Task Bearer_B64TokenGrammar_AcceptedAndBoundarySpaceTabTrimmed(string raw)
     {
@@ -150,6 +153,12 @@ public sealed class OllamaWebClientProtocolTests
     [InlineData("abc,def")]
     [InlineData("abc;def")]
     [InlineData("\u00E9abc")]
+    [InlineData("=")]
+    [InlineData("==")]
+    [InlineData("=ZA")]
+    [InlineData("A=Z")]
+    [InlineData("A==Z")]
+    [InlineData(" =Z ")]
     public async Task Bearer_MalformedOrBlank_ReturnsCredentialUnavailableWithoutSending(string raw)
     {
         var handler = FetchOk();
@@ -380,11 +389,11 @@ public sealed class OllamaWebClientProtocolTests
 
         var result = await client.SearchAsync("q", 1, TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        var data = Assert.IsType<WebSearchData>(result.Data);
-        Assert.Equal(3, data.Results.Count); // count selection is the LATER adapter's job
-        Assert.Equal(longContent, data.Results[0].Content);
-        Assert.Equal("T2", data.Results[1].Title);
-        Assert.Equal("U3", data.Results[2].Url);
+        var data = Assert.IsType<WebSearchData>(result.GetRawData());
+        Assert.Equal(3, data.GetRawResults().Count); // count selection is the LATER adapter's job
+        Assert.Equal(longContent, data.GetRawResults()[0].GetRawContent());
+        Assert.Equal("T2", data.GetRawResults()[1].GetRawTitle());
+        Assert.Equal("U3", data.GetRawResults()[2].GetRawUrl());
         Assert.Equal(string.Empty, result.DisplayMessage);
         Assert.Null(result.ErrorKind);
     }

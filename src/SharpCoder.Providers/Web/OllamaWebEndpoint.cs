@@ -26,7 +26,19 @@ internal static class OllamaWebEndpoint
         if (!baseUri.IsAbsoluteUri) throw new ArgumentException("The base URI must be absolute.");
         if (!string.Equals(baseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("The base URI must use HTTPS.");
-        if (baseUri.UserInfo.Length != 0) throw new ArgumentException("The base URI must not contain user info.");
+
+        // Uri.UserInfo is empty for BOTH "https://host" and "https://@host". Detect the '@'
+        // delimiter in the escaped authority so even empty user-info syntax is rejected. '%40'
+        // remains legal host/path data rather than being mistaken for this delimiter.
+        var original = baseUri.OriginalString;
+        var authorityStart = original.IndexOf("://", StringComparison.Ordinal);
+        if (authorityStart >= 0)
+        {
+            var authorityEnd = original.IndexOfAny(['/', '\\'], authorityStart + 3);
+            var rawAuthority = authorityEnd < 0 ? original[(authorityStart + 3)..] : original[(authorityStart + 3)..authorityEnd];
+            if (rawAuthority.Contains('@', StringComparison.Ordinal))
+                throw new ArgumentException("The base URI must not contain user info.");
+        }
         if (baseUri.Query.Length != 0) throw new ArgumentException("The base URI must not contain a query.");
         if (baseUri.Fragment.Length != 0) throw new ArgumentException("The base URI must not contain a fragment.");
 

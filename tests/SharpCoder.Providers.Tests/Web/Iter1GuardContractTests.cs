@@ -90,8 +90,10 @@ public sealed class Iter1GuardContractTests
             .SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.True(result.IsSuccess);
-        Assert.Empty(result.Data!.Results);
-        Assert.True(stream.ReadCount >= 5, "Positive control: the full body plus EOF was read.");
+        Assert.Empty(result.GetRawData()!.GetRawResults());
+        Assert.Equal(new[] { 16, 12, 8, 4, 1 }, stream.RequestedLengths);
+        Assert.Equal(5, stream.ReadCount);
+        Assert.Equal(cap, stream.TotalBytesRead);
         Assert.True(stream.Disposed);
 
         var overCap = owned.Track(new ChunkedWebStream(Encoding.UTF8.GetBytes("{\"results\":[]}  "), chunkSize: 4));
@@ -101,7 +103,9 @@ public sealed class Iter1GuardContractTests
 
         AssertFailure(over, WebToolErrorKind.ResponseTooLarge);
         AssertSafeMessage(over);
-        Assert.True(overCap.ReadCount >= 4, "Positive control: the crossing read was reached.");
+        Assert.Equal(new[] { 16, 12, 8, 4 }, overCap.RequestedLengths);
+        Assert.Equal(4, overCap.ReadCount);
+        Assert.Equal(cap + 1, overCap.TotalBytesRead);
         Assert.True(overCap.Disposed);
     }
 
@@ -215,9 +219,9 @@ public sealed class Iter1GuardContractTests
 
         Assert.True(result.IsSuccess);
         Assert.Null(result.ErrorKind);
-        Assert.Equal("T", result.Data!.Title);
-        Assert.Equal("C", result.Data.Content);
-        Assert.Equal(new[] { "L" }, result.Data.Links);
+        Assert.Equal("T", result.GetRawData()!.GetRawTitle());
+        Assert.Equal("C", result.GetRawData()!.GetRawContent());
+        Assert.Equal(new[] { "L" }, result.GetRawData()!.GetRawLinks());
         Assert.Empty(result.DisplayMessage);
     }
 

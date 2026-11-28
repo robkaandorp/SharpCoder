@@ -17,8 +17,8 @@ public sealed class OllamaWebClientResponseTests
         var handler = SearchOk("[]");
         var result = await Create(Options(handler)).SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        var data = Assert.IsType<WebSearchData>(result.Data);
-        Assert.Empty(data.Results);
+        var data = Assert.IsType<WebSearchData>(result.GetRawData());
+        Assert.Empty(data.GetRawResults());
         Assert.Null(result.ErrorKind);
         Assert.Equal(string.Empty, result.DisplayMessage);
     }
@@ -31,7 +31,7 @@ public sealed class OllamaWebClientResponseTests
         var handler = SearchOk("[null,1,\"s\",[],true]");
         var result = await Create(Options(handler)).SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        Assert.Empty(result.Data!.Results);
+        Assert.Empty(result.GetRawData()!.GetRawResults());
     }
 
     [Fact]
@@ -40,10 +40,10 @@ public sealed class OllamaWebClientResponseTests
         var handler = SearchOk("[null,1,\"s\",[],{\"title\":\"T\",\"url\":\"U\",\"content\":\"C\"},true,999]");
         var result = await Create(Options(handler)).SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        var entry = Assert.Single(result.Data!.Results);
-        Assert.Equal("T", entry.Title);
-        Assert.Equal("U", entry.Url);
-        Assert.Equal("C", entry.Content);
+        var entry = Assert.Single(result.GetRawData()!.GetRawResults());
+        Assert.Equal("T", entry.GetRawTitle());
+        Assert.Equal("U", entry.GetRawUrl());
+        Assert.Equal("C", entry.GetRawContent());
     }
 
     [Theory]
@@ -93,29 +93,37 @@ public sealed class OllamaWebClientResponseTests
               {"title":"T"},
               {"url":"U"},
               {"content":"C"},
-              {"title":null,"url":"U2","content":"C2"}
+              {"title":null,"url":"U2","content":"C2"},
+              {"title":"T3","url":null,"content":"C3"},
+              {"title":"T4","url":"U4","content":null}
             ]}
             """;
         var handler = RecordingWebHandler.Json(body);
         var result = await Create(Options(handler)).SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        var rows = result.Data!.Results;
-        Assert.Equal(6, rows.Count);
-        Assert.Equal(string.Empty, rows[0].Title);
-        Assert.Equal(string.Empty, rows[0].Url);
-        Assert.Equal(string.Empty, rows[0].Content);
-        Assert.Equal(string.Empty, rows[1].Title);
-        Assert.Equal(string.Empty, rows[1].Url);
-        Assert.Equal(string.Empty, rows[1].Content);
-        Assert.Equal("T", rows[2].Title);
-        Assert.Equal(string.Empty, rows[2].Url);
-        Assert.Equal(string.Empty, rows[2].Content);
-        Assert.Equal(string.Empty, rows[3].Title);
-        Assert.Equal("U", rows[3].Url);
-        Assert.Equal("C", rows[4].Content);
-        Assert.Equal(string.Empty, rows[5].Title);
-        Assert.Equal("U2", rows[5].Url);
-        Assert.Equal("C2", rows[5].Content);
+        var rows = result.GetRawData()!.GetRawResults();
+        Assert.Equal(8, rows.Count);
+        Assert.Equal(string.Empty, rows[0].GetRawTitle());
+        Assert.Equal(string.Empty, rows[0].GetRawUrl());
+        Assert.Equal(string.Empty, rows[0].GetRawContent());
+        Assert.Equal(string.Empty, rows[1].GetRawTitle());
+        Assert.Equal(string.Empty, rows[1].GetRawUrl());
+        Assert.Equal(string.Empty, rows[1].GetRawContent());
+        Assert.Equal("T", rows[2].GetRawTitle());
+        Assert.Equal(string.Empty, rows[2].GetRawUrl());
+        Assert.Equal(string.Empty, rows[2].GetRawContent());
+        Assert.Equal(string.Empty, rows[3].GetRawTitle());
+        Assert.Equal("U", rows[3].GetRawUrl());
+        Assert.Equal("C", rows[4].GetRawContent());
+        Assert.Equal(string.Empty, rows[5].GetRawTitle());
+        Assert.Equal("U2", rows[5].GetRawUrl());
+        Assert.Equal("C2", rows[5].GetRawContent());
+        Assert.Equal("T3", rows[6].GetRawTitle());
+        Assert.Equal(string.Empty, rows[6].GetRawUrl());
+        Assert.Equal("C3", rows[6].GetRawContent());
+        Assert.Equal("T4", rows[7].GetRawTitle());
+        Assert.Equal("U4", rows[7].GetRawUrl());
+        Assert.Equal(string.Empty, rows[7].GetRawContent());
     }
 
     [Fact]
@@ -123,21 +131,21 @@ public sealed class OllamaWebClientResponseTests
     {
         var empty = await FetchWithBody("{}");
         Assert.True(empty.IsSuccess);
-        Assert.Equal(string.Empty, empty.Data!.Title);
-        Assert.Equal(string.Empty, empty.Data.Content);
-        Assert.Empty(empty.Data.Links);
+        Assert.Equal(string.Empty, empty.GetRawData()!.GetRawTitle());
+        Assert.Equal(string.Empty, empty.GetRawData()!.GetRawContent());
+        Assert.Empty(empty.GetRawData()!.GetRawLinks());
 
         var nulls = await FetchWithBody("{\"title\":null,\"content\":null,\"links\":null}");
         Assert.True(nulls.IsSuccess);
-        Assert.Equal(string.Empty, nulls.Data!.Title);
-        Assert.Equal(string.Empty, nulls.Data.Content);
-        Assert.Empty(nulls.Data.Links);
+        Assert.Equal(string.Empty, nulls.GetRawData()!.GetRawTitle());
+        Assert.Equal(string.Empty, nulls.GetRawData()!.GetRawContent());
+        Assert.Empty(nulls.GetRawData()!.GetRawLinks());
 
         var mixed = await FetchWithBody("{\"title\":\"T\",\"content\":null,\"links\":[]}");
         Assert.True(mixed.IsSuccess);
-        Assert.Equal("T", mixed.Data!.Title);
-        Assert.Equal(string.Empty, mixed.Data.Content);
-        Assert.Empty(mixed.Data.Links);
+        Assert.Equal("T", mixed.GetRawData()!.GetRawTitle());
+        Assert.Equal(string.Empty, mixed.GetRawData()!.GetRawContent());
+        Assert.Empty(mixed.GetRawData()!.GetRawLinks());
     }
 
     [Fact]
@@ -146,7 +154,7 @@ public sealed class OllamaWebClientResponseTests
         var body = "{\"title\":\"T\",\"content\":\"C\",\"links\":[null,1,true,{},[],\"L1\",\"L2\",null,\"L3\"]}";
         var result = await FetchWithBody(body);
         Assert.True(result.IsSuccess);
-        Assert.Equal(new[] { "L1", "L2", "L3" }, result.Data!.Links);
+        Assert.Equal(new[] { "L1", "L2", "L3" }, result.GetRawData()!.GetRawLinks());
     }
 
     [Theory]
@@ -177,9 +185,9 @@ public sealed class OllamaWebClientResponseTests
         var body = "{\"title\":\"T\",\"content\":\"" + longContent + "\",\"links\":[\"A\",\"B\"]}";
         var result = await FetchWithBody(body);
         Assert.True(result.IsSuccess);
-        Assert.Equal("T", result.Data!.Title);
-        Assert.Equal(longContent, result.Data.Content);
-        Assert.Equal(new[] { "A", "B" }, result.Data.Links);
+        Assert.Equal("T", result.GetRawData()!.GetRawTitle());
+        Assert.Equal(longContent, result.GetRawData()!.GetRawContent());
+        Assert.Equal(new[] { "A", "B" }, result.GetRawData()!.GetRawLinks());
         Assert.Equal(string.Empty, result.DisplayMessage);
     }
 
@@ -193,12 +201,15 @@ public sealed class OllamaWebClientResponseTests
     public async Task NonSuccessStatus_ImmediateHttpFailure_WithSecretInReasonAndBody(HttpStatusCode status)
     {
         var neverRead = new NeverReadContent(SecretSentinel);
-        var handler = RecordingWebHandler.With(status, neverRead);
-        var result = await Create(Options(handler)).FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
+        // Pin the sentinel in the ACTUAL response metadata (reason phrase), not just in the body.
+        var response = new HttpResponseMessage(status) { Content = neverRead, ReasonPhrase = SecretSentinel };
+        var metadataHandler = RecordingWebHandler.With(status, neverRead);
+        metadataHandler.ResponseFactory = _ => response;
+        var result = await Create(Options(metadataHandler)).FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
 
         AssertFailure(result, WebToolErrorKind.HttpFailure);
         AssertSafeMessage(result);
-        Assert.Equal(1, handler.SendCount);
+        Assert.Equal(1, metadataHandler.SendCount);
         Assert.Equal(0, neverRead.ReadAttempts);
         Assert.True(neverRead.Disposed);
         Assert.DoesNotContain(status.ToString(), result.DisplayMessage, StringComparison.OrdinalIgnoreCase);
@@ -210,16 +221,22 @@ public sealed class OllamaWebClientResponseTests
         // A body that would block forever if read, and advertise an enormous length. If production
         // touched it, the test would hang at the gate; instead it must classify immediately.
         var stalled = new GatedWebStream();
-        var content = new StreamContent(stalled);
-        content.Headers.ContentLength = long.MaxValue / 2;
-        var handler = RecordingWebHandler.With(HttpStatusCode.BadGateway, content);
-
-        var result = await Create(Options(handler)).FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
-        AssertFailure(result, WebToolErrorKind.HttpFailure);
-        AssertSafeMessage(result);
-        Assert.Equal(0, stalled.ReadCount);
-        Assert.True(stalled.Disposed, "The response and its content must be disposed even when the body is never read.");
-        stalled.ReleaseAllPending();
+        try
+        {
+            var content = new StreamContent(stalled);
+            content.Headers.ContentLength = long.MaxValue / 2;
+            var handler = RecordingWebHandler.With(HttpStatusCode.BadGateway, content);
+            var result = await Create(Options(handler)).FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
+            AssertFailure(result, WebToolErrorKind.HttpFailure);
+            AssertSafeMessage(result);
+            Assert.Equal(0, stalled.ReadCount);
+            await stalled.WaitForDisposalAsync("non-success stalled body");
+        }
+        finally
+        {
+            // Assertion failures must never strand the parked stream.
+            stalled.ReleaseAllPending();
+        }
     }
 
     [Theory]
@@ -306,7 +323,7 @@ public sealed class OllamaWebClientResponseTests
             .SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.True(result.IsSuccess);
-        Assert.Empty(result.Data!.Results);
+        Assert.Empty(result.GetRawData()!.GetRawResults());
         Assert.True(stream.Disposed);
     }
 
@@ -337,7 +354,7 @@ public sealed class OllamaWebClientResponseTests
         var result = await Create(Options(handler))
             .FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
-        Assert.Equal("T", result.Data!.Title);
+        Assert.Equal("T", result.GetRawData()!.GetRawTitle());
     }
 
     [Fact]
