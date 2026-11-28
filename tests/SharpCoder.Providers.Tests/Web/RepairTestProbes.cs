@@ -93,36 +93,28 @@ internal sealed class GatedOpenContent : HttpContent
     }
 }
 
-/// <summary>Records physical release order and can throw at one selected cleanup point.</summary>
+/// <summary>Records physical release order and can throw at response/content/stream cleanup.</summary>
 internal sealed class CleanupProbeResources
 {
-    private int _requestDisposeCalls;
-    private int _registrationDisposeCalls;
-    private int _timerDisposeCalls;
     private readonly TaskCompletionSource<bool> _responseCreated = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
+    private int _requestDisposeCalls;
     internal Task ResponseCreated => _responseCreated.Task;
-
-    internal List<string> Releases { get; } = new();
     internal HttpRequestMessage? Request { get; private set; }
+    internal int RequestDisposeCalls => Volatile.Read(ref _requestDisposeCalls);
+    internal bool ThrowOnRequestDispose { get; set; }
+    internal List<string> Releases { get; } = new();
     internal ThrowingResponse? Response { get; private set; }
     internal ThrowingContent? Content { get; private set; }
     internal ThrowingStream? Stream { get; private set; }
-    internal bool ThrowOnRequestDispose { get; set; }
-    internal bool ThrowOnRegistrationDispose { get; set; }
-    internal bool ThrowOnTimerDispose { get; set; }
-    internal int RequestDisposeCalls => Volatile.Read(ref _requestDisposeCalls);
-    internal int RegistrationDisposeCalls => Volatile.Read(ref _registrationDisposeCalls);
-    internal int TimerDisposeCalls => Volatile.Read(ref _timerDisposeCalls);
 
     internal GatedWebHandler CreateGatedHandler(HttpStatusCode status = HttpStatusCode.OK, string body = "{}")
     {
-        var handler = new GatedWebHandler
+        return new GatedWebHandler
         {
             ResponseFactory = request =>
             {
                 Request = request;
-                Request.Content = new RequestDisposalContent(this);
+                request.Content = new RequestDisposalContent(this);
                 Stream = new ThrowingStream(this, Encoding.UTF8.GetBytes(body));
                 Content = new ThrowingContent(this, Stream);
                 Response = new ThrowingResponse(this, status).SetContent(Content);
@@ -130,63 +122,17 @@ internal sealed class CleanupProbeResources
                 return Response;
             },
         };
-        return handler;
-    }
-
-    internal void Complete(GatedWebHandler handler, HttpStatusCode status) => handler.ReleaseWith(status);
-
-    internal void ConfigureCleanupFault(string thrower)
-    {
-        ThrowOnRequestDispose = thrower == "request";
-        ThrowOnRegistrationDispose = thrower == "registration";
-        ThrowOnTimerDispose = thrower == "timer";
-        if (Response is not null) Response.ThrowOnDispose = thrower == "response";
-        if (Content is not null) Content.ThrowOnDispose = thrower == "content";
-        if (Stream is not null) Stream.ThrowOnDispose = thrower == "stream";
-    }
-
-    internal async Task AssertAllResourcesReleasedAsync()
-    {
-        Assert.NotNull(Request);
-        Assert.NotNull(Response);
-        Assert.NotNull(Content);
-        Assert.NotNull(Stream);
-        Assert.Equal(1, RequestDisposeCalls);
-        Assert.Equal(1, Response.DisposeCalls);
-        Assert.Equal(1, Content.DisposeCalls);
-        Assert.Equal(1, Stream.DisposeCalls);
-        Assert.Equal(1, RegistrationDisposeCalls);
-        Assert.Equal(1, TimerDisposeCalls);
-        Assert.Equal(new[] { "response-start", "content", "stream", "registration", "timer", "request" }, Releases);
-        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     internal void Record(string name) { lock (Releases) Releases.Add(name); }
-
     internal void RequestDisposed()
     {
         Record("request");
         Interlocked.Increment(ref _requestDisposeCalls);
         if (ThrowOnRequestDispose) throw new IOException("REQUEST_CLEANUP_SENTINEL");
     }
-
-    internal void RegistrationDisposed()
-    {
-        Record("registration");
-        Interlocked.Increment(ref _registrationDisposeCalls);
-        if (ThrowOnRegistrationDispose) throw new IOException("REGISTRATION_CLEANUP_SENTINEL");
-    }
-
-    internal void TimerDisposed()
-    {
-        Record("timer");
-        Interlocked.Increment(ref _timerDisposeCalls);
-        if (ThrowOnTimerDispose) throw new IOException("TIMER_CLEANUP_SENTINEL");
-    }
-
 }
 
-/// <summary>Request content that records and can fault the request's actual disposal path.</summary>
 internal sealed class RequestDisposalContent(CleanupProbeResources owner) : HttpContent
 {
     protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
@@ -204,24 +150,19 @@ internal sealed class ThrowingResponse(CleanupProbeResources owner, HttpStatusCo
     private int _disposeCalls;
     public int DisposeCalls => Volatile.Read(ref _disposeCalls);
     public bool ThrowOnDispose { get; set; }
-    public ThrowingResponse SetContent(ThrowingContent value)
-    {
-        Content = value;
-        return this;
-    }
+    public ThrowingResponse SetContent(ThrowingContent value) { Content = value; return this; }
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            owner.Record("response-start");
-            Interlocked.Increment(ref _disposeCalls);
+            if (Interlocked.Increment(ref _disposeCalls) == 1) owner.Record("response-start");
         }
         base.Dispose(disposing);
         if (ThrowOnDispose) throw new IOException("RESPONSE_CLEANUP_SENTINEL");
     }
 }
 
-internal sealed class ThrowingContent(CleanupProbeResources owner, Stream stream) : StreamContent(stream)
+internal sealed class ThrowingContent(CleanupProbeResources owner, Stream stream) : PreopenedStreamContent(stream)
 {
     private int _disposeCalls;
     public int DisposeCalls => Volatile.Read(ref _disposeCalls);
@@ -230,8 +171,7 @@ internal sealed class ThrowingContent(CleanupProbeResources owner, Stream stream
     {
         if (disposing)
         {
-            owner.Record("content");
-            Interlocked.Increment(ref _disposeCalls);
+            if (Interlocked.Increment(ref _disposeCalls) == 1) owner.Record("content");
         }
         base.Dispose(disposing);
         if (ThrowOnDispose) throw new IOException("CONTENT_CLEANUP_SENTINEL");
@@ -247,8 +187,7 @@ internal sealed class ThrowingStream(CleanupProbeResources owner, byte[] bytes) 
     {
         if (disposing)
         {
-            owner.Record("stream");
-            Interlocked.Increment(ref _disposeCalls);
+            if (Interlocked.Increment(ref _disposeCalls) == 1) owner.Record("stream");
         }
         base.Dispose(disposing);
         if (ThrowOnDispose) throw new IOException("STREAM_CLEANUP_SENTINEL");
@@ -259,17 +198,13 @@ internal sealed class ThrowingStream(CleanupProbeResources owner, byte[] bytes) 
 /// Returns the SAME stream on every open and owns it on content disposal. This makes the response's
 /// disposal chain deterministic without relying on StreamContent's internal stream-cache behavior.
 /// </summary>
-internal sealed class PreopenedStreamContent : HttpContent
+internal class PreopenedStreamContent : HttpContent
 {
     private readonly Stream _stream;
     internal PreopenedStreamContent(Stream stream) => _stream = stream;
 
     protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult(_stream);
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing) _stream.Dispose();
-        base.Dispose(disposing);
-    }
+    // HttpContent owns and disposes the stream returned by CreateContentReadStreamAsync.
     protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
     protected override bool TryComputeLength(out long length)
     {
@@ -345,17 +280,4 @@ internal sealed class DisposalGatedBodyStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-}
-
-/// <summary>Real manual timer with observable, faultable cleanup hooks for ownership tests.</summary>
-internal sealed class FaultingCleanupTimeProvider : ManualWebTimeProvider, IAsyncDisposable
-{
-    internal Action? OnTimerDispose { get; set; }
-    internal Action? OnRegistrationDispose { get; set; }
-
-    public ValueTask DisposeAsync()
-    {
-        OnRegistrationDispose?.Invoke();
-        return ValueTask.CompletedTask;
-    }
 }

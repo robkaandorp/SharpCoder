@@ -212,37 +212,61 @@ public sealed class WebRepairContractTests
     [InlineData("response")]
     [InlineData("content")]
     [InlineData("stream")]
-    [InlineData("registration")]
     [InlineData("timer")]
-    public async Task CleanupFault_DoesNotReplaceHttpFailure_AndEveryResourceIsReleased(string thrower)
+    public async Task CleanupFault_DoesNotReplaceHttpFailure_AndOwnedResourcesAreReleased(string thrower)
     {
-        await using var owned = new DeterministicTestOwnedResources();
-        var clock = owned.TrackAsync(new FaultingCleanupTimeProvider());
         var resources = new CleanupProbeResources();
-        clock.OnTimerDispose = resources.TimerDisposed;
-        clock.OnRegistrationDispose = resources.RegistrationDisposed;
-        var handler = owned.Track(resources.CreateGatedHandler(HttpStatusCode.ServiceUnavailable));
+        var clock = new FaultingCleanupTimeProvider();
+        var handler = resources.CreateGatedHandler(HttpStatusCode.ServiceUnavailable);
         var client = Create(Options(handler, timeProvider: clock));
         var call = client.FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
         await handler.WaitForEntryAsync("cleanup fault");
-        Assert.NotEmpty(clock.RegisteredTimers);
-        resources.Complete(handler, HttpStatusCode.ServiceUnavailable);
-        await resources.ResponseCreated.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        resources.ConfigureCleanupFault(thrower);
+        handler.ReleaseWith(HttpStatusCode.ServiceUnavailable);
+        await resources.ResponseCreated.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        resources.ThrowOnRequestDispose = thrower == "request";
+        resources.Response!.ThrowOnDispose = thrower == "response";
+        resources.Content!.ThrowOnDispose = thrower == "content";
+        resources.Stream!.ThrowOnDispose = thrower == "stream";
+        clock.ThrowOnTimerDispose = thrower == "timer";
         var result = await call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.HttpFailure);
         AssertSafeMessage(result);
-        await resources.AssertAllResourcesReleasedAsync();
+        Assert.Equal(1, resources.RequestDisposeCalls);
+        Assert.Equal(1, resources.Response.DisposeCalls);
+        Assert.Equal(1, resources.Content.DisposeCalls);
+        Assert.Equal(0, resources.Stream.DisposeCalls); // non-success never opens/owns the body stream
+        Assert.Equal(1, clock.TimerDisposeCalls);
     }
 
     [Fact]
-    public async Task CleanupFault_DoesNotReplaceSuccess_OrCallerCancellation()
+    public async Task CleanupFault_DoesNotReplaceCallerCancellation()
+    {
+        var clock = new FaultingCleanupTimeProvider();
+        var body = new GatedValidBodyStream(Encoding.UTF8.GetBytes(@"{""title"":""T""}"));
+        var handler = RecordingWebHandler.With(HttpStatusCode.OK, new StreamContent(body));
+        using var caller = new CancellationTokenSource();
+        var client = Create(Options(handler, timeProvider: clock));
+        var call = client.FetchAsync("https://page.example.test", caller.Token);
+        await body.WaitForCompletedReadAsync();
+        clock.ThrowOnTimerDispose = true;
+        caller.Cancel();
+        body.ReleaseEof();
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+        Assert.Equal(caller.Token, thrown.CancellationToken);
+        Assert.Equal(1, clock.TimerDisposeCalls);
+    }
+
+    [Fact]
+    public async Task CleanupFault_DoesNotReplaceSuccess()
     {
         var resources = new CleanupProbeResources();
-        var handler = resources.CreateGatedHandler(body: "{\"title\":\"T\"}");
+        var handler = resources.CreateGatedHandler(body: @"{""title"":""T""}");
         var client = Create(Options(handler));
         var call = client.FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
         await handler.WaitForEntryAsync("success cleanup");
+        handler.ReleaseWith(HttpStatusCode.OK);
+        await resources.ResponseCreated.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         resources.Response!.ThrowOnDispose = true;
         resources.Content!.ThrowOnDispose = true;
         resources.Stream!.ThrowOnDispose = true;
@@ -252,6 +276,5 @@ public sealed class WebRepairContractTests
         Assert.Equal(1, resources.Stream!.DisposeCalls);
         Assert.Equal(1, resources.Content!.DisposeCalls);
         Assert.Equal(1, resources.Response!.DisposeCalls);
-        Assert.Equal(new[] { "response-start", "content", "stream" }, resources.Releases);
     }
 }

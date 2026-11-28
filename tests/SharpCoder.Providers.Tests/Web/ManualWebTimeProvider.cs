@@ -9,6 +9,7 @@ namespace SharpCoder.Providers.Tests.Web;
 /// </summary>
 internal class ManualWebTimeProvider : TimeProvider
 {
+    internal virtual void OnTimerDispose() { }
     private readonly Channel<ManualWebTimer> _timers =
         Channel.CreateUnbounded<ManualWebTimer>(new UnboundedChannelOptions
         {
@@ -147,11 +148,26 @@ internal sealed class ManualWebTimer : ITimer
         return true;
     }
 
-    public void Dispose() => Interlocked.Exchange(ref _disposed, 1);
+    public void Dispose()
+    {
+        Interlocked.Exchange(ref _disposed, 1);
+        _owner.OnTimerDispose();
+    }
 
     public ValueTask DisposeAsync()
     {
         Dispose();
         return ValueTask.CompletedTask;
+    }
+}
+
+internal sealed class FaultingCleanupTimeProvider : ManualWebTimeProvider
+{
+    internal bool ThrowOnTimerDispose { get; set; }
+    internal int TimerDisposeCalls;
+    internal override void OnTimerDispose()
+    {
+        TimerDisposeCalls++;
+        if (ThrowOnTimerDispose) throw new IOException("TIMER_CLEANUP_SENTINEL");
     }
 }

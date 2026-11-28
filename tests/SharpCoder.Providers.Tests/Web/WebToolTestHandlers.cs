@@ -132,7 +132,6 @@ internal sealed class GatedWebHandler : RecordingWebHandler
         await _release.Task.ConfigureAwait(false);
         if (ResponseFactory is null) return _release.Task.Result;
         var response = ResponseFactory(request);
-        await Task.Yield(); // deterministic rendezvous before HttpClient can dispose the response
         return response;
     }
 
