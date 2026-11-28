@@ -64,6 +64,17 @@ internal sealed class StreamingMarkdownWriter
         FlushMarkdown();
     }
 
+    /// <summary>
+    /// Flushes all prose received so far without ending the turn. Call before writing any
+    /// out-of-band annotation (for example a structured tool-call line) so the annotation
+    /// appears <em>after</em> the text that preceded it rather than before it.
+    /// </summary>
+    public void FlushPending()
+    {
+        DrainLines(flushAll: true);
+        FlushMarkdown();
+    }
+
     private void DrainLines(bool flushAll)
     {
         while (true)

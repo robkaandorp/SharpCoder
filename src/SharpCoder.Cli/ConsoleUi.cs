@@ -175,14 +175,19 @@ public sealed class ConsoleUi
                     case StreamingUpdateKind.ToolCallStarted when update.ToolCall is { } started:
                         structuredSeen = true;
                         StopSpinner(spinnerCts, spinner);
+                        // The markdown writer buffers prose until a complete block. Flush it here so
+                        // the tool line appears after the reasoning that preceded the call, not before.
+                        writer.FlushPending();
                         toolRenderer.Started(started);
                         break;
                     case StreamingUpdateKind.ToolCallCompleted when update.ToolCall is { } finished:
                         structuredSeen = true;
+                        writer.FlushPending();
                         toolRenderer.Finished(finished);
                         break;
                     case StreamingUpdateKind.RoundProgress when update.Progress is { } progress:
                         structuredSeen = true;
+                        writer.FlushPending();
                         toolRenderer.Progress(progress);
                         break;
                     case StreamingUpdateKind.Completed:

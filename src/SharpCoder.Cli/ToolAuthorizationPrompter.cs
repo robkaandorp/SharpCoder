@@ -1,4 +1,3 @@
-using System.Text;
 using SharpCoder;
 using Spectre.Console;
 
@@ -142,24 +141,37 @@ internal sealed class ToolAuthorizationPolicy
 internal sealed class SpectreToolConfirmationPrompter : IToolConfirmationPrompter
 {
     private readonly IAnsiConsole _console;
+    private readonly Func<CancellationToken, char?> _readKey;
 
-    public SpectreToolConfirmationPrompter(IAnsiConsole console) => _console = console;
+    public SpectreToolConfirmationPrompter(IAnsiConsole console)
+        : this(console, ReadKey)
+    {
+    }
+
+    /// <summary>Test seam: allows injecting the key read so tests never block on stdin.</summary>
+    internal SpectreToolConfirmationPrompter(IAnsiConsole console, Func<CancellationToken, char?> readKey)
+    {
+        _console = console;
+        _readKey = readKey;
+    }
 
     public ToolConfirmationAnswer Ask(ToolAuthorizationContext context, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
 
         _console.WriteLine();
-        _console.Write(new Rule($"[yellow]tool authorization: {Markup.Escape(context.ToolName)}[/]")
+        _console.Write(new Rule
         {
+            Title = $"[yellow]tool authorization: {Markup.Escape(context.ToolName)}[/]",
             Justification = Justify.Left,
         });
-        _console.WriteLine(Describe(context));
+        foreach (var line in Describe(context))
+            _console.MarkupLine(line);
         _console.WriteLine();
 
         // Read a single key so no Enter is needed. EOF / non-interactive input fails closed.
         _console.Markup("[bold]Allow?[/] [dim][[y]]es  [[n]]o  [[a]]lways  [[s]]top-all  (default: no)[/] ");
-        var key = ReadKey(ct);
+        var key = _readKey(ct);
         var answer = key switch
         {
             'y' or 'Y' => ToolConfirmationAnswer.Yes,
@@ -167,7 +179,7 @@ internal sealed class SpectreToolConfirmationPrompter : IToolConfirmationPrompte
             's' or 'S' => ToolConfirmationAnswer.Never,
             _ => ToolConfirmationAnswer.No,
         };
-        _console.WriteLine(answer switch
+        _console.MarkupLine(answer switch
         {
             ToolConfirmationAnswer.Yes => "[green]allowed[/]",
             ToolConfirmationAnswer.Always => "[green]allowed (always for this session)[/]",
@@ -178,19 +190,21 @@ internal sealed class SpectreToolConfirmationPrompter : IToolConfirmationPrompte
         return answer;
     }
 
-    private static string Describe(ToolAuthorizationContext context)
+    /// <summary>Returns already-escaped markup lines describing the tool arguments.</summary>
+    private static IReadOnlyList<string> Describe(ToolAuthorizationContext context)
     {
-        var sb = new StringBuilder();
+        var lines = new List<string>();
         foreach (var (name, value) in context.Arguments)
         {
             var text = value?.ToString() ?? "(null)";
             if (text.Length > 600) text = text[..599] + "…";
-            // Preserve newlines for commands; the panel keeps them readable.
-            sb.AppendLine($"  [dim]{Markup.Escape(name)}:[/]");
+            lines.Add($"  [dim]{Markup.Escape(name)}:[/]");
             foreach (var line in text.Replace("\r\n", "\n").Split('\n'))
-                sb.AppendLine($"    {Markup.Escape(line)}");
+                lines.Add($"    {Markup.Escape(line)}");
         }
-        return sb.Length == 0 ? "  [dim](no arguments)[/]" : sb.ToString().TrimEnd();
+        if (lines.Count == 0)
+            lines.Add("  [dim](no arguments)[/]");
+        return lines;
     }
 
     private static char? ReadKey(CancellationToken ct)

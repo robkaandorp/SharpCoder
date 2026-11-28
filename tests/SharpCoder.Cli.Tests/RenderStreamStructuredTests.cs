@@ -73,6 +73,32 @@ public class RenderStreamStructuredTests
     }
 
     [Fact]
+    public async Task LiveMode_ProseBeforeToolCallIsRenderedBeforeTheToolLine()
+    {
+        // Regression: the markdown writer buffers prose until a complete block, while the
+        // structured tool renderer writes immediately. Without an explicit flush the tool line
+        // appeared BEFORE the reasoning that preceded it.
+        var console = new TestConsole { EmitAnsiSequences = false };
+        console.Profile.Capabilities.Interactive = true;
+        var ui = new ConsoleUi { MarkdownMode = MarkdownMode.Live, RenderConsole = console };
+
+        await ui.RenderStreamAsync(Script(TestContext.Current.CancellationToken), TestContext.Current.CancellationToken);
+
+        var output = console.Output;
+        var before = output.IndexOf("Before.", StringComparison.Ordinal);
+        var toolLine = output.IndexOf("write_file(filePath=a.cs)", StringComparison.Ordinal);
+        var after = output.IndexOf("After.", StringComparison.Ordinal);
+
+        Assert.True(before >= 0, "preceding prose must be rendered");
+        Assert.True(toolLine >= 0, "tool line must be rendered");
+        Assert.True(after >= 0, "following prose must be rendered");
+        Assert.True(before < toolLine,
+            "reasoning before a tool call must appear before the tool line");
+        Assert.True(toolLine < after,
+            "reasoning after a tool call must appear after the tool line");
+    }
+
+    [Fact]
     public async Task VerboseMode_ShowsSecondResultLine()
     {
         var console = new TestConsole { EmitAnsiSequences = false };
