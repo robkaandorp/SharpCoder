@@ -269,13 +269,45 @@ public sealed class OllamaWebClientProtocolTests
         Assert.Equal(new[] { "Bearer " + Credential }, request.AuthorizationValues);
         Assert.Equal("INHERITED_SENTINEL", request.InheritedMarker); // other inherited headers survive
         Assert.StartsWith("application/json", request.ContentType, StringComparison.Ordinal);
+        // A typed inherited Authorization is present on the host client. The recorded request must
+        // carry ONLY the request-scoped value (one value, exact spelling), never the inherited one.
         Assert.DoesNotContain("INHERITED", request.Authorization, StringComparison.Ordinal);
+        Assert.Single(request.AuthorizationValues);
 
         using var json = JsonDocument.Parse(request.Body);
         var root = json.RootElement;
         Assert.Equal(2, root.EnumerateObject().Count()); // property count, not a collection-size assertion
         Assert.Equal("hello \"world\" \u00E9", root.GetProperty("query").GetString());
         Assert.Equal(3, root.GetProperty("max_results").GetInt32());
+    }
+
+    [Fact]
+    public async Task InheritedAuthorization_IsReplacedByRequestScopedBearerOnly_PositiveControl()
+    {
+        var handler = FetchOk();
+        var options = Options(handler);
+
+        // POSITIVE CONTROL: with no request-scoped Authorization, HttpClient really does merge the
+        // host client's inherited default values. This proves the "no inherited value" assertion
+        // below is not passable on a client that never had an inherited header at all.
+        using (var probe = new HttpRequestMessage(HttpMethod.Post, new Uri(options.BaseUri, "api/web_fetch")))
+        using (var probeResponse = await options.HttpClient.SendAsync(
+                   probe,
+                   HttpCompletionOption.ResponseHeadersRead,
+                   TestContext.Current.CancellationToken))
+        {
+            var inherited = handler.Requests[0].AuthorizationValues;
+            Assert.NotEmpty(inherited);
+            Assert.Contains(inherited, value => value.Contains("INHERITED_SENTINEL", StringComparison.Ordinal));
+        }
+
+        var result = await Create(options).FetchAsync(
+            "https://page.example.test", TestContext.Current.CancellationToken);
+        Assert.True(result.IsSuccess);
+        var production = handler.Requests[1];
+        Assert.Equal(new[] { "Bearer " + Credential }, production.AuthorizationValues);
+        Assert.All(production.AuthorizationValues, value =>
+            Assert.DoesNotContain("INHERITED", value, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -290,6 +322,8 @@ public sealed class OllamaWebClientProtocolTests
         Assert.Equal("/api/web_fetch", request.AbsolutePath);
         Assert.Equal("Bearer " + Credential, request.Authorization);
         Assert.Equal(new[] { "Bearer " + Credential }, request.AuthorizationValues);
+        Assert.Single(request.AuthorizationValues);
+        Assert.DoesNotContain("INHERITED", request.Authorization, StringComparison.Ordinal);
         using var json = JsonDocument.Parse(request.Body);
         Assert.Single(json.RootElement.EnumerateObject());
         Assert.Equal("https://page.example.test/a?b=1#c", json.RootElement.GetProperty("url").GetString());

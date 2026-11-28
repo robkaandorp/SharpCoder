@@ -24,9 +24,12 @@ internal static class OllamaWebClientTestHarness
         int maxResponseBytes = OllamaWebClientOptions.DefaultMaxResponseBytes)
     {
         var client = new HttpClient(handler);
-        // Deliberately install an inherited Authorization value as well as a competing marker to
-        // prove the request-scoped credential wins and inherited auth is cleared.
-        client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer INHERITED_SENTINEL");
+        // Deliberately install a typed inherited Authorization value as well as a competing marker.
+        // HttpClient merges a default Authorization only when the request has none, so the recorded
+        // request must contain exactly one request-scoped Bearer value with no inherited sentinel.
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", "INHERITED_SENTINEL");
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer RAW_INHERITED_SENTINEL");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-Inherited-Authorization", "INHERITED_SENTINEL");
         return new OllamaWebClientOptions
         {
@@ -64,16 +67,25 @@ internal static class OllamaWebClientTestHarness
         Assert.False(string.IsNullOrEmpty(result.DisplayMessage));
     }
 
-    /// <summary>
-    /// Asserts the fixed message is library-owned and contains no dynamic data. Bounded diagnostic
-    /// only: the sentinel, raw status text, and common exception words are checked explicitly.
-    /// </summary>
+    /// <summary>Asserts the observed message is EXACTLY one of the fixed library-owned literals.</summary>
     internal static void AssertSafeMessage<T>(WebToolResult<T> result)
         where T : class
     {
         var message = result.DisplayMessage;
         Assert.NotNull(message);
         Assert.True(message.Length < 128, "Display message must be a short fixed literal.");
+        Assert.Contains(
+            message,
+            new HashSet<string>(StringComparer.Ordinal)
+            {
+                WebToolErrorMessages.Validation,
+                WebToolErrorMessages.CredentialUnavailable,
+                WebToolErrorMessages.HttpFailure,
+                WebToolErrorMessages.TransportFailure,
+                WebToolErrorMessages.MalformedResponse,
+                WebToolErrorMessages.ResponseTooLarge,
+                WebToolErrorMessages.Timeout,
+            });
         Assert.DoesNotContain(SecretSentinel, message, StringComparison.Ordinal);
         Assert.DoesNotContain("Exception", message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Bearer", message, StringComparison.OrdinalIgnoreCase);

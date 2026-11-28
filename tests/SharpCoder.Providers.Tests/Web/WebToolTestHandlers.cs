@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
+using System.Threading.Channels;
 
 namespace SharpCoder.Providers.Tests.Web;
 
@@ -24,11 +25,12 @@ internal sealed record RecordedWebRequest(
 /// A local, never-network handler that records requests and returns a programmable response. Each
 /// test owns its instance; disposal is deterministic and observable.
 /// </summary>
-internal class RecordingWebHandler : HttpMessageHandler{
+internal class RecordingWebHandler : HttpMessageHandler
+{
     private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _respond;
     private readonly ConcurrentQueue<RecordedWebRequest> _requests = new();
 
-    protected RecordingWebHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) =>
+    internal RecordingWebHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) =>
         _respond = respond;
 
     internal int SendCount;
@@ -126,8 +128,17 @@ internal sealed class GatedWebHandler : RecordingWebHandler
     /// <summary>Waits with a bounded budget so a broken test fails with diagnostics instead of hanging.</summary>
     internal async Task WaitForEntryAsync(string because)
     {
-        var completed = await Task.WhenAny(_entered.Task, Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken)).ConfigureAwait(false);
-        if (completed != _entered.Task) throw new TimeoutException($"Handler was never entered: {because}");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken, timeout.Token);
+        try
+        {
+            await _entered.Task.WaitAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Handler was never entered: {because}");
+        }
     }
 
     /// <summary>Releases the awaited send with a response.</summary>
@@ -156,30 +167,35 @@ internal sealed class GatedWebHandler : RecordingWebHandler
 /// </summary>
 internal sealed class OwningGatedContent : StreamContent
 {
-    private int _disposed;
+    private readonly TaskCompletionSource<bool> _disposed =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal OwningGatedContent(GatedWebStream stream)
         : base(stream) => Stream = stream;
 
     internal GatedWebStream Stream { get; }
 
-    internal bool ContentDisposed => Volatile.Read(ref _disposed) != 0;
+    internal bool ContentDisposed => _disposed.Task.IsCompleted;
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) Interlocked.Exchange(ref _disposed, 1);
+        if (disposing) _disposed.TrySetResult(true);
         base.Dispose(disposing);
     }
 
     internal async Task WaitForDisposalAsync(string because)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
-        while (DateTime.UtcNow < deadline)
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken, timeout.Token);
+        try
         {
-            if (ContentDisposed) return;
-            await Task.Delay(1, TestContext.Current.CancellationToken).ConfigureAwait(false);
+            await _disposed.Task.WaitAsync(linked.Token).ConfigureAwait(false);
         }
-        throw new TimeoutException($"Content was never disposed: {because}");
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Content was never disposed: {because}");
+        }
     }
 }
 
@@ -189,71 +205,89 @@ internal sealed class OwningGatedContent : StreamContent
 /// </summary>
 internal sealed class GatedWebStream : Stream
 {
-    private readonly ConcurrentQueue<TaskCompletionSource<int>> _releases = new();
+    private readonly Channel<TaskCompletionSource<int>> _releases =
+        Channel.CreateUnbounded<TaskCompletionSource<int>>(new UnboundedChannelOptions
+        {
+            SingleReader = false,
+            SingleWriter = false,
+        });
     private readonly TaskCompletionSource<bool> _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Channel<int> _readCounts = Channel.CreateUnbounded<int>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = true,
+    });
     private int _readCount;
-    private int _disposed;
 
     internal int ReadCount => Volatile.Read(ref _readCount);
 
-    internal bool Disposed => Volatile.Read(ref _disposed) != 0;
+    internal bool Disposed => _disposed.Task.IsCompleted;
 
-    /// <summary>
-    /// Bounded observation of deterministic disposal. Awaiting the already-completed call is the
-    /// synchronization point; this simply allows response/content disposal continuations to settle
-    /// without relying on narrow wall-clock margins.
-    /// </summary>
     internal async Task WaitForDisposalAsync(string because)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
-        while (DateTime.UtcNow < deadline)
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken, timeout.Token);
+        try
         {
-            if (Disposed) return;
-            await Task.Delay(1, TestContext.Current.CancellationToken).ConfigureAwait(false);
+            await _disposed.Task.WaitAsync(linked.Token).ConfigureAwait(false);
         }
-        throw new TimeoutException($"Stream was never disposed: {because}");
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Stream was never disposed: {because}");
+        }
     }
 
     /// <summary>Completes once production has actually entered a read on this stream.</summary>
     internal Task ReadEntered => _entered.Task;
 
+    /// <summary>
+    /// Awaits the Nth read's arrival signal. The signal is published AFTER the release TCS is
+    /// enqueued, so the test cannot release a read that production has not yet armed.
+    /// </summary>
     internal async Task WaitForReadCountAsync(int count, string because)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (DateTime.UtcNow < deadline)
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken, timeout.Token);
+        var observed = 0;
+        try
         {
-            var current = Volatile.Read(ref _readCount);
-            if (current >= count)
+            while (observed < count)
             {
-                // Ensure the rendezvous signal has also been observed.
-                if (_entered.Task.IsCompleted) return;
+                observed = await _readCounts.Reader.ReadAsync(linked.Token).ConfigureAwait(false);
             }
-            await Task.Delay(5, TestContext.Current.CancellationToken).ConfigureAwait(false);
+            await _entered.Task.WaitAsync(linked.Token).ConfigureAwait(false);
         }
-        throw new TimeoutException($"Stream read count {count} was never reached (actual {ReadCount}): {because}");
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Stream read count {count} was never reached (actual {ReadCount}): {because}");
+        }
     }
 
     /// <summary>Completes the pending read with N bytes of 'x' (or an exception).</summary>
     internal void ReleaseRead(int count)
     {
-        Assert.True(_releases.TryDequeue(out var tcs), "No pending read to release.");
+        Assert.True(_releases.Reader.TryRead(out var tcs), "No pending read to release.");
         tcs.TrySetResult(count);
     }
 
     /// <summary>Completes the pending read with a fault.</summary>
     internal void ReleaseRead(Exception fault)
     {
-        Assert.True(_releases.TryDequeue(out var tcs), "No pending read to fault.");
+        Assert.True(_releases.Reader.TryRead(out var tcs), "No pending read to fault.");
         tcs.TrySetException(fault);
     }
 
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
         var release = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _releases.Enqueue(release);
-        Interlocked.Increment(ref _readCount);
+        Assert.True(_releases.Writer.TryWrite(release), "The gated-read channel must remain open.");
+        var count = Interlocked.Increment(ref _readCount);
         // Deliberately ignore cancellationToken: production must await, not abandon, this read.
         _entered.TrySetResult(true);
+        Assert.True(_readCounts.Writer.TryWrite(count), "The read-count channel must remain open.");
         return AwaitReleaseAsync(buffer, release);
     }
 
@@ -282,7 +316,7 @@ internal sealed class GatedWebStream : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) Interlocked.Exchange(ref _disposed, 1);
+        if (disposing) _disposed.TrySetResult(true);
         base.Dispose(disposing);
     }
 
@@ -292,7 +326,7 @@ internal sealed class GatedWebStream : Stream
     /// </summary>
     internal void ReleaseAllPending(Exception? fault = null)
     {
-        while (_releases.TryDequeue(out var tcs))
+        while (_releases.Reader.TryRead(out var tcs))
         {
             if (fault is null) tcs.TrySetResult(0);
             else tcs.TrySetException(fault);
@@ -310,7 +344,7 @@ internal sealed class ChunkedWebStream : Stream
     private readonly int _chunkSize;
     private int _offset;
     private int _readCount;
-    private int _disposed;
+    private readonly TaskCompletionSource<bool> _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal ChunkedWebStream(byte[] bytes, int chunkSize)
     {
@@ -319,7 +353,7 @@ internal sealed class ChunkedWebStream : Stream
     }
 
     internal int ReadCount => Volatile.Read(ref _readCount);
-    internal bool Disposed => Volatile.Read(ref _disposed) != 0;
+    internal bool Disposed => _disposed.Task.IsCompleted;
 
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
@@ -344,7 +378,7 @@ internal sealed class ChunkedWebStream : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) Interlocked.Exchange(ref _disposed, 1);
+        if (disposing) _disposed.TrySetResult(true);
         base.Dispose(disposing);
     }
 }

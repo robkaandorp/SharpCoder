@@ -341,6 +341,22 @@ public sealed class OllamaWebClientResponseTests
     }
 
     [Fact]
+    public async Task NonSuccessNoBodyReadGuard_ThrowingContentReadStreamAsync_IsNeverInvoked()
+    {
+        var content = new ThrowingReadAsStreamContent(SecretSentinel);
+        var handler = RecordingWebHandler.With(HttpStatusCode.Forbidden, content);
+        var result = await Create(Options(handler)).FetchAsync(
+            "https://page.example.test", TestContext.Current.CancellationToken);
+
+        AssertFailure(result, WebToolErrorKind.HttpFailure);
+        AssertSafeMessage(result);
+        Assert.Equal(0, content.TokenOverloadAttempts);
+        Assert.Equal(0, content.ParameterlessOverloadAttempts);
+        Assert.Equal(0, content.SerializeAttempts);
+        Assert.True(content.Disposed);
+    }
+
+    [Fact]
     public async Task StreamingCap_StopsReadingOnceExceeded()
     {
         var cap = 16;
@@ -376,6 +392,57 @@ internal sealed class ThrowingWebHandler : RecordingWebHandler
         CancellationToken cancellationToken,
         Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) =>
         Task.FromException<HttpResponseMessage>(_fault);
+}
+
+/// <summary>
+/// Content whose stream-open overloads and serialization path all fail. This is a second
+/// independent no-body-read detector: production's exact ReadAsStreamAsync(token) path would
+/// increment TokenOverloadAttempts and propagate a secret-bearing exception.
+/// </summary>
+internal sealed class ThrowingReadAsStreamContent : HttpContent
+{
+    private readonly string _secret;
+    private int _tokenOverloadAttempts;
+    private int _parameterlessOverloadAttempts;
+    private int _serializeAttempts;
+    private int _disposed;
+
+    internal ThrowingReadAsStreamContent(string secret) => _secret = secret;
+
+    internal int TokenOverloadAttempts => Volatile.Read(ref _tokenOverloadAttempts);
+    internal int ParameterlessOverloadAttempts => Volatile.Read(ref _parameterlessOverloadAttempts);
+    internal int SerializeAttempts => Volatile.Read(ref _serializeAttempts);
+    internal bool Disposed => Volatile.Read(ref _disposed) != 0;
+
+    protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _tokenOverloadAttempts);
+        return Task.FromException<Stream>(new InvalidOperationException(_secret));
+    }
+
+    protected override Task<Stream> CreateContentReadStreamAsync()
+    {
+        Interlocked.Increment(ref _parameterlessOverloadAttempts);
+        return Task.FromException<Stream>(new InvalidOperationException(_secret));
+    }
+
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+    {
+        Interlocked.Increment(ref _serializeAttempts);
+        return Task.FromException(new InvalidOperationException(_secret));
+    }
+
+    protected override bool TryComputeLength(out long length)
+    {
+        length = 1;
+        return true;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Interlocked.Exchange(ref _disposed, 1);
+        base.Dispose(disposing);
+    }
 }
 
 /// <summary>

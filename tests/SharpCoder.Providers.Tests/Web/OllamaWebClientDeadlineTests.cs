@@ -29,11 +29,19 @@ public sealed class OllamaWebClientDeadlineTests
         internal static async Task<HeaderWindow> StartAsync(TimeSpan? deadline = null)
         {
             var window = new HeaderWindow();
-            var options = Options(window.Handler, timeProvider: window.Clock, deadline: deadline ?? StandardDeadline);
-            var client = Create(options);
-            window.Call = client.FetchAsync("https://page.example.test", window.Caller.Token);
-            await window.Handler.WaitForEntryAsync("fetch");
-            return window;
+            try
+            {
+                var options = Options(window.Handler, timeProvider: window.Clock, deadline: deadline ?? StandardDeadline);
+                var client = Create(options);
+                window.Call = client.FetchAsync("https://page.example.test", window.Caller.Token);
+                await window.Handler.WaitForEntryAsync("fetch");
+                return window;
+            }
+            catch
+            {
+                await window.DisposeAsync();
+                throw;
+            }
         }
 
         internal async Task<ManualWebTimer> RendezvousAsync()
@@ -49,14 +57,12 @@ public sealed class OllamaWebClientDeadlineTests
             return timer;
         }
 
-        internal OwningGatedContent? Content { get; private set; }
 
         internal GatedWebStream CompleteWithGatedBody(HttpStatusCode status = HttpStatusCode.OK)
         {
             var stream = new GatedWebStream();
             Body = stream;
             var content = new OwningGatedContent(stream);
-            Content = content;
             Handler.CompleteWith(status, content);
             return stream;
         }
@@ -103,7 +109,7 @@ public sealed class OllamaWebClientDeadlineTests
         var clock = new ManualWebTimeProvider();
         var gate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var accessorEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var handler = FetchOk();
+        var handler = new GatedWebHandler();
         var options = Options(handler, timeProvider: clock, accessor: () =>
         {
             accessorEntered.TrySetResult(true);
@@ -112,17 +118,21 @@ public sealed class OllamaWebClientDeadlineTests
         var client = Create(options);
         var call = Task.Run(() => client.FetchAsync("https://page.example.test", TestContext.Current.CancellationToken));
 
-        var entered = await Task.WhenAny(accessorEntered.Task, Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
-        Assert.Same(accessorEntered.Task, entered);
-        // Bounded diagnostic wait: give production time to (incorrectly) register a timer while
-        // the credential is still gated; it must not do so.
-        await Task.Delay(50, TestContext.Current.CancellationToken);
+        // The accessor-entry signal is the deterministic rendezvous for the still-gated credential
+        // window. The handler cannot be entered while this gate is held, so waiting for it here
+        // would be a deadlock, not a negative-wait proof.
+        await accessorEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         Assert.Empty(clock.RegisteredTimers);
         Assert.Equal(0, handler.SendCount);
+        Assert.False(handler.Entered.IsCompleted);
+        clock.SetCheckpoint();
 
         gate.TrySetResult(Credential);
         var timer = await clock.WaitForTimerAsync();
+        Assert.True(timer.CheckpointReached, "Deadline registration must happen after credential resolution.");
+        await handler.WaitForEntryAsync("post-credential send");
         Assert.Equal(StandardDeadline, timer.DueTime);
+        handler.CompleteWithJson("{}");
         var result = await call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
         Assert.True(timer.Disposed);
@@ -135,12 +145,16 @@ public sealed class OllamaWebClientDeadlineTests
         var timer = await window.RendezvousAsync();
         timer.Fire();
         Assert.True(timer.Fired);
-        // Release a non-success response AFTER expiry; the body is never read.
-        window.Handler.CompleteWith(HttpStatusCode.BadGateway, new StringContent(SecretSentinel));
+        // Release a non-success response AFTER expiry; the body is never read. The counting content
+        // records every ReadAsStreamAsync/SerializeToStreamAsync entry point, not just Stream.Read.
+        var content = new CountingHttpContent(SecretSentinel);
+        window.Handler.CompleteWith(HttpStatusCode.BadGateway, content);
 
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
         AssertSafeMessage(result);
+        Assert.Equal(0, content.ReadAttempts);
+        Assert.True(content.Disposed);
     }
 
     [Fact]
@@ -149,14 +163,16 @@ public sealed class OllamaWebClientDeadlineTests
         await using var window = await HeaderWindow.StartAsync();
         var timer = await window.RendezvousAsync();
         timer.Fire();
-        var body = window.CompleteWithGatedBody();
+        // A CountingHttpContent records a stream-open attempt even if no byte read occurs.
+        var content = new CountingHttpContent(SecretSentinel);
+        window.Handler.CompleteWith(HttpStatusCode.OK, content);
 
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
-        Assert.Equal(0, body.ReadCount);
-        Assert.NotNull(window.Content);
-        await window.Content.WaitForDisposalAsync("late success after expiry");
-        body.ReleaseAllPending();
+        AssertSafeMessage(result);
+        Assert.Equal(0, content.ReadAttempts);
+        Assert.False(content.ReadEntered.IsCompleted);
+        Assert.True(content.Disposed);
     }
 
     [Fact]
@@ -426,14 +442,13 @@ public sealed class OllamaWebClientDeadlineTests
         var client = Create(options);
         var call = client.FetchAsync("https://page.example.test", caller.Token);
         await handler.WaitForEntryAsync("infinite deadline");
-        // Bounded diagnostic wait: assert that NO timer was registered for this call.
-        await Task.Delay(50, TestContext.Current.CancellationToken);
-        Assert.Empty(clock.RegisteredTimers);
         Assert.True(handler.Entered.IsCompleted); // positive control
 
         handler.CompleteWithJson("{}");
         var result = await call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         Assert.True(result.IsSuccess);
+        // Completion is the deterministic observation point: an infinite deadline registers no
+        // timer at any point before, during, or after the awaited operation.
         Assert.Empty(clock.RegisteredTimers);
     }
 
@@ -502,57 +517,3 @@ public sealed class OllamaWebClientDeadlineTests
     }
 }
 
-/// <summary>
-/// Serves one complete JSON payload, then gates the terminal EOF read so the test can prove the
-/// full body was read BEFORE the deadline fires.
-/// </summary>
-internal sealed class GatedValidBodyStream : Stream
-{
-    private readonly byte[] _bytes;
-    private readonly TaskCompletionSource<bool> _completedRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource<int> _eof = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private bool _served;
-    private int _disposed;
-
-    internal GatedValidBodyStream(byte[] bytes) => _bytes = bytes;
-
-    internal bool Completed => _completedRead.Task.IsCompleted;
-    internal bool Disposed => Volatile.Read(ref _disposed) != 0;
-
-    internal async Task WaitForCompletedReadAsync()
-    {
-        var done = await Task.WhenAny(_completedRead.Task, Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken)).ConfigureAwait(false);
-        if (done != _completedRead.Task) throw new TimeoutException("Full body read was never reached.");
-    }
-
-    internal void ReleaseEof() => _eof.TrySetResult(0);
-
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        if (!_served)
-        {
-            _served = true;
-            _bytes.CopyTo(buffer);
-            return _bytes.Length;
-        }
-        _completedRead.TrySetResult(true);
-        return await _eof.Task.ConfigureAwait(false);
-    }
-
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => throw new NotSupportedException();
-    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-    public override void Flush() { }
-    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing) Interlocked.Exchange(ref _disposed, 1);
-        base.Dispose(disposing);
-    }
-}

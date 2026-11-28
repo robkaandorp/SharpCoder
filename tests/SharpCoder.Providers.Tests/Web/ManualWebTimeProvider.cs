@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Threading.Channels;
 
 namespace SharpCoder.Providers.Tests.Web;
 
@@ -9,11 +9,17 @@ namespace SharpCoder.Providers.Tests.Web;
 /// </summary>
 internal sealed class ManualWebTimeProvider : TimeProvider
 {
-    private readonly ConcurrentQueue<ManualWebTimer> _timers = new();
+    private readonly Channel<ManualWebTimer> _timers =
+        Channel.CreateUnbounded<ManualWebTimer>(new UnboundedChannelOptions
+        {
+            SingleReader = false,
+            SingleWriter = false,
+        });
     private readonly List<ManualWebTimer> _all = new();
     private readonly object _gate = new();
     private DateTimeOffset _now = new(2024, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private long _utcTicks;
+    private int _checkpointReached;
 
     public override DateTimeOffset GetUtcNow()
     {
@@ -27,24 +33,37 @@ internal sealed class ManualWebTimeProvider : TimeProvider
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        var timer = new ManualWebTimer(this, callback, state, dueTime, period);
-        _timers.Enqueue(timer);
+        var checkpointReached = Volatile.Read(ref _checkpointReached) != 0;
+        var timer = new ManualWebTimer(this, callback, state, dueTime, period, checkpointReached);
+        lock (_gate) _all.Add(timer);
+        Assert.True(_timers.Writer.TryWrite(timer), "The test-owned timer channel must remain open.");
         return timer;
     }
 
     /// <summary>
+    /// Marks a deterministic checkpoint. Timers registered before it record
+    /// <see cref="ManualWebTimer.CheckpointReached"/> = false; timers registered afterwards record
+    /// true. Used to prove that deadline registration happens after credential resolution.
+    /// </summary>
+    internal void SetCheckpoint() => Volatile.Write(ref _checkpointReached, 1);
+
+    /// <summary>
     /// Waits for the production code to register its one-shot deadline timer, then returns it.
-    /// This is the rendezvous: advancing before this returns would be a vacuous test.
+    /// This is a TCS/channel rendezvous: advancing before this returns would be a vacuous test.
     /// </summary>
     internal async Task<ManualWebTimer> WaitForTimerAsync(TimeSpan? budget = null)
     {
-        var deadline = DateTime.UtcNow + (budget ?? TimeSpan.FromSeconds(10));
-        while (DateTime.UtcNow < deadline)
+        using var timeout = new CancellationTokenSource(budget ?? TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken, timeout.Token);
+        try
         {
-            if (_timers.TryDequeue(out var timer)) return timer;
-            await Task.Delay(5, TestContext.Current.CancellationToken).ConfigureAwait(false);
+            return await _timers.Reader.ReadAsync(linked.Token).ConfigureAwait(false);
         }
-        throw new TimeoutException("Production code never registered its deadline timer.");
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException("Production code never registered its deadline timer.");
+        }
     }
 
     /// <summary>All registered timers, for exact-count assertions (e.g. infinite deadline registers none).</summary>
@@ -62,15 +81,10 @@ internal sealed class ManualWebTimeProvider : TimeProvider
             Interlocked.Add(ref _utcTicks, by.Ticks);
         }
     }
-
-    internal void Record(ManualWebTimer timer)
-    {
-        lock (_gate) _all.Add(timer);
-    }
 }
 
 /// <summary>
-/// A manual one-shot timer. <see cref="FireAsync"/> invokes the production callback exactly once
+/// A manual one-shot timer. <see cref="Fire"/> invokes the production callback exactly once
 /// (the callback is what cancels the linked token), so no real elapsed time is involved.
 /// </summary>
 internal sealed class ManualWebTimer : ITimer
@@ -81,14 +95,20 @@ internal sealed class ManualWebTimer : ITimer
     private int _fired;
     private int _disposed;
 
-    internal ManualWebTimer(ManualWebTimeProvider owner, TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+    internal ManualWebTimer(
+        ManualWebTimeProvider owner,
+        TimerCallback callback,
+        object? state,
+        TimeSpan dueTime,
+        TimeSpan period,
+        bool checkpointReached)
     {
         _owner = owner;
         _callback = callback;
         _state = state;
         DueTime = dueTime;
         Period = period;
-        _owner.Record(this);
+        CheckpointReached = checkpointReached;
     }
 
     /// <summary>The exact due time production requested.</summary>
@@ -99,6 +119,9 @@ internal sealed class ManualWebTimer : ITimer
 
     /// <summary>The exact state object production supplied (the linked token source).</summary>
     internal object? State => _state;
+
+    /// <summary>True when the provider's deterministic checkpoint had already been reached.</summary>
+    internal bool CheckpointReached { get; }
 
     /// <summary>True once the callback has been invoked.</summary>
     internal bool Fired => Volatile.Read(ref _fired) != 0;
