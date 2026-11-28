@@ -70,4 +70,42 @@ public class ConfigurationTableTests
         Assert.Contains("Tool confirmation", console.Output);
         Assert.Contains(expected, console.Output);
     }
+
+    [Fact]
+    public void Configuration_UsesSuppliedCompactionThresholdNotHardCodedValue()
+    {
+        var console = TestConsoleFactory.Create(width: 120);
+        var ui = new ConsoleUi { RenderConsole = console };
+
+        ui.Configuration(
+            model: "copilot/test-model",
+            workDirectory: "/repo",
+            maxSteps: 25,
+            enableBash: false,
+            readOnly: false,
+            noEnvContext: false,
+            confirmTools: ToolConfirmationMode.Auto,
+            reasoning: null,
+            contextTokens: 200_000,
+            shell: SharpCoder.ShellPreference.Auto,
+            savePath: null,
+            compactionThreshold: 0.5);
+
+        // 200,000 * 0.5 = 100,000; the old hard-coded 0.8 would have printed 160,000.
+        Assert.Contains("100,000", console.Output);
+        Assert.DoesNotContain("160,000", console.Output);
+    }
+
+    [Fact]
+    public void ShowSessionStats_UsesSuppliedCompactionThreshold()
+    {
+        var console = TestConsoleFactory.Create(width: 120);
+        var ui = new ConsoleUi { RenderConsole = console };
+        var session = SharpCoder.AgentSession.Create("threshold-test");
+
+        ui.ShowSessionStats(session, contextTokens: 200_000, compactionThreshold: 0.5);
+
+        Assert.Contains("100,000", console.Output);
+        Assert.DoesNotContain("160,000", console.Output);
+    }
 }

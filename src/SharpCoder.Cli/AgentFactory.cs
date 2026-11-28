@@ -20,6 +20,7 @@ public sealed class AgentFactory : IAsyncDisposable
 
     private IChatClient? _client;
     private CodingAgent? _agent;
+    private AgentOptions? _agentOptions;
 
     public AgentFactory(CliOptions options, ConsoleUi ui)
         : this(options, ui, EnvironmentDigest.CreateDefault(), ChatClientFactory.Create)
@@ -92,6 +93,7 @@ public sealed class AgentFactory : IAsyncDisposable
         if (_options.RetainTokens is { } retainTokens)
             agentOptions.CompactionRetainTokens = retainTokens;
 
+        _agentOptions = agentOptions;
         _agent = new CodingAgent(_client, agentOptions);
 
         if (customInstructions is not null)
@@ -123,7 +125,8 @@ public sealed class AgentFactory : IAsyncDisposable
             reasoning: _options.ReasoningEffort,
             contextTokens: _options.ContextTokens,
             savePath: _options.SavePath,
-            resolvedShell: _agent?.ResolvedBashShell);
+            resolvedShell: _agent?.ResolvedBashShell,
+            compactionThreshold: _agentOptions?.CompactionThreshold);
 
     public async ValueTask DisposeAsync()
     {

@@ -480,6 +480,20 @@ dotnet run --project src/SharpCoder.Cli
 
 In interactive mode the banner is followed by a prompt; `/help` lists the slash commands (`/save`, `/session`, `/markdown`, `/clear`, `/exit`). A task given without a subcommand runs once as a one-shot (`SharpCoder.Cli "fix the build"` is shorthand for `SharpCoder.Cli run "fix the build"`). Useful options: `--workdir`, `--max-steps`, `--reasoning`, `--bash` (with `--shell auto|pwsh|powershell|cmd|bash` to pick the shell), `--read-only`/`--no-writes` to disable `write_file`/`edit_file`, `--confirm-tools auto|always|never` (or `-y`/`--yes`) to control consent prompts for write and bash tools, `--verbose` (or `/verbose`) for full tool results, `--no-env-context` to skip the startup environment snapshot, `--session`/`--save` for session persistence, `-m|--model` for provider-prefixed model ids (`copilot/…`, `github/…`, `ollama-local/…`, `ollama-cloud/…`), `--context-tokens` for the model's context window, `--retain-tokens` for the verbatim tail kept on compaction, and `--markdown` for how assistant output is rendered. Credentials come from the same environment variables as `SharpCoder.Providers` (`GITHUB_TOKEN`/`GH_TOKEN`, `OLLAMA_API_KEY`, `OLLAMA_URL`, `LLM_PROVIDER`).
 
+#### REPL commands
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show the in-REPL command table |
+| `/save [path]` | Save the session (defaults to the `--save` path). Reports the path it wrote |
+| `/session` | Show session statistics: id, message/tool/token counts, context window and compaction point |
+| `/markdown [mode]` | Show or set markdown rendering (`auto`, `live`, `full`, `raw`) |
+| `/verbose [on\|off]` | Show or set full tool-result rendering |
+| `/clear` | Clear the screen (does not clear the conversation history) |
+| `/exit`, `/quit`, `/q` | Save (if `--save`) and exit |
+
+Per-turn autosaves from `--save` are silent; only an explicit `/save` prints a confirmation. Session files are written atomically (temp file + replace), so an interrupted save cannot leave a truncated, unloadable JSON file.
+
 ### Structured tool updates
 
 The CLI renders tool calls as distinct terminal lines: a cyan call line with arguments, a result line (red when the tool failed), elapsed time, and a round/step progress line. By default only the first line of a tool result is shown; `--verbose` (or `/verbose on` in the REPL) prints the full, untruncated result, which is useful for build/test logs. When output is redirected (`--markdown raw`), tool annotations are kept off stdout, so `SharpCoder.Cli run "..." > out.txt` contains only the model's text.

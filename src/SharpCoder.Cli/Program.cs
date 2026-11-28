@@ -65,6 +65,8 @@ internal static class Program
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             ui.Error(ex.Message);
+            if (StartupErrorHints.For(ex.Message) is { } hint)
+                ui.Info($"hint: {hint}");
             return 1;
         }
 
@@ -102,6 +104,7 @@ internal static class Program
     private static async Task<int> RunOnceAsync(CodingAgent agent, AgentSession session, CliOptions options, ConsoleUi ui)
     {
         var exitCode = await ExecuteTurnAsync(agent, session, options.Task!, ui).ConfigureAwait(false);
+        // One-shot runs have no REPL to be noisy in, but keep the confirmation for consistency.
         await SaveSessionAsync(ui, session, options.SavePath).ConfigureAwait(false);
         return exitCode;
     }
@@ -113,7 +116,7 @@ internal static class Program
         if (options.Task is { Length: > 0 } initial)
         {
             await ExecuteTurnAsync(agent, session, initial, ui).ConfigureAwait(false);
-            await SaveSessionAsync(ui, session, options.SavePath).ConfigureAwait(false);
+            await SaveSessionAsync(ui, session, options.SavePath, announce: false).ConfigureAwait(false);
         }
 
         ui.Info("Interactive session — /help for commands, /exit to quit.");
@@ -141,10 +144,11 @@ internal static class Program
             }
 
             await ExecuteTurnAsync(agent, session, input, ui).ConfigureAwait(false);
-            await SaveSessionAsync(ui, session, options.SavePath).ConfigureAwait(false);
+            // Per-turn autosaves are silent; an explicit /save still reports the path.
+            await SaveSessionAsync(ui, session, options.SavePath, announce: false).ConfigureAwait(false);
         }
 
-        await SaveSessionAsync(ui, session, options.SavePath).ConfigureAwait(false);
+        await SaveSessionAsync(ui, session, options.SavePath, announce: false).ConfigureAwait(false);
         return 0;
     }
 
@@ -211,7 +215,7 @@ internal static class Program
                 return false;
 
             case "/session":
-                ui.ShowSessionStats(session, options.ContextTokens);
+                ui.ShowSessionStats(session, options.ContextTokens, ConsoleUi.DefaultCompactionThreshold);
                 return false;
 
             case "/markdown":
@@ -288,14 +292,20 @@ internal static class Program
         return false;
     }
 
-    private static async Task SaveSessionAsync(ConsoleUi ui, AgentSession session, string? path)
+    /// <summary>
+    /// Saves the session atomically. <paramref name="announce"/> is false for per-turn autosaves
+    /// (they happen after every REPL turn and would otherwise flood the transcript); an explicit
+    /// <c>/save</c> keeps the confirmation line.
+    /// </summary>
+    private static async Task SaveSessionAsync(ConsoleUi ui, AgentSession session, string? path, bool announce = true)
     {
         if (string.IsNullOrWhiteSpace(path))
             return;
         try
         {
-            await session.SaveAsync(path).ConfigureAwait(false);
-            ui.Info($"session saved to {path}");
+            await SessionFileWriter.SaveAtomicAsync(session, path).ConfigureAwait(false);
+            if (announce)
+                ui.Info($"session saved to {path}");
         }
         catch (Exception ex)
         {
@@ -303,13 +313,14 @@ internal static class Program
         }
     }
 
+    /// <summary>Synchronous variant used from the Ctrl+C handler, which cannot await.</summary>
     private static void SaveSessionToDisk(ConsoleUi ui, AgentSession session, string? path)
     {
         if (string.IsNullOrWhiteSpace(path))
             return;
         try
         {
-            session.SaveAsync(path).GetAwaiter().GetResult();
+            SessionFileWriter.SaveAtomicAsync(session, path).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {

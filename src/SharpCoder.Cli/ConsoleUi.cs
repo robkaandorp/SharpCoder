@@ -22,6 +22,12 @@ public sealed class ConsoleUi
     private const string Warn = "yellow";
     private const string Bad = "red";
 
+    /// <summary>
+    /// Fallback when the effective threshold is not supplied by the caller. Taken from the
+    /// library's own defaults rather than duplicating the magic 0.8 in the UI.
+    /// </summary>
+    internal static readonly double DefaultCompactionThreshold = new SharpCoder.AgentOptions().CompactionThreshold;
+
     // Braille spinner frames used while waiting for the first token.
     private static readonly string[] SpinnerFrames =
         { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -79,13 +85,17 @@ public sealed class ConsoleUi
         int? contextTokens,
         SharpCoder.ShellPreference shell,
         string? savePath,
-        string? resolvedShell = null)
+        string? resolvedShell = null,
+        double? compactionThreshold = null)
     {
+        // Read the library's real default instead of duplicating a magic 0.8 here. Callers may
+        // pass the effective value when they have one (e.g. the factory's AgentOptions instance).
+        var threshold = compactionThreshold ?? DefaultCompactionThreshold;
         var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
         var contextValue = contextTokens is null
             ? $"{effectiveContext:n0} [dim](default)[/]"
             : $"{effectiveContext:n0}";
-        var compactAt = (long)(effectiveContext * 0.8);
+        var compactAt = (long)(effectiveContext * threshold);
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey).AddColumn("[dim]Setting[/]").AddColumn("[dim]Value[/]");
         table.AddRow("Model", Markup.Escape(model ?? $"default ($LLM_PROVIDER → {Environment.GetEnvironmentVariable("LLM_PROVIDER") ?? "copilot"})"));
         table.AddRow("Working directory", Markup.Escape(workDirectory));
@@ -272,19 +282,20 @@ public sealed class ConsoleUi
     }
 
     /// <summary>Prints session statistics.</summary>
-    public void ShowSessionStats(AgentSession session, int? contextTokens = null)
+    public void ShowSessionStats(AgentSession session, int? contextTokens = null, double? compactionThreshold = null)
     {
+        var threshold = compactionThreshold ?? DefaultCompactionThreshold;
         var effectiveContext = contextTokens ?? CliOptions.DefaultContextTokens;
         var table = new Table().Border(TableBorder.Rounded).AddColumn("[dim]Field[/]").AddColumn("[dim]Value[/]");
         table.AddRow("Session id", Markup.Escape(session.SessionId));
         table.AddRow("Messages", session.MessageHistory.Count.ToString());
         table.AddRow("Tool calls", session.TotalToolCalls.ToString());
         table.AddRow("Tokens in / out", $"{session.InputTokensUsed:n0} / {session.OutputTokensUsed:n0}");
-        table.AddRow("Context window", $"{effectiveContext:n0} tokens (compacts at ~{(long)(effectiveContext * 0.8):n0})");
+        table.AddRow("Context window", $"{effectiveContext:n0} tokens (compacts at ~{(long)(effectiveContext * threshold):n0})");
         table.AddRow("Last known context", session.LastKnownContextTokens > 0 ? $"{session.LastKnownContextTokens:n0} tokens" : "unknown");
         table.AddRow("Created", session.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
         table.AddRow("Last activity", session.LastActivityAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
-        AnsiConsole.Write(table);
+        RenderConsole.Write(table);
     }
 
     /// <summary>Clears the terminal.</summary>
