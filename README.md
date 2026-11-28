@@ -501,12 +501,12 @@ The CLI renders tool calls in two modes, switched with `/verbose [on|off]` (or `
 - **Compact** (default) — one line per call (two for bash), driven by structured `ToolCallFacts` rather than by scraping result text. A width-aware path emphasises the filename and elides directories from the left when needed. Examples:
 
   ```
-  🔧 ✓ Read   …/SharpCoder.Cli/ConsoleUi.cs  138–210 · 4,182 chars · 8 ms
-  🔧 ✓ Write  …/SharpCoder.Cli/Program.cs    1× · −27/+41 chars · 4 ms
-  🔧 ✓ Create …/CHANGELOG.md                2,910 chars · 2 ms
-  🔧 ✓ Grep   FlushPending  *.cs            7 matches in 3 files · 41 ms
-  🔧 ✓ Skill  build                         1 ms
-  🔧 ✓ Bash   2 m timeout (default) · 1.4 s · exit 0
+  🔧 ✓ Read   …/SharpCoder.Cli/ConsoleUi.cs  138–210 · 4,182 chars · 8ms
+  🔧 ✓ Write  …/SharpCoder.Cli/Program.cs    1× · −27/+41 chars · 4ms
+  🔧 ✓ Create …/CHANGELOG.md                2,910 chars · 2ms
+  🔧 ✓ Grep   FlushPending  *.cs            7 matches in 3 files · 41ms
+  🔧 ✓ Skill  build                         1ms
+  🔧 ✓ Bash   ⏱ 2m (default) timeout · 1.4s · exit 0
               dotnet build SharpCoder.slnx --nologo -v q
   ```
 

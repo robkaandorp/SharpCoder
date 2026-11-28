@@ -124,8 +124,8 @@ public class StructuredToolCallRendererTests
         renderer.Finished(Detail(name: "execute_bash_command", arguments: args, facts: facts));
 
         Assert.Contains("Bash", console.Output);
-        Assert.Contains("2 m 00 s (default) timeout", console.Output);
-        Assert.Contains("12 ms", console.Output);
+        Assert.Contains("2m (default) timeout", console.Output);
+        Assert.Contains("12ms", console.Output);
         Assert.Contains("exit 0", console.Output);
         Assert.Contains("dotnet build", console.Output);
     }
@@ -140,7 +140,7 @@ public class StructuredToolCallRendererTests
 
         renderer.Finished(Detail(name: "execute_bash_command", arguments: args, facts: facts));
 
-        Assert.Contains("5.0 s timeout", console.Output);
+        Assert.Contains("5s timeout", console.Output);
         Assert.DoesNotContain("(default)", console.Output);
     }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using Spectre.Console;
 
 namespace SharpCoder.Cli;
@@ -6,22 +7,53 @@ namespace SharpCoder.Cli;
 internal static class ToolDisplayFormatters
 {
     /// <summary>
-    /// Formats a duration in a compact, human-readable form: <c>820 ms</c>, <c>1.4 s</c>,
-    /// <c>2 m 03 s</c>, <c>1 h 05 m</c>.
+    /// Formats a duration in the most compact human-readable form: <c>820ms</c>, <c>1.4s</c>,
+    /// <c>2m3s</c>, <c>1h5m</c>, <c>25h</c>. Zero-valued units are omitted entirely, so
+    /// <c>1 minute</c> is <c>1m</c> rather than <c>1m00s</c>, and there are no spaces or
+    /// zero-padding. Culture-invariant so the fixed-width CLI lines do not change with locale.
     /// </summary>
     public static string Duration(TimeSpan value)
     {
-        var totalSeconds = value.TotalSeconds;
-        if (totalSeconds < 1)
-            return $"{Math.Max(0, value.TotalMilliseconds):n0} ms";
-        if (totalSeconds < 60)
-            return $"{totalSeconds:0.0} s";
-        if (value.TotalHours >= 1)
-            return $"{(long)value.TotalHours} h {value.Minutes:00} m";
-        return $"{(long)value.TotalMinutes} m {value.Seconds:00} s";
+        // Negative / sub-millisecond durations (possible for a not-yet-measured call) clamp to 0ms.
+        if (value.TotalMilliseconds < 1)
+            return "0ms";
+
+        // Sub-second: whole milliseconds, no separator.
+        if (value.TotalMilliseconds < 1000)
+            return $"{(long)value.TotalMilliseconds}ms";
+
+        // Round to the ONE decimal we show, and derive the unit choice and every component
+        // from that single value. This prevents boundary bleed: 59.96s becomes "1m", never
+        // "60s" / "60.0s", and no rounded-up display ever disagrees with the chosen unit.
+        var shownSeconds = Math.Round(value.TotalSeconds, 1, MidpointRounding.AwayFromZero);
+        if (shownSeconds < 60)
+        {
+            var seconds = shownSeconds.ToString("0.0", CultureInfo.InvariantCulture);
+            return seconds.EndsWith(".0", StringComparison.Ordinal)
+                ? seconds.Substring(0, seconds.Length - 2) + "s"
+                : seconds + "s";
+        }
+
+        var total = (long)Math.Round(shownSeconds, MidpointRounding.AwayFromZero);
+        var hours = total / 3600;
+        var minutes = total % 3600 / 60;
+        var secs = total % 60;
+
+        if (hours > 0)
+            return NonZeroUnits(("h", hours), ("m", minutes));
+        return NonZeroUnits(("m", minutes), ("s", secs));
     }
 
-    /// <summary>Formats a millisecond timeout in the same human-readable style as <see cref="Duration"/>.</summary>
+    /// <summary>
+    /// Joins only the non-zero (unit, value) pairs with no separator, e.g. <c>1h5m</c>, <c>25h</c>,
+    /// <c>2m3s</c>. The first unit is always emitted (it is non-zero by construction).
+    /// </summary>
+    private static string NonZeroUnits((string Unit, long Value) first, (string Unit, long Value) second) =>
+        second.Value == 0
+            ? $"{first.Value}{first.Unit}"
+            : $"{first.Value}{first.Unit}{second.Value}{second.Unit}";
+
+    /// <summary>Formats a millisecond timeout in the same compact style as <see cref="Duration"/>.</summary>
     public static string Timeout(long milliseconds) => Duration(TimeSpan.FromMilliseconds(milliseconds));
 
     /// <summary>
