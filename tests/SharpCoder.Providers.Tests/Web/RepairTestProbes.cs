@@ -49,6 +49,8 @@ internal sealed class GatedOpenContent : HttpContent
     internal Task Entered => _entered.Task;
     internal bool Disposed => Volatile.Read(ref _disposed) != 0;
 
+    internal bool OpenPending => Entered.IsCompleted && !_release.Task.IsCompleted;
+
     internal async Task WaitForOpenAsync()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -94,29 +96,106 @@ internal sealed class GatedOpenContent : HttpContent
 /// <summary>Records physical release order and can throw at one selected cleanup point.</summary>
 internal sealed class CleanupProbeResources
 {
+    private int _requestDisposeCalls;
+    private int _registrationDisposeCalls;
+    private int _timerDisposeCalls;
+    private readonly TaskCompletionSource<bool> _responseCreated = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    internal Task ResponseCreated => _responseCreated.Task;
+
     internal List<string> Releases { get; } = new();
     internal HttpRequestMessage? Request { get; private set; }
     internal ThrowingResponse? Response { get; private set; }
     internal ThrowingContent? Content { get; private set; }
     internal ThrowingStream? Stream { get; private set; }
+    internal bool ThrowOnRequestDispose { get; set; }
+    internal bool ThrowOnRegistrationDispose { get; set; }
+    internal bool ThrowOnTimerDispose { get; set; }
+    internal int RequestDisposeCalls => Volatile.Read(ref _requestDisposeCalls);
+    internal int RegistrationDisposeCalls => Volatile.Read(ref _registrationDisposeCalls);
+    internal int TimerDisposeCalls => Volatile.Read(ref _timerDisposeCalls);
 
     internal GatedWebHandler CreateGatedHandler(HttpStatusCode status = HttpStatusCode.OK, string body = "{}")
     {
-        var handler = new GatedWebHandler();
-        // Install the release action before returning; completion creates and releases exactly once.
-        handler.ResponseFactory = request =>
+        var handler = new GatedWebHandler
         {
-            Request = request;
-            Stream = new ThrowingStream(this, Encoding.UTF8.GetBytes(body));
-            Content = new ThrowingContent(this, Stream);
-            Response = new ThrowingResponse(this, status).SetContent(Content);
-            return Response;
+            ResponseFactory = request =>
+            {
+                Request = request;
+                Request.Content = new RequestDisposalContent(this);
+                Stream = new ThrowingStream(this, Encoding.UTF8.GetBytes(body));
+                Content = new ThrowingContent(this, Stream);
+                Response = new ThrowingResponse(this, status).SetContent(Content);
+                _responseCreated.TrySetResult(true);
+                return Response;
+            },
         };
-        handler.ReleaseWith(status); // response is created after the test configures disposers
         return handler;
     }
 
+    internal void Complete(GatedWebHandler handler, HttpStatusCode status) => handler.ReleaseWith(status);
+
+    internal void ConfigureCleanupFault(string thrower)
+    {
+        ThrowOnRequestDispose = thrower == "request";
+        ThrowOnRegistrationDispose = thrower == "registration";
+        ThrowOnTimerDispose = thrower == "timer";
+        if (Response is not null) Response.ThrowOnDispose = thrower == "response";
+        if (Content is not null) Content.ThrowOnDispose = thrower == "content";
+        if (Stream is not null) Stream.ThrowOnDispose = thrower == "stream";
+    }
+
+    internal async Task AssertAllResourcesReleasedAsync()
+    {
+        Assert.NotNull(Request);
+        Assert.NotNull(Response);
+        Assert.NotNull(Content);
+        Assert.NotNull(Stream);
+        Assert.Equal(1, RequestDisposeCalls);
+        Assert.Equal(1, Response.DisposeCalls);
+        Assert.Equal(1, Content.DisposeCalls);
+        Assert.Equal(1, Stream.DisposeCalls);
+        Assert.Equal(1, RegistrationDisposeCalls);
+        Assert.Equal(1, TimerDisposeCalls);
+        Assert.Equal(new[] { "response-start", "content", "stream", "registration", "timer", "request" }, Releases);
+        await Task.CompletedTask.ConfigureAwait(false);
+    }
+
     internal void Record(string name) { lock (Releases) Releases.Add(name); }
+
+    internal void RequestDisposed()
+    {
+        Record("request");
+        Interlocked.Increment(ref _requestDisposeCalls);
+        if (ThrowOnRequestDispose) throw new IOException("REQUEST_CLEANUP_SENTINEL");
+    }
+
+    internal void RegistrationDisposed()
+    {
+        Record("registration");
+        Interlocked.Increment(ref _registrationDisposeCalls);
+        if (ThrowOnRegistrationDispose) throw new IOException("REGISTRATION_CLEANUP_SENTINEL");
+    }
+
+    internal void TimerDisposed()
+    {
+        Record("timer");
+        Interlocked.Increment(ref _timerDisposeCalls);
+        if (ThrowOnTimerDispose) throw new IOException("TIMER_CLEANUP_SENTINEL");
+    }
+
+}
+
+/// <summary>Request content that records and can fault the request's actual disposal path.</summary>
+internal sealed class RequestDisposalContent(CleanupProbeResources owner) : HttpContent
+{
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
+    protected override bool TryComputeLength(out long length) { length = 0; return true; }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) owner.RequestDisposed();
+        base.Dispose(disposing);
+    }
 }
 
 internal sealed class ThrowingResponse(CleanupProbeResources owner, HttpStatusCode status)
@@ -266,4 +345,17 @@ internal sealed class DisposalGatedBodyStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+/// <summary>Real manual timer with observable, faultable cleanup hooks for ownership tests.</summary>
+internal sealed class FaultingCleanupTimeProvider : ManualWebTimeProvider, IAsyncDisposable
+{
+    internal Action? OnTimerDispose { get; set; }
+    internal Action? OnRegistrationDispose { get; set; }
+
+    public ValueTask DisposeAsync()
+    {
+        OnRegistrationDispose?.Invoke();
+        return ValueTask.CompletedTask;
+    }
 }

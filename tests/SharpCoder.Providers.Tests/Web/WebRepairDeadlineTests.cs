@@ -21,6 +21,7 @@ public sealed class WebRepairDeadlineTests
         await using var window = await OpenWindow.StartAsync();
         var timer = await window.RendezvousAsync();
         window.Clock.Advance(Deadline + TimeSpan.FromSeconds(1));
+        Assert.False(window.Call.IsCompleted); // send is outstanding before late response release
         window.Handler.CompleteWith(status, new StringContent(SecretSentinel));
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
@@ -32,11 +33,14 @@ public sealed class WebRepairDeadlineTests
     [InlineData("IO")]
     [InlineData("HTTP")]
     [InlineData("InvalidOperation")]
+    [InlineData("TimeoutMarker")]
+    [InlineData("NestedTimeoutMarker")]
     public async Task SendLateSecretFault_WithElapsedDeadlineAndDelayedCallback_ReturnsTimeout(string fault)
     {
         await using var window = await OpenWindow.StartAsync();
         var timer = await window.RendezvousAsync();
         window.Clock.Advance(Deadline);
+        Assert.False(window.Call.IsCompleted); // cancellation-ignoring send remains outstanding
         window.Handler.CompleteWith(Fault(fault));
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
@@ -50,6 +54,8 @@ public sealed class WebRepairDeadlineTests
     [InlineData("IO")]
     [InlineData("HTTP")]
     [InlineData("InvalidOperation")]
+    [InlineData("TimeoutMarker")]
+    [InlineData("NestedTimeoutMarker")]
     public async Task StreamOpenLateReturnOrThrow_WithElapsedDeadline_ReturnsTimeout(string outcome)
     {
         await using var window = await OpenWindow.StartAsync();
@@ -57,6 +63,7 @@ public sealed class WebRepairDeadlineTests
         var content = window.CompleteWithGatedOpen();
         await content.WaitForOpenAsync();
         window.Clock.Advance(Deadline);
+        Assert.False(window.Call.IsCompleted); // real ReadAsStreamAsync is parked and never abandoned
         if (outcome == "return") content.Release(new MemoryStream(Encoding.UTF8.GetBytes("{}")));
         else content.Release(Fault(outcome));
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -116,23 +123,32 @@ public sealed class WebRepairDeadlineTests
         var body = window.CompleteWithGatedBody();
         await body.WaitForReadCountAsync(1, "delayed-callback late read");
         window.Clock.Advance(Deadline);
+        Assert.False(window.Call.IsCompleted); // parked read is not abandoned at expiry
         body.ReleaseRead(1);
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
         Assert.False(timer.Fired);
     }
 
-    [Fact]
-    public async Task ReadLateThrow_WithElapsedDeadlineAndDelayedCallback_ReturnsTimeout()
+    [Theory]
+    [InlineData("OCE")]
+    [InlineData("IO")]
+    [InlineData("HTTP")]
+    [InlineData("InvalidOperation")]
+    [InlineData("TimeoutMarker")]
+    [InlineData("NestedTimeoutMarker")]
+    public async Task ReadLateThrow_WithElapsedDeadlineAndDelayedCallback_ReturnsTimeout(string fault)
     {
         await using var window = await OpenWindow.StartAsync();
         var timer = await window.RendezvousAsync();
         var body = window.CompleteWithGatedBody();
         await body.WaitForReadCountAsync(1, "delayed-callback late throw");
         window.Clock.Advance(Deadline);
-        body.ReleaseRead(new IOException(SecretSentinel));
+        Assert.False(window.Call.IsCompleted); // parked stream read is not abandoned at expiry
+        body.ReleaseRead(Fault(fault));
         var result = await window.Call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.Timeout);
+        AssertSafeMessage(result);
         Assert.False(timer.Fired);
     }
 
@@ -183,6 +199,9 @@ public sealed class WebRepairDeadlineTests
         "OCE" => new OperationCanceledException(SecretSentinel),
         "IO" => new IOException(SecretSentinel),
         "HTTP" => new HttpRequestException(SecretSentinel),
+        "TimeoutMarker" => new WebToolTimeoutException(SecretSentinel, new InvalidOperationException(SecretSentinel)),
+        "NestedTimeoutMarker" => new HttpRequestException(SecretSentinel,
+            new IOException(SecretSentinel, new WebToolTimeoutException(SecretSentinel))),
         _ => new InvalidOperationException(SecretSentinel),
     };
 

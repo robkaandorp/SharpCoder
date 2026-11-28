@@ -32,13 +32,33 @@ public sealed class WebRepairContractTests
     }
 
     [Theory]
+    [InlineData("title", "\\uD800")]
+    [InlineData("title", "\\uDFFF")]
+    [InlineData("url", "\\uD800")]
+    [InlineData("content", "\\uD800")]
+    public async Task Search_UnpairedEscapedSurrogate_ReturnsMalformedResponse(string field, string surrogate)
+    {
+        var json = "{\"results\":[{\"" + field + "\":\"" + surrogate + "\"}]}";
+        var result = await Create(Options(RecordingWebHandler.Json(json)))
+            .SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
+        AssertFailure(result, WebToolErrorKind.MalformedResponse);
+        AssertSafeMessage(result);
+    }
+
+    [Theory]
     [InlineData("title")]
     [InlineData("url")]
     [InlineData("content")]
-    public async Task Search_UnpairedEscapedSurrogate_ReturnsMalformedResponse(string field)
+    public async Task Search_InvalidUtf8InsideQuotedField_ReturnsMalformedResponse(string field)
     {
-        var json = "{\"results\":[{\"" + field + "\":\"\\uD800\"}]}";
-        var result = await Create(Options(RecordingWebHandler.Json(json)))
+        var prefix = "{\"results\":[{\"" + field + "\":\"";
+        const string suffix = "\"}]}";
+        var body = Encoding.ASCII.GetBytes(prefix)
+            .Concat(new byte[] { 0xC0, 0xAF }) // invalid overlong UTF-8 inside the actual JSON string
+            .Concat(Encoding.ASCII.GetBytes(suffix))
+            .ToArray();
+        var result = await Create(Options(RecordingWebHandler.With(
+                HttpStatusCode.OK, new ByteArrayContent(body))))
             .SearchAsync("q", cancellationToken: TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.MalformedResponse);
         AssertSafeMessage(result);
@@ -56,12 +76,36 @@ public sealed class WebRepairContractTests
         AssertSafeMessage(result);
     }
 
+    [Theory]
+    [InlineData("title")]
+    [InlineData("content")]
+    [InlineData("links")]
+    public async Task Fetch_InvalidUtf8InsideEveryStringField_ReturnsMalformedResponse(string field)
+    {
+        var body = field == "links"
+            ? Encoding.ASCII.GetBytes("{\"title\":\"T\",\"content\":\"C\",\"links\":[\"")
+                .Concat(new byte[] { 0xFF })
+                .Concat(Encoding.ASCII.GetBytes("\"]}"))
+                .ToArray()
+            : Encoding.ASCII.GetBytes("{\"title\":\"T\",\"content\":\"C\",")
+                .Concat(Encoding.ASCII.GetBytes("\"" + field + "\":\""))
+                .Concat(new byte[] { 0xFF })
+                .Concat(Encoding.ASCII.GetBytes("\"}"))
+                .ToArray();
+        var result = await Create(Options(RecordingWebHandler.With(
+                HttpStatusCode.OK, new ByteArrayContent(body))))
+            .FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
+        AssertFailure(result, WebToolErrorKind.MalformedResponse);
+        AssertSafeMessage(result);
+    }
+
     [Fact]
     public async Task Fetch_LinksWithUnpairedEscapedSurrogate_ReturnsMalformedResponse()
     {
-        var result = await Create(Options(RecordingWebHandler.Json("{\"links\":[\"\\uD800\"]}")))
+        var result = await Create(Options(RecordingWebHandler.Json("{\"title\":\"T\",\"content\":\"C\",\"links\":[\"\\uD800\"]}")))
             .FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.MalformedResponse);
+        AssertSafeMessage(result);
     }
 
     [Fact]
@@ -96,9 +140,11 @@ public sealed class WebRepairContractTests
         Assert.Equal(unicode, row.GetRawUrl());
         Assert.Equal(unicode, row.GetRawContent());
 
+        var escapedPairJson = JsonSerializer.Serialize(unicode);
         var fetch = await Create(Options(RecordingWebHandler.Json(
-                "{\"title\":\"" + unicode + "\",\"content\":\"" + unicode + "\",\"links\":[\"" + unicode + "\"]}")))
+                "{\"title\":" + escapedPairJson + ",\"content\":" + escapedPairJson + ",\"links\":[" + escapedPairJson + "]}")))
             .FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
+        Assert.True(fetch.IsSuccess);
         Assert.Equal(unicode, fetch.GetRawData()!.GetRawTitle());
         Assert.Equal(unicode, fetch.GetRawData()!.GetRawContent());
         Assert.Equal(unicode, Assert.Single(fetch.GetRawData()!.GetRawLinks()));
@@ -108,7 +154,8 @@ public sealed class WebRepairContractTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData("=")]
-    public async Task CallerCancellation_AfterEveryUnusableCredentialOutcome_Propagates(string? credential)
+    [InlineData("abcDEF123-._~+/=")] // valid credential: cancellation still wins before any send
+    public async Task CallerCancellation_AfterEveryCredentialAccessorOutcome_Propagates(string? credential)
     {
         using var caller = new CancellationTokenSource();
         var handler = FetchOk();
@@ -161,29 +208,31 @@ public sealed class WebRepairContractTests
     }
 
     [Theory]
+    [InlineData("request")]
     [InlineData("response")]
     [InlineData("content")]
     [InlineData("stream")]
+    [InlineData("registration")]
+    [InlineData("timer")]
     public async Task CleanupFault_DoesNotReplaceHttpFailure_AndEveryResourceIsReleased(string thrower)
     {
+        await using var owned = new DeterministicTestOwnedResources();
+        var clock = owned.TrackAsync(new FaultingCleanupTimeProvider());
         var resources = new CleanupProbeResources();
-        var handler = resources.CreateGatedHandler(HttpStatusCode.ServiceUnavailable);
-        var client = Create(Options(handler));
+        clock.OnTimerDispose = resources.TimerDisposed;
+        clock.OnRegistrationDispose = resources.RegistrationDisposed;
+        var handler = owned.Track(resources.CreateGatedHandler(HttpStatusCode.ServiceUnavailable));
+        var client = Create(Options(handler, timeProvider: clock));
         var call = client.FetchAsync("https://page.example.test", TestContext.Current.CancellationToken);
         await handler.WaitForEntryAsync("cleanup fault");
-        switch (thrower)
-        {
-            case "response": resources.Response!.ThrowOnDispose = true; break;
-            case "content": resources.Content!.ThrowOnDispose = true; break;
-            default: resources.Stream!.ThrowOnDispose = true; break;
-        }
+        Assert.NotEmpty(clock.RegisteredTimers);
+        resources.Complete(handler, HttpStatusCode.ServiceUnavailable);
+        await resources.ResponseCreated.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        resources.ConfigureCleanupFault(thrower);
         var result = await call.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         AssertFailure(result, WebToolErrorKind.HttpFailure);
         AssertSafeMessage(result);
-        Assert.Equal(1, resources.Response!.DisposeCalls);
-        Assert.Equal(1, resources.Content!.DisposeCalls);
-        Assert.Equal(1, resources.Stream!.DisposeCalls);
-        Assert.Equal(new[] { "response-start", "content", "stream" }, resources.Releases);
+        await resources.AssertAllResourcesReleasedAsync();
     }
 
     [Fact]

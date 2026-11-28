@@ -7,7 +7,7 @@ namespace SharpCoder.Providers.Tests.Web;
 /// registers. Deadline tests rendezvous on that exact timer (state, due time, period) and then
 /// advance it explicitly — no narrow wall-clock timing margins are used.
 /// </summary>
-internal sealed class ManualWebTimeProvider : TimeProvider
+internal class ManualWebTimeProvider : TimeProvider
 {
     private readonly Channel<ManualWebTimer> _timers =
         Channel.CreateUnbounded<ManualWebTimer>(new UnboundedChannelOptions

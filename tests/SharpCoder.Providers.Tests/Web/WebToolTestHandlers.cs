@@ -234,8 +234,11 @@ internal sealed class GatedWebStream : Stream
         SingleWriter = true,
     });
     private int _readCount;
+    private readonly object _gate = new();
+    private readonly HashSet<TaskCompletionSource<int>> _pending = new();
 
     internal int ReadCount => Volatile.Read(ref _readCount);
+    internal int PendingReads { get { lock (_gate) return _pending.Count; } }
 
     internal bool Disposed => _disposed.Task.IsCompleted;
 
@@ -299,6 +302,7 @@ internal sealed class GatedWebStream : Stream
     {
         var release = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         Assert.True(_releases.Writer.TryWrite(release), "The gated-read channel must remain open.");
+        lock (_gate) _pending.Add(release);
         var count = Interlocked.Increment(ref _readCount);
         // Deliberately ignore cancellationToken: production must await, not abandon, this read.
         _entered.TrySetResult(true);
@@ -309,6 +313,7 @@ internal sealed class GatedWebStream : Stream
     private async ValueTask<int> AwaitReleaseAsync(Memory<byte> buffer, TaskCompletionSource<int> release)
     {
         var count = await release.Task.ConfigureAwait(false);
+        lock (_gate) _pending.Remove(release);
         if (count > 0)
         {
             var fill = Math.Min(count, buffer.Length);
